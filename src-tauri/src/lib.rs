@@ -2,7 +2,6 @@ use base64::Engine;
 use scraper::{Element, Html, Selector};
 use serde::Serialize;
 use std::collections::HashSet;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use tauri::image::Image;
@@ -510,29 +509,24 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
     Err("无法解析图片地址，页面结构可能变化或图片由脚本延迟加载".to_string())
 }
 
-async fn fetch_page(url: String, referer: Option<&str>, _app: &tauri::AppHandle) -> Result<String, String> {
+async fn fetch_page(url: String, referer: Option<&str>) -> Result<String, String> {
     let referer = referer.unwrap_or("https://wnacg.com/");
-    let output = Command::new("curl")
-        .args([
-            "-s", "-L",
-            "--compressed",
-            "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "-H", "Accept-Language: zh-CN,zh;q=0.9",
-            "-e", referer,
-            "--connect-timeout", "15",
-            "--max-time", "30",
-            "-A", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            &url,
-        ])
-        .output()
-        .map_err(|e| format!("curl 执行失败: {e}"))?;
+    let response = client()?
+        .get(&url)
+        .header("referer", referer)
+        .send()
+        .await
+        .map_err(|err| format!("请求失败：{err}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("curl 请求失败: {}", stderr.trim()));
+    if !response.status().is_success() {
+        return Err(format!("服务返回 HTTP {}", response.status()));
     }
 
-    let body = String::from_utf8(output.stdout).map_err(|e| format!("响应编码错误: {e}"))?;
+    let body = response
+        .text()
+        .await
+        .map_err(|err| format!("读取响应失败：{err}"))?;
+
     if body.is_empty() || body.contains("cf_chl") || body.contains("Just a moment") {
         return Err("站点返回空内容或被 CF 拦截".to_string());
     }
@@ -594,13 +588,13 @@ async fn fetch_binary(url: String, referer: Option<String>) -> Result<(String, V
 }
 
 #[tauri::command]
-async fn fetch_albums(path: String, app: tauri::AppHandle) -> Result<Vec<Album>, String> {
+async fn fetch_albums(path: String, _app: tauri::AppHandle) -> Result<Vec<Album>, String> {
     let mut errors = Vec::new();
 
     for base_url in BASE_URLS {
         let url = build_url(base_url, &path)?;
 
-        match fetch_page(url, None, &app).await.and_then(|html| parse_albums(&html, base_url)) {
+        match fetch_page(url, None).await.and_then(|html| parse_albums(&html, base_url)) {
             Ok(albums) => return Ok(albums),
             Err(error) => errors.push(format!("{base_url}: {error}")),
         }
@@ -630,7 +624,7 @@ fn parse_album_tags(html: &str, base_url: &str) -> Vec<Tag> {
 }
 
 #[tauri::command]
-async fn fetch_album_photos(aid: String, app: tauri::AppHandle) -> Result<AlbumDetail, String> {
+async fn fetch_album_photos(aid: String, _app: tauri::AppHandle) -> Result<AlbumDetail, String> {
     let aid = aid.trim().to_string();
     let path = format!("/photos-index-aid-{aid}.html");
     let mut errors = Vec::new();
@@ -638,7 +632,7 @@ async fn fetch_album_photos(aid: String, app: tauri::AppHandle) -> Result<AlbumD
     for base_url in BASE_URLS {
         let url = build_url(base_url, &path)?;
 
-        match fetch_page(url, None, &app).await {
+        match fetch_page(url, None).await {
             Ok(first_html) => {
                 let max_page = parse_album_max_page(&first_html);
                 let mut photos = parse_album_photos(&first_html, base_url)?;
@@ -647,13 +641,12 @@ async fn fetch_album_photos(aid: String, app: tauri::AppHandle) -> Result<AlbumD
                     // Fetch remaining pages CONCURRENTLY
                     let mut handles = Vec::new();
                     for page in 2..=max_page {
-                        let app = app.clone();
                         let bu = base_url.to_string();
                         let a = aid.clone();
                         handles.push(tauri::async_runtime::spawn(async move {
                             let page_path = format!("/photos-index-page-{page}-aid-{a}.html");
                             let page_url = build_url(&bu, &page_path)?;
-                            let html = fetch_page(page_url, None, &app).await?;
+                            let html = fetch_page(page_url, None).await?;
                             parse_album_photos(&html, &bu)
                         }));
                     }
@@ -687,14 +680,14 @@ async fn search_tag(tag: String, app: tauri::AppHandle) -> Result<Vec<Album>, St
 }
 
 #[tauri::command]
-async fn fetch_photo_image(page_url: String, album_url: Option<String>, app: tauri::AppHandle) -> Result<PhotoImage, String> {
+async fn fetch_photo_image(page_url: String, album_url: Option<String>, _app: tauri::AppHandle) -> Result<PhotoImage, String> {
     let mut errors = Vec::new();
 
     for base_url in BASE_URLS {
         let url = build_url(base_url, &page_url)?;
         let referer = album_url.as_deref().or(Some(base_url));
 
-        match fetch_page(url, referer, &app).await.and_then(|html| parse_photo_image(&html, base_url)) {
+        match fetch_page(url, referer).await.and_then(|html| parse_photo_image(&html, base_url)) {
             Ok(photo) => return Ok(photo),
             Err(error) => errors.push(format!("{base_url}: {error}")),
         }
