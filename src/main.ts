@@ -117,6 +117,7 @@ jumpTopButton.title = "回到顶部";
 jumpTopButton.hidden = true;
 workspace.append(jumpTopButton);
 
+
 // ---- helpers ----
 
 function setStatus(message: string) {
@@ -641,70 +642,13 @@ async function loadNextPage() {
 
 // ---- reader ----
 
-let readerObserver: IntersectionObserver | null = null;
-
-function teardownReaderObserver() {
-  readerObserver?.disconnect();
-  readerObserver = null;
-}
-
-function setupReaderObserver() {
-  teardownReaderObserver();
-  readerObserver = new IntersectionObserver(
-    (entries) => {
-      for (const entry of entries) {
-        if (entry.isIntersecting) {
-          const container = entry.target as HTMLElement;
-          const index = parseInt(container.dataset.index || "", 10);
-          if (!isNaN(index) && container.dataset.state === "") {
-            loadReaderImage(container, index);
-          }
-        }
-      }
-    },
-    { rootMargin: "600px" },
-  );
-
-  document.querySelectorAll<HTMLElement>(".reader-full-photo").forEach((el) => {
-    readerObserver!.observe(el);
-  });
-}
-
-async function loadReaderImage(container: HTMLElement, index: number) {
-  const token = state.readerToken;
-  container.dataset.state = "loading";
-
-  try {
-    const imageUrl = await resolvePhotoImageUrlWithRetry(index, 2);
-    if (token !== state.readerToken || container.dataset.state !== "loading") return;
-
-    const img = document.createElement("img");
-    img.className = "reader-full-img";
-    img.alt = state.photos[index]?.title || `#${index + 1}`;
-    img.loading = "lazy";
-    img.addEventListener("load", () => {
-      container.classList.add("loaded");
-      container.dataset.state = "loaded";
-    }, { once: true });
-    img.addEventListener("error", () => {
-      container.classList.add("error");
-      container.dataset.state = "error";
-    }, { once: true });
-    img.src = imageUrl;
-    container.append(img);
-  } catch {
-    if (token !== state.readerToken || container.dataset.state !== "loading") return;
-    container.classList.add("error");
-    container.dataset.state = "error";
-  }
-}
+function teardownReaderObserver() {}
 
 function renderReaderGrid(tags?: Tag[]) {
-  resultGrid.className = "reader-grid reader-continuous";
+  resultGrid.className = "reader-grid";
 
   const frag = document.createDocumentFragment();
 
-  // Tags bar
   if (tags && tags.length > 0) {
     const tagBar = document.createElement("div");
     tagBar.className = "tag-bar";
@@ -727,32 +671,32 @@ function renderReaderGrid(tags?: Tag[]) {
 
   for (let i = 0; i < state.photos.length; i++) {
     const photo = state.photos[i];
-    const container = document.createElement("div");
-    container.className = "reader-full-photo";
-    container.dataset.index = String(i);
-    container.dataset.state = "";
+    const card = document.createElement("div");
+    card.className = "reader-photo";
+
+    const thumbWrap = document.createElement("div");
+    thumbWrap.className = "thumb-wrap";
 
     if (photo.thumbnail) {
-      const thumb = document.createElement("img");
-      thumb.className = "reader-thumb";
-      thumb.alt = "";
-      thumb.loading = "lazy";
-      hydrateImage(thumb, photo.thumbnail, photo.url);
-      container.append(thumb);
+      const img = document.createElement("img");
+      img.alt = "";
+      img.loading = "lazy";
+      hydrateImage(img, photo.thumbnail, photo.url);
+      thumbWrap.append(img);
     }
 
-    const label = document.createElement("div");
-    label.className = "reader-label";
+    const label = document.createElement("span");
+    label.className = "thumb-label";
     label.textContent = `${i + 1} / ${state.photos.length}`;
-    container.append(label);
+    thumbWrap.append(label);
 
+    card.append(thumbWrap);
     const idx = i;
-    container.addEventListener("click", () => openLightbox(idx));
-    frag.append(container);
+    card.addEventListener("click", () => openLightbox(idx));
+    frag.append(card);
   }
 
   resultGrid.replaceChildren(frag);
-  setupReaderObserver();
 }
 
 async function loadAlbumReader(aid: string, title: string) {
