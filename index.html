@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>wnacg desktop</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <main class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">W</span>
+          <div>
+            <h1>wnacg</h1>
+            <p>crawler mvp</p>
+          </div>
+        </div>
+
+        <form id="search-form" class="search-panel">
+          <label for="search-input">搜索关键词</label>
+          <input id="search-input" type="search" placeholder="输入关键词" autocomplete="off" />
+          <button type="submit" class="primary-action">搜索</button>
+        </form>
+
+        <nav class="shortcut-list" aria-label="分类">
+          <h2>分类</h2>
+          <div id="category-list"></div>
+        </nav>
+      </aside>
+
+      <section class="workspace">
+        <header class="toolbar">
+          <div class="toolbar-left">
+            <button id="back-to-list" type="button" class="back-button" hidden>← 返回列表</button>
+            <div>
+              <h2 id="view-title">更新</h2>
+              <p id="status-label">准备抓取</p>
+            </div>
+          </div>
+
+          <div class="pager" id="pager-controls">
+            <button id="previous-page" type="button">上一页</button>
+            <input id="page-input" type="number" min="1" value="1" aria-label="页码" />
+            <button id="next-page" type="button">下一页</button>
+            <button id="refresh" type="button" class="primary-action">刷新</button>
+          </div>
+        </header>
+
+        <section id="result-grid" class="result-grid" aria-live="polite"></section>
+      </section>
+    </main>
+  </body>
+</html>
