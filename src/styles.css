@@ -279,10 +279,9 @@ input:focus-visible {
 }
 
 .pager {
-  display: grid;
-  grid-template-columns: 78px 72px 78px 82px;
-  gap: 8px;
+  display: flex;
   align-items: center;
+  gap: 8px;
   flex: 0 0 auto;
 }
 
@@ -794,6 +793,59 @@ input:focus-visible {
   text-overflow: ellipsis;
 }
 
+/* ---- reader mode toggle ---- */
+
+.reader-mode-toggle {
+  padding: 0 12px;
+  font-size: 13px;
+  color: #d7bd67;
+  border-color: #4b473d;
+  background: transparent;
+}
+
+.reader-mode-toggle:hover {
+  border-color: #d1b45d;
+  background: rgba(215, 189, 103, 0.1);
+}
+
+/* ---- stream reader ---- */
+
+.reader-stream {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 0 0 48px;
+  overflow: auto;
+  background: #141311;
+}
+
+.stream-photo {
+  width: 100%;
+  max-width: 960px;
+  position: relative;
+  background: #0f0e0c;
+  cursor: pointer;
+}
+
+.stream-photo .stream-thumb {
+  width: 100%;
+  display: block;
+}
+
+.stream-photo .stream-img {
+  width: 100%;
+  display: block;
+}
+
+.stream-label {
+  padding: 4px 10px 8px;
+  color: #9d9686;
+  font-size: 12px;
+  font-weight: 600;
+  text-align: right;
+}
+
 /* ---- lightbox ---- */
 
 .lightbox {
@@ -1138,10 +1190,6 @@ input:focus-visible {
     font-size: 20px;
   }
 
-  .pager {
-    width: 100%;
-    grid-template-columns: 1fr 74px 1fr 78px;
-  }
 
   .result-grid {
     grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));

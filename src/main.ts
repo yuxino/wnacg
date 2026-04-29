@@ -70,6 +70,7 @@ const state = {
   loadMoreError: "",
   currentAlbum: null as { aid: string; title: string } | null,
   photos: [] as PhotoEntry[],
+  readerMode: "stream" as "grid" | "stream",
   lightboxIndex: -1,
   lightboxImageUrl: null as string | null,
   preloadedUrls: {} as Record<number, string>, // index -> full image URL
@@ -100,14 +101,18 @@ const categoryList = document.querySelector<HTMLElement>("#category-list")!;
 const resultGrid = document.querySelector<HTMLElement>("#result-grid")!;
 const searchForm = document.querySelector<HTMLFormElement>("#search-form")!;
 const searchInput = document.querySelector<HTMLInputElement>("#search-input")!;
-const pageInput = document.querySelector<HTMLInputElement>("#page-input")!;
-const previousButton = document.querySelector<HTMLButtonElement>("#previous-page")!;
-const nextButton = document.querySelector<HTMLButtonElement>("#next-page")!;
 const refreshButton = document.querySelector<HTMLButtonElement>("#refresh")!;
 const viewTitle = document.querySelector<HTMLElement>("#view-title")!;
 const statusLabel = document.querySelector<HTMLElement>("#status-label")!;
 const backButton = document.querySelector<HTMLButtonElement>("#back-to-list")!;
 const pagerControls = document.querySelector<HTMLElement>("#pager-controls")!;
+
+const readerModeBtn = document.createElement("button");
+readerModeBtn.type = "button";
+readerModeBtn.className = "reader-mode-toggle";
+readerModeBtn.hidden = true;
+readerModeBtn.addEventListener("click", () => toggleReaderMode());
+pagerControls.append(readerModeBtn);
 
 const jumpTopButton = document.createElement("button");
 jumpTopButton.type = "button";
@@ -151,11 +156,7 @@ function listContextKey() {
 function updateListControls() {
   const busy = state.listLoading || state.loadingMore;
   const isList = state.view === "list";
-  const isTag = state.mode === "tag";
-  previousButton.disabled = !isList || busy || state.page <= 1 || isTag;
-  nextButton.disabled = !isList || busy || state.allLoaded || isTag;
   refreshButton.disabled = !isList || busy;
-  pageInput.disabled = !isList || busy || isTag;
   searchForm.querySelectorAll<HTMLButtonElement | HTMLInputElement>("button, input").forEach((control) => {
     control.disabled = busy;
   });
@@ -333,18 +334,20 @@ function syncToolbar() {
   if (state.view === "reader") {
     backButton.hidden = false;
     pagerControls.hidden = true;
+    readerModeBtn.hidden = false;
+    readerModeBtn.textContent = state.readerMode === "stream" ? "网格" : "一图流";
     viewTitle.textContent = state.currentAlbum?.title ?? "阅读";
     sidebar.classList.add("hidden");
     shell.classList.add("reader-mode");
   } else {
     backButton.hidden = true;
     pagerControls.hidden = false;
+    readerModeBtn.hidden = true;
     viewTitle.textContent =
       state.mode === "tag" ? `标签：${state.query}` :
       state.mode === "search" ? `搜索：${state.query || "未输入"}` : state.category.label;
     sidebar.classList.remove("hidden");
     shell.classList.remove("reader-mode");
-    pageInput.value = String(state.page);
   }
   updateListControls();
 }
@@ -642,10 +645,18 @@ async function loadNextPage() {
 
 // ---- reader ----
 
-function teardownReaderObserver() {}
+let readerObserver: IntersectionObserver | null = null;
+
+function teardownReaderObserver() {
+  readerObserver?.disconnect();
+  readerObserver = null;
+  streamQueue = [];
+  streamLoading = false;
+}
 
 function renderReaderGrid(tags?: Tag[]) {
-  resultGrid.className = "reader-grid";
+  teardownReaderObserver();
+  resultGrid.className = state.readerMode === "stream" ? "reader-stream" : "reader-grid";
 
   const frag = document.createDocumentFragment();
 
@@ -671,32 +682,129 @@ function renderReaderGrid(tags?: Tag[]) {
 
   for (let i = 0; i < state.photos.length; i++) {
     const photo = state.photos[i];
-    const card = document.createElement("div");
-    card.className = "reader-photo";
-
-    const thumbWrap = document.createElement("div");
-    thumbWrap.className = "thumb-wrap";
-
-    if (photo.thumbnail) {
-      const img = document.createElement("img");
-      img.alt = "";
-      img.loading = "lazy";
-      hydrateImage(img, photo.thumbnail, photo.url);
-      thumbWrap.append(img);
-    }
-
-    const label = document.createElement("span");
-    label.className = "thumb-label";
-    label.textContent = `${i + 1} / ${state.photos.length}`;
-    thumbWrap.append(label);
-
-    card.append(thumbWrap);
     const idx = i;
-    card.addEventListener("click", () => openLightbox(idx));
-    frag.append(card);
+
+    if (state.readerMode === "stream") {
+      const container = document.createElement("div");
+      container.className = "stream-photo";
+      container.dataset.index = String(i);
+      container.dataset.state = "";
+      container.addEventListener("click", () => openLightbox(idx));
+      frag.append(container);
+
+      const label = document.createElement("div");
+      label.className = "stream-label";
+      label.textContent = `${i + 1} / ${state.photos.length}`;
+      frag.append(label);
+    } else {
+      const card = document.createElement("div");
+      card.className = "reader-photo";
+
+      const thumbWrap = document.createElement("div");
+      thumbWrap.className = "thumb-wrap";
+
+      if (photo.thumbnail) {
+        const img = document.createElement("img");
+        img.alt = "";
+        img.loading = "lazy";
+        hydrateImage(img, photo.thumbnail, photo.url);
+        thumbWrap.append(img);
+      }
+
+      const label = document.createElement("span");
+      label.className = "thumb-label";
+      label.textContent = `${i + 1} / ${state.photos.length}`;
+      thumbWrap.append(label);
+
+      card.append(thumbWrap);
+      card.addEventListener("click", () => openLightbox(idx));
+      frag.append(card);
+    }
   }
 
   resultGrid.replaceChildren(frag);
+
+  if (state.readerMode === "stream") {
+    setupStreamObserver();
+  }
+}
+
+let streamQueue: HTMLElement[] = [];
+let streamLoading = false;
+
+function setupStreamObserver() {
+  teardownReaderObserver();
+  streamQueue = [];
+  streamLoading = false;
+  readerObserver = new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          const container = entry.target as HTMLElement;
+          if (container.dataset.state === "" && !streamQueue.includes(container)) {
+            streamQueue.push(container);
+          }
+        }
+      }
+      if (!streamLoading) pumpStreamQueue();
+    },
+    { rootMargin: "400px" },
+  );
+
+  document.querySelectorAll<HTMLElement>(".stream-photo").forEach((el) => {
+    readerObserver!.observe(el);
+  });
+  // kick off first few visible
+  if (streamQueue.length === 0) {
+    const first = document.querySelector<HTMLElement>('.stream-photo[data-state=""]');
+    if (first) { streamQueue.push(first); pumpStreamQueue(); }
+  }
+}
+
+async function pumpStreamQueue() {
+  if (streamLoading || streamQueue.length === 0) return;
+  streamLoading = true;
+  while (streamQueue.length > 0) {
+    const container = streamQueue.shift()!;
+    if (container.dataset.state !== "") continue;
+    const token = state.readerToken;
+    if (token !== state.readerToken || state.view !== "reader") break;
+    await loadStreamImage(container);
+  }
+  streamLoading = false;
+}
+
+async function loadStreamImage(container: HTMLElement) {
+  const index = parseInt(container.dataset.index || "", 10);
+  if (isNaN(index)) return;
+  const token = state.readerToken;
+  container.dataset.state = "loading";
+
+  try {
+    const imageUrl = await resolvePhotoImageUrlWithRetry(index, 2);
+    if (token !== state.readerToken || container.dataset.state !== "loading") return;
+
+    const img = document.createElement("img");
+    img.className = "stream-img";
+    img.alt = state.photos[index]?.title || `#${index + 1}`;
+    img.addEventListener("load", () => {
+      container.dataset.state = "loaded";
+    }, { once: true });
+    img.addEventListener("error", () => {
+      container.dataset.state = "error";
+    }, { once: true });
+    img.src = imageUrl;
+    container.append(img);
+  } catch {
+    if (token !== state.readerToken || container.dataset.state !== "loading") return;
+    container.dataset.state = "error";
+  }
+}
+
+function toggleReaderMode() {
+  state.readerMode = state.readerMode === "grid" ? "stream" : "grid";
+  renderReaderGrid();
+  syncToolbar();
 }
 
 async function loadAlbumReader(aid: string, title: string) {
@@ -1300,23 +1408,8 @@ searchForm.addEventListener("submit", (event) => {
   state.mode = "search";
   state.query = query;
   searchInput.value = query;
-  state.page = Math.max(1, Number(pageInput.value || "1") || 1);
+  state.page = 1;
   state.allLoaded = false;
-  loadAlbums();
-});
-
-pageInput.addEventListener("change", () => {
-  state.page = Math.max(1, Number(pageInput.value || "1") || 1);
-  loadAlbums();
-});
-
-previousButton.addEventListener("click", () => {
-  state.page = Math.max(1, state.page - 1);
-  loadAlbums();
-});
-
-nextButton.addEventListener("click", () => {
-  state.page += 1;
   loadAlbums();
 });
 
