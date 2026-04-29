@@ -453,7 +453,11 @@ function renderAlbumCard(album: Album): HTMLElement {
 function renderAlbums(albums: Album[]) {
   state.albums = [...albums];
   resultGrid.className = "result-grid";
-  resultGrid.replaceChildren(...albums.map(renderAlbumCard));
+  resultGrid.replaceChildren(...albums.map((album, i) => {
+    const card = renderAlbumCard(album);
+    card.style.setProperty("--card-order", String(i));
+    return card;
+  }));
   if (albums.length > 0 && state.mode !== "tag" && !state.allLoaded) setupInfiniteScroll();
 }
 
@@ -621,8 +625,10 @@ async function loadNextPage() {
     state.page = page;
     state.albums = [...state.albums, ...albums];
     // Insert albums before the sentinel (keep sentinel at bottom)
-    for (const album of albums) {
-      insertBeforeSentinel(renderAlbumCard(album));
+    for (let i = 0; i < albums.length; i++) {
+      const card = renderAlbumCard(albums[i]);
+      card.style.setProperty("--card-order", String(i));
+      insertBeforeSentinel(card);
     }
     syncToolbar();
     setStatus(`抓到 ${resultGrid.querySelectorAll(".album-card").length} 条，第 ${state.page} 页`);
@@ -699,6 +705,7 @@ function renderReaderGrid(tags?: Tag[]) {
     } else {
       const card = document.createElement("div");
       card.className = "reader-photo";
+      card.style.setProperty("--card-order", String(i));
 
       const thumbWrap = document.createElement("div");
       thumbWrap.className = "thumb-wrap";
@@ -1167,13 +1174,29 @@ function preloadNeighbors(index: number) {
 }
 
 function closeLightbox() {
+  const overlay = document.querySelector(".lightbox");
+  if (overlay) {
+    overlay.classList.add("closing");
+    // Immediately mark as closed so keyboard/other handlers don't act
+    state.lightboxToken++;
+    state.lightboxIndex = -1;
+    state.lightboxImageUrl = null;
+    state.lightboxZoom = 1;
+    state.lightboxPanX = 0;
+    state.lightboxPanY = 0;
+    state.retryNotice = "";
+    // Wait for close animation to finish, then remove from DOM
+    overlay.addEventListener("animationend", (e: Event) => {
+      if ((e as AnimationEvent).animationName === "lightboxClose") renderLightbox();
+    }, { once: true });
+    return;
+  }
   state.lightboxToken++;
   state.lightboxIndex = -1;
   state.lightboxImageUrl = null;
   state.lightboxZoom = 1;
   state.lightboxPanX = 0;
   state.lightboxPanY = 0;
-  state.lightboxPanning = false;
   state.retryNotice = "";
   renderLightbox();
 }
