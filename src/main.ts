@@ -74,9 +74,6 @@ const state = {
   lightboxIndex: -1,
   lightboxImageUrl: null as string | null,
   preloadedUrls: {} as Record<number, string>, // index -> full image URL
-  preloading: false,
-  preloadTotal: 0,
-  preloadDone: 0,
   listToken: 0,
   readerToken: 0,
   lightboxToken: 0,
@@ -824,9 +821,6 @@ async function loadAlbumReader(aid: string, title: string) {
   state.lightboxIndex = -1;
   state.preloadedUrls = {};
   state.preloadFailures = {};
-  state.preloadDone = 0;
-  state.preloadTotal = 0;
-  state.preloading = false;
   syncToolbar();
   showEmpty("正在加载图集...");
 
@@ -841,41 +835,11 @@ async function loadAlbumReader(aid: string, title: string) {
     }
     renderReaderGrid(detail.tags);
     setStatus(`共 ${detail.photos.length} 张`);
-    startPreload(token);
   } catch (error) {
     if (token !== state.readerToken || state.view !== "reader" || state.currentAlbum?.aid !== aid) return;
     const message = error instanceof Error ? error.message : String(error);
     showError(message, () => loadAlbumReader(aid, title));
     setStatus("加载失败");
-  }
-}
-
-async function startPreload(_readerToken = state.readerToken) {
-  // 不再全局预加载所有图片的页面，改为按需加载
-  // 缩略图已经通过 hydrateImage 直接使用 WebView 加载
-  state.preloading = false;
-  updatePreloadBar();
-}
-
-function updatePreloadBar() {
-  const bar = document.querySelector<HTMLElement>("#preload-bar");
-  const fill = document.querySelector<HTMLElement>("#preload-fill");
-  if (!bar || !fill) return;
-
-  const pct = state.preloadTotal > 0 ? (state.preloadDone / state.preloadTotal) * 100 : 0;
-  fill.style.width = `${pct}%`;
-
-  if (state.preloading) {
-    bar.hidden = false;
-    const failed = Object.keys(state.preloadFailures).length;
-    bar.querySelector("span")!.textContent =
-      failed > 0
-        ? `预加载 ${state.preloadDone}/${state.preloadTotal}，重试中 ${failed}`
-        : `预加载 ${state.preloadDone}/${state.preloadTotal}`;
-  } else if (state.preloadDone > 0) {
-    const cached = Object.keys(state.preloadedUrls).length;
-    bar.querySelector("span")!.textContent = `已缓存 ${cached}/${state.photos.length}`;
-    setTimeout(() => { bar.hidden = true; }, 2000);
   }
 }
 
@@ -1054,7 +1018,6 @@ function bindLightboxZoomEvents(overlay: HTMLElement) {
     tapMoved = false;
 
     if (Math.abs(state.lightboxZoom - 1) > 0.01) {
-        event.preventDefault();
       const target = event.target as HTMLElement;
       if (!target.classList.contains("lightbox-image")) return;
 
@@ -1399,6 +1362,19 @@ function renderLightbox() {
 // ---- keyboard ----
 
 document.addEventListener("keydown", (e) => {
+  if (e.key === " " && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
+    e.preventDefault();
+    if (state.lightboxIndex >= 0) {
+      if (e.shiftKey) navigateLightbox(-1);
+      else navigateLightbox(1);
+      return;
+    }
+    const scrollTarget = resultGrid;
+    const delta = scrollTarget.clientHeight * 0.85;
+    scrollTarget.scrollBy({ top: e.shiftKey ? -delta : delta, behavior: "smooth" });
+    return;
+  }
+
   if (state.lightboxIndex >= 0) {
     if (e.key === "Escape") {
       closeLightbox();

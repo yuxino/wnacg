@@ -750,44 +750,6 @@ img:not(.image-loading):not(.image-error) {
     #141311;
 }
 
-.preload-bar {
-  grid-column: 1 / -1;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  position: sticky;
-  top: 0;
-  z-index: 5;
-  min-height: 36px;
-  padding: 8px 10px;
-  border: 1px solid rgba(52, 48, 39, 0.9);
-  border-radius: 8px;
-  background: rgba(20, 19, 17, 0.88);
-  backdrop-filter: blur(12px);
-  font-size: 13px;
-  color: #9d9686;
-}
-
-.preload-bar[hidden] {
-  display: none;
-}
-
-.preload-track {
-  flex: 1;
-  height: 4px;
-  border-radius: 2px;
-  background: #302d27;
-  overflow: hidden;
-}
-
-.preload-fill {
-  height: 100%;
-  width: 0%;
-  border-radius: 2px;
-  background: #d7bd67;
-  transition: width 0.3s;
-}
-
 .reader-photo {
   border: 1px solid #302d27;
   border-radius: 8px;

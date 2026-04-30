@@ -781,6 +781,12 @@ pub fn run() {
 
             let is_quitting = Arc::new(AtomicBool::new(false));
 
+            if cfg!(debug_assertions) {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_title("wnacg [DEV]");
+                }
+            }
+
             let app_handle = app.handle().clone();
             let close_is_quitting = is_quitting.clone();
             if let Some(window) = app.get_webview_window("main") {
@@ -797,6 +803,7 @@ pub fn run() {
 
             let _tray = TrayIconBuilder::new()
                 .icon(tray_icon_image())
+                .icon_as_template(true)
                 .tooltip("wnacg")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -829,6 +836,11 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_main_window(app);
+            }
+        });
 }
