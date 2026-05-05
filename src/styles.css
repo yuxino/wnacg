@@ -820,7 +820,8 @@ img:not(.image-loading):not(.image-error) {
 
 /* ---- reader mode toggle ---- */
 
-.reader-mode-toggle {
+.reader-mode-toggle,
+.fullscreen-button {
   padding: 0 12px;
   font-size: 13px;
   color: #d7bd67;
@@ -828,9 +829,28 @@ img:not(.image-loading):not(.image-error) {
   background: transparent;
 }
 
-.reader-mode-toggle:hover {
+.reader-mode-toggle:hover,
+.fullscreen-button:hover,
+.fullscreen-button.active {
   border-color: #d1b45d;
   background: rgba(215, 189, 103, 0.1);
+}
+
+.shell.fullscreen-mode {
+  background: #0f0e0c;
+}
+
+.shell.fullscreen-mode.reader-mode .toolbar {
+  padding: 8px 18px;
+  background: rgba(15, 14, 12, 0.82);
+}
+
+.shell.fullscreen-mode.reader-mode .reader-stream {
+  background: #0f0e0c;
+}
+
+.shell.fullscreen-mode.reader-mode .stream-photo {
+  max-width: 1040px;
 }
 
 /* ---- stream reader ---- */
@@ -871,6 +891,40 @@ img:not(.image-loading):not(.image-error) {
   animation: shimmer 1.25s ease-in-out infinite;
   min-height: 200px;
   border-radius: 4px;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+}
+
+.stream-error {
+  display: grid;
+  gap: 10px;
+  min-height: 180px;
+  place-items: center;
+  padding: 24px;
+  color: #ffd1d1;
+  font-size: 13px;
+  text-align: center;
+}
+
+.stream-error strong {
+  color: #f2eee5;
+  font-size: 15px;
+}
+
+.stream-error span {
+  max-width: 420px;
+  color: #cfc6b3;
+  overflow-wrap: anywhere;
+}
+
+.stream-error button {
+  min-height: 34px;
+  padding: 0 18px;
+  border-color: #d1b45d;
+  color: #15130f;
+  background: #d7bd67;
+  font-weight: 700;
 }
 
 .stream-label {
@@ -1008,6 +1062,52 @@ img:not(.image-loading):not(.image-error) {
   margin: 0;
   color: #cfc6b3;
   font-size: 13px;
+}
+
+.image-progress {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 8px;
+  width: min(320px, calc(100vw - 56px));
+}
+
+.image-progress.compact {
+  width: min(280px, 72vw);
+}
+
+.image-progress-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(157, 150, 134, 0.22);
+  overflow: hidden;
+}
+
+.image-progress-bar span {
+  display: block;
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: #d7bd67;
+  transition: width 0.16s ease;
+}
+
+.image-progress-bar .indeterminate {
+  width: 42%;
+  background: linear-gradient(90deg, transparent, #d7bd67, transparent);
+  animation: progressSweep 1.1s ease-in-out infinite;
+}
+
+.image-progress p {
+  margin: 0;
+  color: #cfc6b3;
+  font-size: 12px;
+  text-align: center;
+}
+
+@keyframes progressSweep {
+  from { transform: translateX(-120%); }
+  to { transform: translateX(260%); }
 }
 
 .lightbox-error {

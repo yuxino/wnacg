@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 type Album = {
   aid: string;
@@ -17,6 +18,28 @@ type PhotoEntry = {
 
 type PhotoImage = {
   url: string;
+};
+
+type ImageData = {
+  dataUrl: string;
+};
+
+type ImageDownloadProgress = {
+  requestId: string;
+  loaded: number;
+  total: number | null;
+  percent: number | null;
+};
+
+type ProgressState = {
+  loaded: number;
+  total: number | null;
+  percent: number | null;
+};
+
+type DisplayImageResult = {
+  url: string;
+  viaFallback: boolean;
 };
 
 type Tag = {
@@ -88,6 +111,9 @@ const state = {
   gestureStartZoom: 1,
   preloadFailures: {} as Record<number, number>,
   retryNotice: "",
+  lightboxProgress: null as ProgressState | null,
+  fullscreen: false,
+  conserveImages: true,
 };
 
 // DOM refs
@@ -103,6 +129,13 @@ const viewTitle = document.querySelector<HTMLElement>("#view-title")!;
 const statusLabel = document.querySelector<HTMLElement>("#status-label")!;
 const backButton = document.querySelector<HTMLButtonElement>("#back-to-list")!;
 const pagerControls = document.querySelector<HTMLElement>("#pager-controls")!;
+
+const fullscreenButton = document.createElement("button");
+fullscreenButton.type = "button";
+fullscreenButton.className = "fullscreen-button";
+fullscreenButton.title = "全屏 (F11)";
+fullscreenButton.addEventListener("click", () => toggleFullscreen());
+pagerControls.append(fullscreenButton);
 
 const readerModeBtn = document.createElement("button");
 readerModeBtn.type = "button";
@@ -124,6 +157,37 @@ workspace.append(jumpTopButton);
 
 function setStatus(message: string) {
   statusLabel.textContent = message;
+}
+
+function setFullscreenState(value: boolean) {
+  state.fullscreen = value;
+  shell.classList.toggle("fullscreen-mode", value);
+  fullscreenButton.classList.toggle("active", value);
+  fullscreenButton.textContent = value ? "退出全屏" : "全屏";
+  fullscreenButton.title = value ? "退出全屏 (F11)" : "全屏 (F11)";
+}
+
+async function syncFullscreenState() {
+  try {
+    setFullscreenState(await invokeTauri<boolean>("is_window_fullscreen"));
+  } catch {
+    setFullscreenState(Boolean(document.fullscreenElement));
+  }
+}
+
+async function toggleFullscreen() {
+  try {
+    const next = await invokeTauri<boolean>("toggle_window_fullscreen");
+    setFullscreenState(next);
+  } catch {
+    const next = !document.fullscreenElement;
+    if (next && document.fullscreenEnabled) {
+      await document.documentElement.requestFullscreen();
+    } else if (!next && document.exitFullscreen) {
+      await document.exitFullscreen();
+    }
+    setFullscreenState(next);
+  }
 }
 
 async function invokeTauri<T>(command: string, args?: Record<string, unknown>) {
@@ -206,6 +270,98 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 KB";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${value >= 10 || unit === 0 ? Math.round(value) : value.toFixed(1)} ${units[unit]}`;
+}
+
+function progressText(progress: ProgressState | null) {
+  if (!progress) return "正在解析图片";
+  if (typeof progress.percent === "number") {
+    const size = progress.total ? ` · ${formatBytes(progress.loaded)} / ${formatBytes(progress.total)}` : "";
+    return `下载中 ${progress.percent}%${size}`;
+  }
+  return `下载中 ${formatBytes(progress.loaded)}`;
+}
+
+function createProgressIndicator(progress: ProgressState | null, compact = false, message?: string) {
+  const wrap = document.createElement("div");
+  wrap.className = compact ? "image-progress compact" : "image-progress";
+
+  const bar = document.createElement("div");
+  bar.className = "image-progress-bar";
+  const fill = document.createElement("span");
+  const percent = progress?.percent;
+  if (typeof percent === "number") {
+    fill.style.width = `${Math.max(0, Math.min(100, percent))}%`;
+  } else {
+    fill.classList.add("indeterminate");
+  }
+  bar.append(fill);
+
+  const label = document.createElement("p");
+  label.textContent = message ?? progressText(progress);
+  wrap.append(bar, label);
+  return wrap;
+}
+
+function setSoftStatus(message: string) {
+  if (state.view === "reader") setStatus(message);
+}
+
+async function fetchImageDataUrlWithProgress(
+  url: string,
+  referer: string | null | undefined,
+  requestId: string,
+  onProgress: (progress: ProgressState) => void,
+) {
+  const unlisten = await listen<ImageDownloadProgress>("image-download-progress", (event) => {
+    if (event.payload.requestId !== requestId) return;
+    onProgress({
+      loaded: event.payload.loaded,
+      total: event.payload.total ?? null,
+      percent: event.payload.percent ?? null,
+    });
+  });
+
+  try {
+    const image = await invokeTauri<ImageData>("fetch_image_data_url_progress", {
+      url,
+      referer: referer ?? null,
+      requestId,
+    });
+    return image.dataUrl;
+  } finally {
+    unlisten();
+  }
+}
+
+async function loadDisplayImageDataUrl(
+  index: number,
+  requestId: string,
+  onProgress: (progress: ProgressState) => void,
+): Promise<DisplayImageResult> {
+  const imageUrl = await resolvePhotoImageUrlWithRetry(index, 2);
+  const referer = state.photos[index]?.url;
+  try {
+    return {
+      url: await fetchImageDataUrlWithProgress(imageUrl, referer, requestId, onProgress),
+      viaFallback: false,
+    };
+  } catch (error) {
+    console.warn("Image proxy failed, falling back to direct URL", error);
+    setSoftStatus("图片线路较慢，正在尝试备用显示");
+    return { url: imageUrl, viaFallback: true };
+  }
+}
+
 async function resolvePhotoImageUrlWithRetry(index: number, retries = 2) {
   let lastError: unknown = null;
 
@@ -250,9 +406,14 @@ async function preloadFullImage(index: number, readerToken = state.readerToken):
   try {
     const imageUrl = await resolvePhotoImageUrlWithRetry(index, 2);
     if (readerToken !== state.readerToken || state.view !== "reader") return "failed";
-    state.preloadedUrls[index] = imageUrl;
+    const image = await invokeTauri<ImageData>("fetch_image_data_url", {
+      url: imageUrl,
+      referer: state.photos[index]?.url ?? null,
+    });
+    if (readerToken !== state.readerToken || state.view !== "reader") return "failed";
+    state.preloadedUrls[index] = image.dataUrl;
     delete state.preloadFailures[index];
-    preloadImage(imageUrl);
+    preloadImage(image.dataUrl);
     return "loaded";
   } catch {
     if (readerToken !== state.readerToken || state.view !== "reader") return "failed";
@@ -328,9 +489,13 @@ function restoreListSnapshot() {
 // ---- toolbar sync ----
 
 function syncToolbar() {
+  shell.classList.toggle("fullscreen-mode", state.fullscreen);
+  fullscreenButton.textContent = state.fullscreen ? "退出全屏" : "全屏";
   if (state.view === "reader") {
     backButton.hidden = false;
-    pagerControls.hidden = true;
+    pagerControls.hidden = false;
+    refreshButton.hidden = true;
+    fullscreenButton.hidden = false;
     readerModeBtn.hidden = false;
     readerModeBtn.textContent = state.readerMode === "stream" ? "网格" : "一图流";
     viewTitle.textContent = state.currentAlbum?.title ?? "阅读";
@@ -339,6 +504,8 @@ function syncToolbar() {
   } else {
     backButton.hidden = true;
     pagerControls.hidden = false;
+    refreshButton.hidden = false;
+    fullscreenButton.hidden = false;
     readerModeBtn.hidden = true;
     viewTitle.textContent =
       state.mode === "tag" ? `标签：${state.query}` :
@@ -752,7 +919,7 @@ function setupStreamObserver() {
       }
       if (!streamLoading) pumpStreamQueue();
     },
-    { rootMargin: "400px" },
+    { root: resultGrid, rootMargin: state.conserveImages ? "120px 0px" : "400px 0px" },
   );
 
   document.querySelectorAll<HTMLElement>(".stream-photo").forEach((el) => {
@@ -783,26 +950,65 @@ async function loadStreamImage(container: HTMLElement) {
   if (isNaN(index)) return;
   const token = state.readerToken;
   container.dataset.state = "loading";
+  container.replaceChildren(createProgressIndicator(null, true));
 
   try {
-    const imageUrl = await resolvePhotoImageUrlWithRetry(index, 2);
+    const requestId = `stream-${token}-${index}-${Date.now()}`;
+    const image = await loadDisplayImageDataUrl(index, requestId, (progress) => {
+      if (token !== state.readerToken || container.dataset.state !== "loading") return;
+      container.replaceChildren(createProgressIndicator(progress, true));
+    });
     if (token !== state.readerToken || container.dataset.state !== "loading") return;
 
     const img = document.createElement("img");
     img.className = "stream-img";
     img.alt = state.photos[index]?.title || `#${index + 1}`;
     img.addEventListener("load", () => {
+      if (token !== state.readerToken) return;
       container.dataset.state = "loaded";
+      container.replaceChildren(img);
+      setSoftStatus(`已加载 ${index + 1} / ${state.photos.length}`);
     }, { once: true });
     img.addEventListener("error", () => {
+      if (token !== state.readerToken) return;
       container.dataset.state = "error";
+      renderStreamError(container, index, "这张图片暂时没有加载出来");
     }, { once: true });
-    img.src = imageUrl;
-    container.append(img);
-  } catch {
+    img.src = image.url;
+    if (image.viaFallback) {
+      container.replaceChildren(createProgressIndicator(null, true, "备用线路加载中"));
+    } else {
+      container.replaceChildren(img);
+    }
+  } catch (error) {
     if (token !== state.readerToken || container.dataset.state !== "loading") return;
     container.dataset.state = "error";
+    const message = error instanceof Error ? error.message : String(error);
+    renderStreamError(container, index, message);
   }
+}
+
+function renderStreamError(container: HTMLElement, index: number, message: string) {
+  const error = document.createElement("div");
+  error.className = "stream-error";
+
+  const title = document.createElement("strong");
+  title.textContent = `第 ${index + 1} 张加载失败`;
+
+  const text = document.createElement("span");
+  text.textContent = message || "网络不稳定，稍后再试";
+
+  const retry = document.createElement("button");
+  retry.type = "button";
+  retry.textContent = "重试";
+  retry.addEventListener("click", (event) => {
+    event.stopPropagation();
+    container.dataset.state = "";
+    loadStreamImage(container);
+  });
+
+  error.append(title, text, retry);
+  container.replaceChildren(error);
 }
 
 function toggleReaderMode() {
@@ -857,6 +1063,7 @@ function backToList(options: { restore?: boolean } = {}) {
   state.lightboxPanY = 0;
   state.lightboxPanning = false;
   state.retryNotice = "";
+  state.lightboxProgress = null;
   state.preloadFailures = {};
   document.querySelector(".lightbox")?.remove();
   teardownReaderObserver();
@@ -1080,12 +1287,14 @@ async function openLightbox(index: number) {
   const token = ++state.lightboxToken;
   state.lightboxIndex = index;
   state.lightboxImageUrl = null;
+  state.lightboxProgress = null;
   state.retryNotice = "";
   renderLightbox();
 
   // use preloaded URL if available
   if (state.preloadedUrls[index]) {
     state.lightboxImageUrl = state.preloadedUrls[index];
+    state.lightboxProgress = null;
     renderLightbox();
     preloadNeighbors(index);
     return;
@@ -1096,12 +1305,13 @@ async function openLightbox(index: number) {
 
 async function loadCurrentPhoto(index: number, token = ++state.lightboxToken) {
   state.lightboxImageUrl = null;
+  state.lightboxProgress = null;
   state.retryNotice = "";
   renderLightbox();
 
   let imageUrl: string;
   try {
-    imageUrl = await resolvePhotoImageUrlUntilSuccess(
+    const rawImageUrl = await resolvePhotoImageUrlUntilSuccess(
       index,
       () => token === state.lightboxToken && state.lightboxIndex === index,
       (attempt, error, delayMs) => {
@@ -1112,7 +1322,31 @@ async function loadCurrentPhoto(index: number, token = ++state.lightboxToken) {
         setStatus(`${state.retryNotice}: ${message}`);
       },
     );
+    if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
+    const requestId = `lightbox-${token}-${index}-${Date.now()}`;
+    try {
+      imageUrl = await fetchImageDataUrlWithProgress(
+        rawImageUrl,
+        state.photos[index]?.url,
+        requestId,
+        (progress) => {
+          if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
+          state.lightboxProgress = progress;
+          renderLightbox();
+        },
+      );
+    } catch (error) {
+      console.warn("Image proxy failed, falling back to direct URL", error);
+      setSoftStatus("图片线路较慢，正在尝试备用显示");
+      imageUrl = rawImageUrl;
+    }
   } catch {
+    if (token === state.lightboxToken && state.lightboxIndex === index) {
+      state.lightboxProgress = null;
+      state.lightboxImageUrl = "__error__";
+      renderLightbox();
+      setStatus("图片加载失败");
+    }
     return;
   }
 
@@ -1121,14 +1355,16 @@ async function loadCurrentPhoto(index: number, token = ++state.lightboxToken) {
   state.preloadedUrls[index] = imageUrl;
   delete state.preloadFailures[index];
   state.retryNotice = "";
-  preloadImage(imageUrl);
+  state.lightboxProgress = null;
+  if (!state.conserveImages) preloadImage(imageUrl);
   renderLightbox();
   preloadNeighbors(index);
   setStatus("");
 }
 
 function preloadNeighbors(index: number) {
-  for (const offset of [-2, -1, 1, 2]) {
+  if (state.conserveImages) return;
+  for (const offset of [-1, 1]) {
     const ni = index + offset;
     if (ni >= 0 && ni < state.photos.length && !state.preloadedUrls[ni]) {
       preloadFullImage(ni);
@@ -1148,6 +1384,7 @@ function closeLightbox() {
     state.lightboxPanX = 0;
     state.lightboxPanY = 0;
     state.retryNotice = "";
+    state.lightboxProgress = null;
     // Wait for close animation to finish, then remove from DOM
     overlay.addEventListener("animationend", (e: Event) => {
       if ((e as AnimationEvent).animationName === "lightboxClose") renderLightbox();
@@ -1161,6 +1398,7 @@ function closeLightbox() {
   state.lightboxPanX = 0;
   state.lightboxPanY = 0;
   state.retryNotice = "";
+  state.lightboxProgress = null;
   renderLightbox();
 }
 
@@ -1228,6 +1466,7 @@ function renderLightbox() {
       const spinner = document.createElement("div");
       spinner.className = "lightbox-spinner";
       loading.append(spinner);
+      loading.append(createProgressIndicator(state.lightboxProgress));
       const text = document.createElement("p");
       text.textContent = state.retryNotice || "加载中";
       loading.append(text);
@@ -1273,6 +1512,7 @@ function renderLightbox() {
     const spinner = document.createElement("div");
     spinner.className = "lightbox-spinner";
     loading.append(spinner);
+    loading.append(createProgressIndicator(state.lightboxProgress));
     const text = document.createElement("p");
     text.textContent = state.retryNotice || "加载中";
     loading.append(text);
@@ -1362,6 +1602,12 @@ function renderLightbox() {
 // ---- keyboard ----
 
 document.addEventListener("keydown", (e) => {
+  if (e.key === "F11") {
+    e.preventDefault();
+    toggleFullscreen();
+    return;
+  }
+
   if (e.key === " " && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
     e.preventDefault();
     if (state.lightboxIndex >= 0) {
@@ -1393,8 +1639,16 @@ document.addEventListener("keydown", (e) => {
   }
 
   if (state.view === "reader" && e.key === "Escape") {
+    if (state.fullscreen) {
+      toggleFullscreen();
+      return;
+    }
     backToList();
   }
+});
+
+document.addEventListener("fullscreenchange", () => {
+  setFullscreenState(Boolean(document.fullscreenElement));
 });
 
 // ---- events ----
@@ -1465,4 +1719,5 @@ function setupInfiniteScroll() {
 // ---- init ----
 
 renderCategories();
+syncFullscreenState();
 loadAlbums();

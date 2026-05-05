@@ -1,13 +1,15 @@
 use base64::Engine;
+use futures_util::StreamExt;
 use scraper::{Element, Html, Selector};
 use serde::Serialize;
 use std::collections::HashSet;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use tauri::image::Image;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 const BASE_URLS: [&str; 3] = [
     "https://www.wn03.cfd",
@@ -93,6 +95,15 @@ struct ImageData {
     data_url: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageDownloadProgress {
+    request_id: String,
+    loaded: u64,
+    total: Option<u64>,
+    percent: Option<u8>,
+}
+
 fn clean_url_value(value: &str) -> String {
     value
         .trim()
@@ -150,6 +161,14 @@ fn build_url(base_url: &str, path: &str) -> Result<String, String> {
 
 fn client() -> Result<&'static reqwest::Client, String> {
     HTTP_CLIENT.as_ref().map_err(Clone::clone)
+}
+
+fn looks_like_cloudflare_challenge(body: &str) -> bool {
+    body.contains("cf_chl")
+        || body.contains("Just a moment")
+        || body.contains("challenge-platform")
+        || body.contains("cf-mitigated")
+        || body.contains("challenges.cloudflare.com")
 }
 
 fn extract_aid(href: &str) -> Option<String> {
@@ -518,8 +537,11 @@ async fn fetch_page(url: String, referer: Option<&str>) -> Result<String, String
         .await
         .map_err(|err| format!("请求失败：{err}"))?;
 
+    let status = response.status();
     if !response.status().is_success() {
-        return Err(format!("服务返回 HTTP {}", response.status()));
+        return fetch_page_via_curl(url, referer.to_string())
+            .await
+            .map_err(|fallback_err| format!("服务返回 HTTP {status}\n备用通道也失败：{fallback_err}"));
     }
 
     let body = response
@@ -527,11 +549,66 @@ async fn fetch_page(url: String, referer: Option<&str>) -> Result<String, String
         .await
         .map_err(|err| format!("读取响应失败：{err}"))?;
 
-    if body.is_empty() || body.contains("cf_chl") || body.contains("Just a moment") {
-        return Err("站点返回空内容或被 CF 拦截".to_string());
+    if body.is_empty() || looks_like_cloudflare_challenge(&body) {
+        return fetch_page_via_curl(url, referer.to_string())
+            .await
+            .map_err(|fallback_err| format!("站点返回空内容或被 CF 拦截\n备用通道也失败：{fallback_err}"));
     }
 
     Ok(body)
+}
+
+async fn fetch_page_via_curl(url: String, referer: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let output = Command::new("curl")
+            .arg("--http1.1")
+            .arg("-L")
+            .arg("--compressed")
+            .arg("--max-time")
+            .arg("25")
+            .arg("-sS")
+            .arg("-A")
+            .arg("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
+            .arg("-H")
+            .arg("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+            .arg("-H")
+            .arg("Accept-Language: zh-CN,zh;q=0.9")
+            .arg("-H")
+            .arg(format!("Referer: {referer}"))
+            .arg("-w")
+            .arg("\n__WNACG_HTTP_STATUS__:%{http_code}")
+            .arg(&url)
+            .output()
+            .map_err(|err| format!("无法启动 curl：{err}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                format!("curl 退出码 {}", output.status)
+            } else {
+                stderr
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let marker = "\n__WNACG_HTTP_STATUS__:";
+        let Some(marker_at) = stdout.rfind(marker) else {
+            return Err("curl 没有返回状态码".to_string());
+        };
+        let body = stdout[..marker_at].to_string();
+        let code = stdout[marker_at + marker.len()..].trim();
+
+        if !code.starts_with('2') {
+            return Err(format!("curl 返回 HTTP {code}"));
+        }
+        if body.is_empty() || looks_like_cloudflare_challenge(&body) {
+            return Err("curl 返回空内容或仍被 Cloudflare 校验拦截".to_string());
+        }
+
+        Ok(body)
+    })
+    .await
+    .map_err(|err| format!("curl 备用任务失败：{err}"))?
 }
 
 async fn fetch_binary(url: String, referer: Option<String>) -> Result<(String, Vec<u8>), String> {
@@ -583,6 +660,91 @@ async fn fetch_binary(url: String, referer: Option<String>) -> Result<(String, V
     if bytes.is_empty() {
         return Err("图片内容为空".to_string());
     }
+
+    Ok((content_type, bytes))
+}
+
+async fn fetch_binary_with_progress(
+    app: tauri::AppHandle,
+    request_id: String,
+    url: String,
+    referer: Option<String>,
+) -> Result<(String, Vec<u8>), String> {
+    let mut request = client()?
+        .get(&url)
+        .header("accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+        .header("accept-language", "zh-CN,zh;q=0.9")
+        .header("priority", "u=1, i")
+        .header("sec-ch-ua", r#""Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147""#)
+        .header("sec-ch-ua-mobile", "?0")
+        .header("sec-ch-ua-platform", "macOS")
+        .header("sec-fetch-dest", "image")
+        .header("sec-fetch-mode", "no-cors")
+        .header("sec-fetch-site", "cross-site")
+        .header("sec-fetch-storage-access", "none");
+
+    if let Some(referer) = referer {
+        request = request.header("referer", referer);
+    } else {
+        request = request.header("referer", "https://wnacg.com/");
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|err| format!("图片请求失败：{err}"))?;
+
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("image/jpeg")
+        .split(';')
+        .next()
+        .unwrap_or("image/jpeg")
+        .to_string();
+    let total = response.content_length();
+
+    if !status.is_success() {
+        return Err(format!("图片服务返回 HTTP {status}"));
+    }
+
+    let mut loaded = 0_u64;
+    let mut bytes = Vec::with_capacity(total.unwrap_or(0).min(30_000_000) as usize);
+    let mut stream = response.bytes_stream();
+    let _ = app.emit("image-download-progress", ImageDownloadProgress {
+        request_id: request_id.clone(),
+        loaded,
+        total,
+        percent: total.map(|_| 0),
+    });
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| format!("读取图片失败：{err}"))?;
+        loaded += chunk.len() as u64;
+        bytes.extend_from_slice(&chunk);
+        let percent = total
+            .filter(|total| *total > 0)
+            .map(|total| ((loaded.saturating_mul(100) / total).min(100)) as u8);
+        let _ = app.emit("image-download-progress", ImageDownloadProgress {
+            request_id: request_id.clone(),
+            loaded,
+            total,
+            percent,
+        });
+    }
+
+    if bytes.is_empty() {
+        return Err("图片内容为空".to_string());
+    }
+
+    let _ = app.emit("image-download-progress", ImageDownloadProgress {
+        request_id,
+        loaded,
+        total,
+        percent: Some(100),
+    });
 
     Ok((content_type, bytes))
 }
@@ -726,6 +888,41 @@ async fn fetch_image_data_url(url: String, referer: Option<String>) -> Result<Im
     })
 }
 
+#[tauri::command]
+async fn fetch_image_data_url_progress(
+    url: String,
+    referer: Option<String>,
+    request_id: String,
+    app: tauri::AppHandle,
+) -> Result<ImageData, String> {
+    let url = clean_url_value(&url);
+    let host = reqwest::Url::parse(&url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default();
+    let allowed = is_allowed_wnacg_host(&host)
+        || host.starts_with("img")
+        || host.starts_with("t.")
+        || host.starts_with("cdn")
+        || host.starts_with("pic")
+        || host.starts_with("photo")
+        || host.starts_with("static")
+        || host == "qy0.ru"
+        || host.ends_with(".qy0.ru")
+        || BASE_URLS.iter().any(|base_url| url.starts_with(base_url));
+
+    if !allowed {
+        return Err("不允许加载非 WNACG 图片域名".to_string());
+    }
+
+    let (content_type, bytes) = fetch_binary_with_progress(app, request_id, url, referer).await?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+
+    Ok(ImageData {
+        data_url: format!("data:{content_type};base64,{encoded}"),
+    })
+}
+
 fn tray_icon_image() -> Image<'static> {
     tauri::include_image!("icons/tray-icon.png")
 }
@@ -756,6 +953,30 @@ fn toggle_main_window(app: &tauri::AppHandle) {
     }
 }
 
+#[tauri::command]
+fn is_window_fullscreen(app: tauri::AppHandle) -> Result<bool, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到主窗口".to_string())?;
+    window
+        .is_fullscreen()
+        .map_err(|err| format!("读取全屏状态失败：{err}"))
+}
+
+#[tauri::command]
+fn toggle_window_fullscreen(app: tauri::AppHandle) -> Result<bool, String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到主窗口".to_string())?;
+    let next = !window
+        .is_fullscreen()
+        .map_err(|err| format!("读取全屏状态失败：{err}"))?;
+    window
+        .set_fullscreen(next)
+        .map_err(|err| format!("切换全屏失败：{err}"))?;
+    Ok(next)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -766,7 +987,10 @@ pub fn run() {
             search_tag,
             fetch_album_photos,
             fetch_photo_image,
-            fetch_image_data_url
+            fetch_image_data_url,
+            fetch_image_data_url_progress,
+            is_window_fullscreen,
+            toggle_window_fullscreen
         ])
         .setup(|app| {
             let show = MenuItemBuilder::with_id("show", "显示").build(app)?;
