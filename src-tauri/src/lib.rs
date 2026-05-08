@@ -9,7 +9,7 @@ use std::sync::{Arc, LazyLock};
 use tauri::image::Image;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 const BASE_URLS: [&str; 3] = [
     "https://www.wn03.cfd",
@@ -87,6 +87,7 @@ struct Tag {
 struct AlbumDetail {
     photos: Vec<PhotoEntry>,
     tags: Vec<Tag>,
+    title: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -785,6 +786,41 @@ fn parse_album_tags(html: &str, base_url: &str) -> Vec<Tag> {
     }).collect()
 }
 
+fn parse_album_title(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+
+    // 优先取页面正文 <h2>（站点把作品名放在这里）
+    if let Ok(sel) = Selector::parse("#bodywrap h2, .userwrap h2, h2") {
+        if let Some(el) = document.select(&sel).next() {
+            let text = cleaned_text(&el.text().collect::<Vec<_>>().join(" "));
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+
+    // fallback: <title> 去掉站名后缀
+    if let Ok(sel) = Selector::parse("title") {
+        if let Some(el) = document.select(&sel).next() {
+            let raw = cleaned_text(&el.text().collect::<Vec<_>>().join(" "));
+            if raw.is_empty() {
+                return None;
+            }
+            let trimmed = raw
+                .split(|c| c == '|' || c == '-' || c == '_')
+                .next()
+                .unwrap_or(&raw)
+                .trim()
+                .to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+
+    None
+}
+
 #[tauri::command]
 async fn fetch_album_photos(aid: String, _app: tauri::AppHandle) -> Result<AlbumDetail, String> {
     let aid = aid.trim().to_string();
@@ -822,9 +858,10 @@ async fn fetch_album_photos(aid: String, _app: tauri::AppHandle) -> Result<Album
                 }
 
                 let tags = parse_album_tags(&first_html, base_url);
+                let title = parse_album_title(&first_html);
                 let mut seen = HashSet::new();
                 photos.retain(|photo| seen.insert(photo.id.clone()));
-                return Ok(AlbumDetail { photos, tags });
+                return Ok(AlbumDetail { photos, tags, title });
             }
             Err(error) => errors.push(format!("{base_url}: {error}")),
         }
@@ -954,20 +991,14 @@ fn toggle_main_window(app: &tauri::AppHandle) {
 }
 
 #[tauri::command]
-fn is_window_fullscreen(app: tauri::AppHandle) -> Result<bool, String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "找不到主窗口".to_string())?;
+fn is_window_fullscreen(window: tauri::Window) -> Result<bool, String> {
     window
         .is_fullscreen()
         .map_err(|err| format!("读取全屏状态失败：{err}"))
 }
 
 #[tauri::command]
-fn toggle_window_fullscreen(app: tauri::AppHandle) -> Result<bool, String> {
-    let window = app
-        .get_webview_window("main")
-        .ok_or_else(|| "找不到主窗口".to_string())?;
+fn toggle_window_fullscreen(window: tauri::Window) -> Result<bool, String> {
     let next = !window
         .is_fullscreen()
         .map_err(|err| format!("读取全屏状态失败：{err}"))?;
@@ -975,6 +1006,78 @@ fn toggle_window_fullscreen(app: tauri::AppHandle) -> Result<bool, String> {
         .set_fullscreen(next)
         .map_err(|err| format!("切换全屏失败：{err}"))?;
     Ok(next)
+}
+
+fn sanitize_window_label(aid: &str) -> String {
+    let mut label = String::from("album-");
+    for ch in aid.chars().take(40) {
+        if ch.is_ascii_alphanumeric() {
+            label.push(ch);
+        } else {
+            label.push('_');
+        }
+    }
+    label
+}
+
+#[tauri::command]
+fn open_album_window(app: tauri::AppHandle, aid: String, title: String) -> Result<(), String> {
+    if aid.trim().is_empty() {
+        return Err("缺少作品 ID".to_string());
+    }
+    let label = sanitize_window_label(&aid);
+
+    if let Some(existing) = app.get_webview_window(&label) {
+        existing.show().ok();
+        existing.set_focus().ok();
+        return Ok(());
+    }
+
+    let url = format!("index.html#aid={}", aid);
+    let window_title = if title.trim().is_empty() {
+        format!("作品 {aid}")
+    } else {
+        title
+    };
+
+    WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(url.into()))
+        .title(window_title)
+        .inner_size(1100.0, 820.0)
+        .min_inner_size(880.0, 640.0)
+        .build()
+        .map_err(|err| format!("无法创建窗口：{err}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+fn set_window_title(window: tauri::Window, title: String) -> Result<(), String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    window.set_title(trimmed).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn close_current_window(window: tauri::Window) -> Result<(), String> {
+    window.close().map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn search_tag_in_main(app: tauri::AppHandle, tag: String) -> Result<(), String> {
+    let trimmed = tag.trim();
+    if trimmed.is_empty() {
+        return Err("缺少标签".to_string());
+    }
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到主窗口".to_string())?;
+    main.show().ok();
+    main.unminimize().ok();
+    main.set_focus().ok();
+    main.emit("search-tag", trimmed.to_string())
+        .map_err(|err| format!("通知主窗口失败：{err}"))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -990,7 +1093,11 @@ pub fn run() {
             fetch_image_data_url,
             fetch_image_data_url_progress,
             is_window_fullscreen,
-            toggle_window_fullscreen
+            toggle_window_fullscreen,
+            open_album_window,
+            set_window_title,
+            close_current_window,
+            search_tag_in_main
         ])
         .setup(|app| {
             let show = MenuItemBuilder::with_id("show", "显示").build(app)?;
