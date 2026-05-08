@@ -71,6 +71,46 @@ type ListSnapshot = {
   status: string;
 };
 
+type ReaderWidth = "comfort" | "wide" | "edge";
+type ReaderGap = "relaxed" | "compact";
+type ReaderTheme = "warm" | "dark";
+
+type ReaderPrefs = {
+  width: ReaderWidth;
+  gap: ReaderGap;
+  theme: ReaderTheme;
+  conserveImages: boolean;
+};
+
+const readerPrefKey = "wnacg.readerPrefs.v1";
+
+const defaultReaderPrefs: ReaderPrefs = {
+  width: "comfort",
+  gap: "relaxed",
+  theme: "dark",
+  conserveImages: true,
+};
+
+function loadReaderPrefs(): ReaderPrefs {
+  try {
+    const raw = localStorage.getItem(readerPrefKey);
+    if (!raw) return { ...defaultReaderPrefs };
+    const parsed = JSON.parse(raw) as Partial<ReaderPrefs>;
+    return {
+      width: parsed.width === "wide" || parsed.width === "edge" ? parsed.width : defaultReaderPrefs.width,
+      gap: parsed.gap === "compact" ? "compact" : defaultReaderPrefs.gap,
+      theme: parsed.theme === "warm" ? "warm" : defaultReaderPrefs.theme,
+      conserveImages: typeof parsed.conserveImages === "boolean"
+        ? parsed.conserveImages
+        : defaultReaderPrefs.conserveImages,
+    };
+  } catch {
+    return { ...defaultReaderPrefs };
+  }
+}
+
+const readerPrefs = loadReaderPrefs();
+
 const categories: Category[] = [
   { label: "更新", path: "/albums-index-page-{page}.html" },
   { label: "同人志 汉化", path: "/albums-index-page-{page}-cate-1.html" },
@@ -93,6 +133,7 @@ const state = {
   loadMoreError: "",
   currentAlbum: null as { aid: string; title: string } | null,
   photos: [] as PhotoEntry[],
+  tags: [] as Tag[],
   readerMode: "stream" as "grid" | "stream",
   lightboxIndex: -1,
   lightboxImageUrl: null as string | null,
@@ -113,7 +154,10 @@ const state = {
   retryNotice: "",
   lightboxProgress: null as ProgressState | null,
   fullscreen: false,
-  conserveImages: true,
+  readerWidth: readerPrefs.width,
+  readerGap: readerPrefs.gap,
+  readerTheme: readerPrefs.theme,
+  conserveImages: readerPrefs.conserveImages,
 };
 
 // DOM refs
@@ -137,12 +181,17 @@ fullscreenButton.title = "全屏 (F11)";
 fullscreenButton.addEventListener("click", () => toggleFullscreen());
 pagerControls.append(fullscreenButton);
 
+const readerSettings = document.createElement("div");
+readerSettings.className = "reader-settings";
+readerSettings.hidden = true;
+
 const readerModeBtn = document.createElement("button");
 readerModeBtn.type = "button";
 readerModeBtn.className = "reader-mode-toggle";
 readerModeBtn.hidden = true;
 readerModeBtn.addEventListener("click", () => toggleReaderMode());
 pagerControls.append(readerModeBtn);
+pagerControls.append(readerSettings);
 
 const jumpTopButton = document.createElement("button");
 jumpTopButton.type = "button";
@@ -152,11 +201,143 @@ jumpTopButton.title = "回到顶部";
 jumpTopButton.hidden = true;
 workspace.append(jumpTopButton);
 
+const readerProgress = document.createElement("div");
+readerProgress.className = "reader-progress";
+readerProgress.hidden = true;
+const readerProgressFill = document.createElement("span");
+readerProgressFill.className = "reader-progress-fill";
+readerProgress.append(readerProgressFill);
+workspace.append(readerProgress);
+
+function createReaderSettingButton(
+  className: string,
+  title: string,
+  text: string,
+  onClick: () => void,
+) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = className;
+  btn.title = title;
+  btn.textContent = text;
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
+const readerWidthBtn = createReaderSettingButton(
+  "reader-setting-button",
+  "切换阅读宽度",
+  "",
+  () => cycleReaderWidth(),
+);
+const readerGapBtn = createReaderSettingButton(
+  "reader-setting-button icon-button",
+  "切换图片间距",
+  "",
+  () => toggleReaderGap(),
+);
+const readerThemeBtn = createReaderSettingButton(
+  "reader-setting-button icon-button",
+  "切换阅读背景",
+  "",
+  () => toggleReaderTheme(),
+);
+const readerPreloadBtn = createReaderSettingButton(
+  "reader-setting-button",
+  "切换预加载策略",
+  "",
+  () => toggleReaderPreload(),
+);
+readerSettings.append(readerWidthBtn, readerGapBtn, readerThemeBtn, readerPreloadBtn);
+
 
 // ---- helpers ----
 
 function setStatus(message: string) {
   statusLabel.textContent = message;
+}
+
+function saveReaderPrefs() {
+  const prefs: ReaderPrefs = {
+    width: state.readerWidth,
+    gap: state.readerGap,
+    theme: state.readerTheme,
+    conserveImages: state.conserveImages,
+  };
+  localStorage.setItem(readerPrefKey, JSON.stringify(prefs));
+}
+
+function applyReaderPrefs() {
+  shell.dataset.readerWidth = state.readerWidth;
+  shell.dataset.readerGap = state.readerGap;
+  shell.dataset.readerTheme = state.readerTheme;
+  shell.classList.toggle("reader-low-data", state.conserveImages);
+}
+
+function syncReaderControls() {
+  readerSettings.hidden = state.view !== "reader";
+  readerWidthBtn.textContent =
+    state.readerWidth === "comfort" ? "适中" : state.readerWidth === "wide" ? "宽屏" : "贴边";
+  readerGapBtn.textContent = state.readerGap === "compact" ? "紧凑" : "留白";
+  readerThemeBtn.textContent = state.readerTheme === "dark" ? "暗场" : "暖色";
+  readerPreloadBtn.textContent = state.conserveImages ? "省流" : "预载";
+
+  readerWidthBtn.setAttribute("aria-label", `阅读宽度：${readerWidthBtn.textContent}`);
+  readerGapBtn.setAttribute("aria-label", `图片间距：${readerGapBtn.textContent}`);
+  readerThemeBtn.setAttribute("aria-label", `阅读背景：${readerThemeBtn.textContent}`);
+  readerPreloadBtn.setAttribute("aria-label", `图片策略：${readerPreloadBtn.textContent}`);
+  readerPreloadBtn.classList.toggle("active", !state.conserveImages);
+  readerThemeBtn.classList.toggle("active", state.readerTheme === "warm");
+}
+
+function updateReaderPrefs(next: Partial<ReaderPrefs>) {
+  const previousConserve = state.conserveImages;
+  Object.assign(state, {
+    readerWidth: next.width ?? state.readerWidth,
+    readerGap: next.gap ?? state.readerGap,
+    readerTheme: next.theme ?? state.readerTheme,
+    conserveImages: next.conserveImages ?? state.conserveImages,
+  });
+  saveReaderPrefs();
+  applyReaderPrefs();
+  syncReaderControls();
+
+  if (state.view === "reader" && state.readerMode === "stream" && previousConserve !== state.conserveImages) {
+    setupStreamObserver();
+  }
+  if (!state.conserveImages && state.lightboxIndex >= 0) {
+    preloadNeighbors(state.lightboxIndex);
+  }
+}
+
+function cycleReaderWidth() {
+  const order: ReaderWidth[] = ["comfort", "wide", "edge"];
+  const next = order[(order.indexOf(state.readerWidth) + 1) % order.length];
+  updateReaderPrefs({ width: next });
+}
+
+function toggleReaderGap() {
+  updateReaderPrefs({ gap: state.readerGap === "relaxed" ? "compact" : "relaxed" });
+}
+
+function toggleReaderTheme() {
+  updateReaderPrefs({ theme: state.readerTheme === "dark" ? "warm" : "dark" });
+}
+
+function toggleReaderPreload() {
+  updateReaderPrefs({ conserveImages: !state.conserveImages });
+}
+
+function updateReaderProgress() {
+  const active = state.view === "reader" && state.lightboxIndex < 0;
+  readerProgress.hidden = !active;
+  if (!active) {
+    readerProgressFill.style.width = "0%";
+    return;
+  }
+  const maxScroll = Math.max(1, resultGrid.scrollHeight - resultGrid.clientHeight);
+  const percent = Math.max(0, Math.min(100, (resultGrid.scrollTop / maxScroll) * 100));
+  readerProgressFill.style.width = `${percent}%`;
 }
 
 function setFullscreenState(value: boolean) {
@@ -489,6 +670,7 @@ function restoreListSnapshot() {
 // ---- toolbar sync ----
 
 function syncToolbar() {
+  applyReaderPrefs();
   shell.classList.toggle("fullscreen-mode", state.fullscreen);
   fullscreenButton.textContent = state.fullscreen ? "退出全屏" : "全屏";
   if (state.view === "reader") {
@@ -513,6 +695,8 @@ function syncToolbar() {
     sidebar.classList.remove("hidden");
     shell.classList.remove("reader-mode");
   }
+  syncReaderControls();
+  updateReaderProgress();
   updateListControls();
 }
 
@@ -824,9 +1008,10 @@ function teardownReaderObserver() {
   streamLoading = false;
 }
 
-function renderReaderGrid(tags?: Tag[]) {
+function renderReaderGrid(tags = state.tags) {
   teardownReaderObserver();
   resultGrid.className = state.readerMode === "stream" ? "reader-stream" : "reader-grid";
+  resultGrid.scrollTop = 0;
 
   const frag = document.createDocumentFragment();
 
@@ -898,6 +1083,7 @@ function renderReaderGrid(tags?: Tag[]) {
   if (state.readerMode === "stream") {
     setupStreamObserver();
   }
+  updateReaderProgress();
 }
 
 let streamQueue: HTMLElement[] = [];
@@ -1024,6 +1210,7 @@ async function loadAlbumReader(aid: string, title: string) {
   state.view = "reader";
   state.currentAlbum = { aid, title: title || `作品 ${aid}` };
   state.photos = [];
+  state.tags = [];
   state.lightboxIndex = -1;
   state.preloadedUrls = {};
   state.preloadFailures = {};
@@ -1034,6 +1221,7 @@ async function loadAlbumReader(aid: string, title: string) {
     const detail = await invokeTauri<AlbumDetail>("fetch_album_photos", { aid });
     if (token !== state.readerToken || state.view !== "reader" || state.currentAlbum?.aid !== aid) return;
     state.photos = detail.photos;
+    state.tags = detail.tags;
     if (detail.photos.length === 0) {
       showEmpty("图集里没有图片");
       setStatus("空图集");
@@ -1056,6 +1244,7 @@ function backToList(options: { restore?: boolean } = {}) {
   state.view = "list";
   state.currentAlbum = null;
   state.photos = [];
+  state.tags = [];
   state.lightboxIndex = -1;
   state.lightboxImageUrl = null;
   state.lightboxZoom = 1;
@@ -1168,6 +1357,14 @@ function bindLightboxZoomEvents(overlay: HTMLElement) {
     if (target.classList.contains("lightbox-image")) return;
     if (target.closest(".lightbox-toolbar") || target.closest(".lightbox-nav")) return;
     closeLightbox();
+  });
+
+  overlay.addEventListener("dblclick", (event) => {
+    const target = event.target as HTMLElement;
+    if (!target.classList.contains("lightbox-image")) return;
+    event.preventDefault();
+    if (Math.abs(state.lightboxZoom - 1) < 0.02) setLightboxZoom(2.4);
+    else resetLightboxZoom();
   });
 
   overlay.addEventListener(
@@ -1628,6 +1825,12 @@ document.addEventListener("keydown", (e) => {
       navigateLightbox(-1);
     } else if (e.key === "ArrowRight") {
       navigateLightbox(1);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      moveLightboxPan(0, 80);
+    } else if (e.key === "ArrowDown") {
+      e.preventDefault();
+      moveLightboxPan(0, -80);
     } else if ((e.key === "+" || e.key === "=") && state.lightboxImageUrl && state.lightboxImageUrl !== "__error__") {
       setLightboxZoom(state.lightboxZoom * 1.2);
     } else if (e.key === "-" && state.lightboxImageUrl && state.lightboxImageUrl !== "__error__") {
@@ -1636,6 +1839,29 @@ document.addEventListener("keydown", (e) => {
       resetLightboxZoom();
     }
     return;
+  }
+
+  if (state.view === "reader" && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
+    if (e.key.toLowerCase() === "m") {
+      toggleReaderMode();
+      return;
+    }
+    if (e.key.toLowerCase() === "w") {
+      cycleReaderWidth();
+      return;
+    }
+    if (e.key.toLowerCase() === "g") {
+      toggleReaderGap();
+      return;
+    }
+    if (e.key.toLowerCase() === "t") {
+      toggleReaderTheme();
+      return;
+    }
+    if (e.key.toLowerCase() === "p") {
+      toggleReaderPreload();
+      return;
+    }
   }
 
   if (state.view === "reader" && e.key === "Escape") {
@@ -1678,6 +1904,7 @@ resultGrid.addEventListener(
   "scroll",
   () => {
     updateJumpTopButton();
+    updateReaderProgress();
     const snapshot = state.listSnapshots[listContextKey()];
     if (state.view === "list" && snapshot) {
       snapshot.scrollTop = resultGrid.scrollTop;
