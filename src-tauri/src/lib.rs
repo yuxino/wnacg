@@ -11,11 +11,7 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
-const BASE_URLS: [&str; 3] = [
-    "https://www.wn03.cfd",
-    "https://wnacg.com",
-    "https://www.wnacg.com",
-];
+const BASE_URLS: [&str; 1] = ["https://www.wn03.cfd"];
 static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
@@ -531,12 +527,19 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
 
 async fn fetch_page(url: String, referer: Option<&str>) -> Result<String, String> {
     let referer = referer.unwrap_or("https://wnacg.com/");
-    let response = client()?
+    let response = match client()?
         .get(&url)
         .header("referer", referer)
         .send()
         .await
-        .map_err(|err| format!("请求失败：{err}"))?;
+    {
+        Ok(r) => r,
+        Err(err) => {
+            return fetch_page_via_curl(url, referer.to_string())
+                .await
+                .map_err(|fallback_err| format!("请求失败：{err}\n备用通道也失败：{fallback_err}"));
+        }
+    };
 
     let status = response.status();
     if !response.status().is_success() {
@@ -545,10 +548,14 @@ async fn fetch_page(url: String, referer: Option<&str>) -> Result<String, String
             .map_err(|fallback_err| format!("服务返回 HTTP {status}\n备用通道也失败：{fallback_err}"));
     }
 
-    let body = response
-        .text()
-        .await
-        .map_err(|err| format!("读取响应失败：{err}"))?;
+    let body = match response.text().await {
+        Ok(b) => b,
+        Err(err) => {
+            return fetch_page_via_curl(url, referer.to_string())
+                .await
+                .map_err(|fallback_err| format!("读取响应失败：{err}\n备用通道也失败：{fallback_err}"));
+        }
+    };
 
     if body.is_empty() || looks_like_cloudflare_challenge(&body) {
         return fetch_page_via_curl(url, referer.to_string())
