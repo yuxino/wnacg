@@ -1,18 +1,10 @@
-<table>
-  <tr>
-    <td width="34%" align="center">
-      <img src="docs/images/wnacg-mascot.png" width="250" alt="wnacg 看板娘">
-    </td>
-    <td width="66%">
-      <h1>wnacg</h1>
-      <p><strong>找本子，打开，一路看到底。</strong></p>
-      <p>分类、搜索、标签和连续阅读都收在一个窗口里，关掉再开也记得看到哪了。</p>
-      <p><a href="#截图">截图</a> · <a href="#本地跑">本地跑</a> · <a href="#先说好">先说好</a></p>
-    </td>
-  </tr>
-</table>
+# wnacg
 
-一个只在本机跑的 wnacg 桌面阅读器。没有账号，也没有自己的服务端；阅读位置和设置都存在本机。
+wnacg 的桌面阅读器，支持分类、搜索、标签、连续阅读和阅读进度保存。
+
+<img src="docs/images/wnacg-mascot.png" width="180" alt="wnacg 看板娘">
+
+没有账号，也没有自己的服务端。阅读位置和设置都存在本机。
 
 > 18+。这里只放源码，不放安装包。截图也都糊过了。
 
