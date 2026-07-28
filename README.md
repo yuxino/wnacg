@@ -1,7 +1,7 @@
 <table>
   <tr>
     <td width="38%" align="center">
-      <img src="docs/images/wnacg-mascot.png" width="280" alt="wnacg 小浣熊">
+      <img src="docs/images/wnacg-mascot.png" width="280" alt="wnacg 小狐狸">
     </td>
     <td width="62%">
       <h1>wnacg</h1>
