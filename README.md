@@ -1,53 +1,50 @@
-<div align="center">
-  <img src="src-tauri/icons/icon.png" width="112" alt="wnacg 图标">
-  <h1>wnacg</h1>
-  <p><strong>为桌面重新整理的安静阅读体验</strong></p>
-  <p>
-    Tauri 2 · TypeScript · Rust
-  </p>
-  <p>
-    <a href="#从源码构建">从源码构建</a>
-    · <a href="#功能">功能</a>
-    · <a href="#使用边界">使用边界</a>
-  </p>
-</div>
-
-<br>
-
-![wnacg 的作品列表，封面已隐藏](docs/images/wnacg-library-masked.jpg)
-
-wnacg 把浏览、搜索和连续阅读收进一个桌面窗口。它会记住阅读位置与显示偏好，也可以把作品放进独立窗口，留在手边慢慢看。
-
-> **仅限成年人。** 本项目只提供源码，用于编程学习与技术研究；不提供安装包，也不托管任何第三方内容。截图中的封面与阅读内容均已隐藏。
-
-## 功能
-
 <table>
   <tr>
-    <td width="33%">
-      <strong>快速找到内容</strong><br><br>
-      分类、关键词搜索、标签跳转和连续加载集中在同一处。
+    <td width="38%" align="center">
+      <img src="docs/images/wnacg-mascot.png" width="280" alt="wnacg 小浣熊">
     </td>
-    <td width="33%">
-      <strong>专注连续阅读</strong><br><br>
-      调整宽度、间距、主题和预加载策略，点击图片即可放大。
-    </td>
-    <td width="33%">
-      <strong>保持本地与轻量</strong><br><br>
-      阅读设置和最近进度保存在本机，不要求注册账号。
+    <td width="62%">
+      <h1>wnacg</h1>
+      <p><strong>把浏览和连续阅读，安静地放进桌面。</strong></p>
+      <p>一个使用 Tauri 2、TypeScript 与 Rust 构建的桌面阅读器实验。</p>
+      <p>
+        <a href="#从源码构建"><strong>从源码构建 →</strong></a>
+        &nbsp;·&nbsp; <a href="#使用边界">使用边界</a>
+      </p>
     </td>
   </tr>
 </table>
 
-### 阅读体验
+> **仅限成年人。** 本项目仅提供源码，用于编程学习与技术研究；不提供安装包，也不托管任何第三方内容。页面中的封面与阅读图片均已隐藏。
 
-- 瀑布流连续阅读与全屏查看
-- 图片缩放、进度提示和失败重试
-- 阅读位置自动记录
-- 作品可在独立窗口中打开
-- 菜单栏常驻，关闭窗口后可以快速回来
+## 先找到想看的
+
+分类、关键词搜索、标签跳转和连续加载都在同一个窗口里。阅读进度会保存在本机，下次打开时可以从上次的位置继续。
+
+![wnacg 的作品列表，封面已隐藏](docs/images/wnacg-library-masked.jpg)
+
+## 打开后，直接往下读
+
+阅读页尽量把界面让给内容。宽度、图片间距、背景和预加载策略都可以调整；需要细看时，点击图片即可放大或进入全屏。
 
 ![wnacg 的连续阅读页，图片已隐藏](docs/images/wnacg-reader-masked.jpg)
+
+<table>
+  <tr>
+    <td width="33%">
+      <strong>连续阅读</strong><br><br>
+      瀑布流加载、进度提示、失败重试和图片缩放。
+    </td>
+    <td width="33%">
+      <strong>独立窗口</strong><br><br>
+      把作品单独打开，列表与阅读互不打扰。
+    </td>
+    <td width="33%">
+      <strong>本地记录</strong><br><br>
+      阅读偏好和最近进度保存在本机，无需注册账号。
+    </td>
+  </tr>
+</table>
 
 ## 从源码构建
 
@@ -66,15 +63,20 @@ npm run tauri dev
 npm run tauri build
 ```
 
-> 仓库不发布预编译安装包。构建与运行前，请先确认自己已年满 18 周岁并理解下方的使用边界。
+> 仓库不发布预编译安装包。构建与运行前，请确认自己已年满 18 周岁，并理解下方的使用边界。
 
-## 使用提示
+<details>
+<summary><strong>使用提示</strong></summary>
+
+<br>
 
 - 在列表底部继续滚动会自动加载更多内容
 - 点击标签可以查找同类内容
 - 阅读时按空格键可以继续向下翻页
 - 页面暂时无法载入时，可以点击右上角的刷新按钮
 - 关闭窗口不会退出应用；需要完全退出时请使用菜单栏图标
+
+</details>
 
 ## 使用边界
 
