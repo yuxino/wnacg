@@ -2,7 +2,7 @@
 
 wnacg 的桌面客户端。
 
-<img src="docs/images/wnacg-mascot.png" width="180" alt="wnacg 看板娘">
+<img src="docs/images/wnacg-avatar.png" width="180" alt="wnacg">
 
 分类、关键词和标签都能搜。点进去以后直接往下看，阅读位置和显示设置会存在本机。
 
