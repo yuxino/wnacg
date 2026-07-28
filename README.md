@@ -1,54 +1,44 @@
 <table>
   <tr>
-    <td width="38%" align="center">
-      <img src="docs/images/wnacg-mascot.png" width="280" alt="wnacg 小狐狸">
+    <td width="34%" align="center">
+      <img src="docs/images/wnacg-mascot.png" width="250" alt="wnacg 小狐狸">
     </td>
-    <td width="62%">
+    <td width="66%">
       <h1>wnacg</h1>
-      <p><strong>把浏览和连续阅读，安静地放进桌面。</strong></p>
-      <p>一个使用 Tauri 2、TypeScript 与 Rust 构建的桌面阅读器实验。</p>
-      <p>
-        <a href="#从源码构建"><strong>从源码构建 →</strong></a>
-        &nbsp;·&nbsp; <a href="#使用边界">使用边界</a>
-      </p>
+      <p><strong>一个给自己用的桌面阅读器。</strong></p>
+      <p>我想在桌面上翻 wnacg，又不想一直开着浏览器，于是做了这个。</p>
+      <p><a href="#自己构建">自己构建</a> · <a href="#使用边界">使用边界</a></p>
     </td>
   </tr>
 </table>
 
-> **仅限成年人。** 本项目仅提供源码，用于编程学习与技术研究；不提供安装包，也不托管任何第三方内容。页面中的封面与阅读图片均已隐藏。
+它不会附带或托管任何内容，只是把列表、搜索和阅读页重新整理成一个桌面应用。阅读位置和显示设置都留在本机。
 
-## 先找到想看的
+> 这个项目只适合成年人。仓库只放源码，不提供安装包。下面的截图已经做了高斯模糊。
 
-分类、关键词搜索、标签跳转和连续加载都在同一个窗口里。阅读进度会保存在本机，下次打开时可以从上次的位置继续。
+## 长什么样
 
-![wnacg 的作品列表，封面已隐藏](docs/images/wnacg-library-masked.jpg)
+先在列表里找。可以按分类翻，也可以直接搜关键词；滚到底会继续加载。
 
-## 打开后，直接往下读
+![作品列表，封面已做高斯模糊](docs/images/wnacg-library-masked.jpg)
 
-阅读页尽量把界面让给内容。宽度、图片间距、背景和预加载策略都可以调整；需要细看时，点击图片即可放大或进入全屏。
+点开一本之后就是连续阅读。工具栏里可以调宽度、间距、背景和预加载，也可以单独开一个窗口放在旁边。
 
-![wnacg 的连续阅读页，图片已隐藏](docs/images/wnacg-reader-masked.jpg)
+![连续阅读页，图片已做高斯模糊](docs/images/wnacg-reader-masked.jpg)
 
-<table>
-  <tr>
-    <td width="33%">
-      <strong>连续阅读</strong><br><br>
-      瀑布流加载、进度提示、失败重试和图片缩放。
-    </td>
-    <td width="33%">
-      <strong>独立窗口</strong><br><br>
-      把作品单独打开，列表与阅读互不打扰。
-    </td>
-    <td width="33%">
-      <strong>本地记录</strong><br><br>
-      阅读偏好和最近进度保存在本机，无需注册账号。
-    </td>
-  </tr>
-</table>
+## 现在有这些
 
-## 从源码构建
+- 分类、关键词和标签搜索
+- 连续阅读、全屏、缩放和失败重试
+- 阅读位置与显示偏好自动保存
+- 独立阅读窗口
+- macOS 菜单栏常驻
 
-需要 [Node.js](https://nodejs.org/)、[Rust](https://www.rust-lang.org/tools/install)，以及 [Tauri 2 的系统依赖](https://v2.tauri.app/start/prerequisites/)。
+没有账号系统，也没有服务端。前端是 TypeScript，抓取和图片代理在 Rust 里，外面套了一层 Tauri 2。
+
+## 自己构建
+
+先准备好 [Node.js](https://nodejs.org/)、[Rust](https://www.rust-lang.org/tools/install) 和 [Tauri 2 需要的系统依赖](https://v2.tauri.app/start/prerequisites/)。
 
 ```bash
 git clone https://github.com/yuxino/wnacg.git
@@ -57,46 +47,33 @@ npm install
 npm run tauri dev
 ```
 
-构建当前平台的应用：
+需要打包时：
 
 ```bash
 npm run tauri build
 ```
 
-> 仓库不发布预编译安装包。构建与运行前，请确认自己已年满 18 周岁，并理解下方的使用边界。
-
-<details>
-<summary><strong>使用提示</strong></summary>
-
-<br>
-
-- 在列表底部继续滚动会自动加载更多内容
-- 点击标签可以查找同类内容
-- 阅读时按空格键可以继续向下翻页
-- 页面暂时无法载入时，可以点击右上角的刷新按钮
-- 关闭窗口不会退出应用；需要完全退出时请使用菜单栏图标
-
-</details>
+仓库不会发布预编译版本。想试的话，请自己看过代码再构建。
 
 ## 使用边界
 
 <details>
-<summary><strong>使用前请阅读：仅限 18 周岁以上使用者</strong></summary>
+<summary>使用前请读一下</summary>
 
 <br>
 
-- 本项目仅供学习与技术研究，不鼓励、不协助传播违法或侵权内容
-- 未满 18 周岁者不得下载、构建、运行或以其他方式使用本项目
-- 使用者应自行确认其行为符合所在地法律、内容来源条款及相关平台规则
-- 不得使用本项目访问、保存或传播涉及未成年人的性内容、非自愿私密内容或其他违法内容
-- 项目不提供、不上传、不托管第三方作品；内容由使用者所访问的第三方来源提供
-- 第三方内容可能受到著作权及其他权利保护；请勿复制、再分发或用于商业用途
-- 项目维护者无法控制第三方来源的可用性、安全性与内容，也不对使用者的具体行为背书
+- 仅限 18 周岁以上使用者
+- 这个项目只用于学习和技术研究，不应用来传播违法或侵权内容
+- 请自行确认使用行为符合所在地法律、内容来源条款和平台规则
+- 不得访问、保存或传播涉及未成年人的性内容、非自愿私密内容及其他违法内容
+- 项目不提供、不上传、不托管第三方作品
+- 第三方内容可能受著作权保护，请勿复制、再分发或用于商业用途
+- 上游站点的内容和可用性不受本项目控制
 
-免责声明不能替代法律。若你无法判断某项使用是否合法，请停止使用并咨询所在地的专业人士。
+如果拿不准某种用法是否合法，就不要使用。
 
 </details>
 
 ## 参与开发
 
-欢迎提交 [Issue](https://github.com/yuxino/wnacg/issues) 和 Pull Request。请勿在 Issue、PR 或截图中上传露骨内容。
+Issue 和 Pull Request 都欢迎。请不要在讨论、提交或截图里上传露骨内容。
