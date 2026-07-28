@@ -4,8 +4,6 @@
   <h1>wnacg</h1>
 </div>
 
----
-
 <p align="center">wnacg 的桌面客户端</p>
 
 <p align="center">
