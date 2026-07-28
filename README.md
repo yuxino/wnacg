@@ -1,8 +1,20 @@
-# wnacg
+<div align="center">
+  <br>
+  <img src="docs/images/wnacg-avatar.png" width="112" alt="wnacg">
+  <h1>wnacg</h1>
+</div>
 
-wnacg 的桌面客户端。
+---
 
-<img src="docs/images/wnacg-avatar.png" width="180" alt="wnacg">
+<p align="center">wnacg 的桌面客户端</p>
+
+<p align="center">
+  <a href="#运行"><strong>本地运行</strong></a>
+  · <a href="#截图">截图</a>
+  · <a href="#说明">说明</a>
+</p>
+
+<br>
 
 分类、关键词和标签都能搜。点进去以后直接往下看，阅读位置和显示设置会存在本机。
 
