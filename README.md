@@ -14,7 +14,7 @@
 
 <br>
 
-![wnacg 的连续阅读页，图片已隐藏](docs/images/wnacg-reader-masked.jpg)
+![wnacg 的作品列表，封面已隐藏](docs/images/wnacg-library-masked.jpg)
 
 wnacg 把浏览、搜索和连续阅读收进一个桌面窗口。它会记住阅读位置与显示偏好，也可以把作品放进独立窗口，留在手边慢慢看。
 
@@ -39,8 +39,6 @@ wnacg 把浏览、搜索和连续阅读收进一个桌面窗口。它会记住�
   </tr>
 </table>
 
-![wnacg 的作品列表，封面已隐藏](docs/images/wnacg-library-masked.jpg)
-
 ### 阅读体验
 
 - 瀑布流连续阅读与全屏查看
@@ -48,6 +46,8 @@ wnacg 把浏览、搜索和连续阅读收进一个桌面窗口。它会记住�
 - 阅读位置自动记录
 - 作品可在独立窗口中打开
 - 菜单栏常驻，关闭窗口后可以快速回来
+
+![wnacg 的连续阅读页，图片已隐藏](docs/images/wnacg-reader-masked.jpg)
 
 ## 从源码构建
 
