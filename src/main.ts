@@ -1232,6 +1232,9 @@ function drawCoverAndText(
 ) {
   text = normalizeCjkText(text);
   const fill = sampleBoxColor(img, x, y, w, h);
+  const [fr, fg, fb] = parseRgb(fill);
+  const fillLuminance = 0.299 * fr + 0.587 * fg + 0.114 * fb;
+  const textColor = resolveTextColor(img, x, y, w, h, fillLuminance);
   ctx.save();
   ctx.fillStyle = fill;
   ctx.beginPath();
@@ -1249,13 +1252,11 @@ function drawCoverAndText(
   ctx.stroke();
   ctx.globalAlpha = 1;
 
-  const [fr, fg, fb] = parseRgb(fill);
-  const luminance = 0.299 * fr + 0.587 * fg + 0.114 * fb;
-  const darkText = luminance > 150;
-  ctx.fillStyle = darkText ? "#1c1c1c" : "#ffffff";
+  const darkText = textColor.luminance > fillLuminance;
+  ctx.fillStyle = textColor.color;
   ctx.textBaseline = "middle";
   if (!darkText) {
-    // 深色气泡上白字加一点阴影,保证可读
+    // 浅色文字(白/亮字)加一点阴影,保证可读
     ctx.shadowColor = "rgba(0, 0, 0, 0.55)";
     ctx.shadowBlur = 2;
     ctx.shadowOffsetY = 1;
@@ -1267,6 +1268,27 @@ function drawCoverAndText(
     drawHorizontalText(ctx, text, x, y, w, h);
   }
   ctx.restore();
+}
+
+function resolveTextColor(
+  img: HTMLImageElement,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  fillLuminance: number,
+): { color: string; luminance: number } {
+  const sampled = sampleTextColor(img, x, y, w, h, fillLuminance);
+  const base = sampled ?? (fillLuminance > 150 ? "#1c1c1c" : "#ffffff");
+  const [tr, tg, tb] = parseRgb(base);
+  let luminance = 0.299 * tr + 0.587 * tg + 0.114 * tb;
+  let color = base;
+  // 对比度兜底:文字色和底色太接近时,按底色明暗强制黑/白,保证可读
+  if (Math.abs(luminance - fillLuminance) < 70) {
+    color = fillLuminance > 150 ? "#1c1c1c" : "#ffffff";
+    luminance = fillLuminance > 150 ? 20 : 255;
+  }
+  return { color, luminance };
 }
 
 function parseRgb(color: string): [number, number, number] {
@@ -1293,6 +1315,92 @@ const SAMPLE_MAX_DIM = 1200;
 let sampleCanvas: HTMLCanvasElement | null = null;
 
 function sampleBoxColor(img: HTMLImageElement, x: number, y: number, w: number, h: number): string {
+  const { sample, ctx, scaleX, scaleY } = ensureSampleCanvas(img);
+  if (!ctx) return "#ffffff";
+  // 采样点放在框外一圈:取最亮(色值最大)的采样点,白色气泡就得到纯白
+  const pad = Math.max(3, Math.min(10, w * 0.08, h * 0.08));
+  const points: Array<[number, number]> = [
+    [x - pad, y - pad], [x + w / 2, y - pad], [x + w + pad, y - pad],
+    [x - pad, y + h / 2], [x + w + pad, y + h / 2],
+    [x - pad, y + h + pad], [x + w / 2, y + h + pad], [x + w + pad, y + h + pad],
+  ];
+  let best: [number, number, number] | null = null;
+  let bestLum = -1;
+  for (const [px, py] of points) {
+    const sx = Math.round(px * scaleX);
+    const sy = Math.round(py * scaleY);
+    if (sx < 0 || sy < 0 || sx >= sample.width || sy >= sample.height) continue;
+    const data = ctx.getImageData(sx, sy, 1, 1).data;
+    if (data[3] === 0) continue;
+    const lum = 0.299 * data[0] + 0.587 * data[1] + 0.114 * data[2];
+    if (lum > bestLum) {
+      bestLum = lum;
+      best = [data[0], data[1], data[2]];
+    }
+  }
+  if (!best) return "#ffffff";
+  return `rgb(${Math.round(best[0])},${Math.round(best[1])},${Math.round(best[2])})`;
+}
+
+// 在原图区域内统计"笔墨"颜色(与底色差异大的像素),取多数一方的平均色
+function sampleTextColor(
+  img: HTMLImageElement,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  fillLuminance: number,
+): string | null {
+  const { sample, ctx, scaleX, scaleY } = ensureSampleCanvas(img);
+  if (!ctx) return null;
+  const sx0 = Math.max(0, Math.round(x * scaleX));
+  const sy0 = Math.max(0, Math.round(y * scaleY));
+  const sw = Math.max(1, Math.round(w * scaleX));
+  const sh = Math.max(1, Math.round(h * scaleY));
+  if (sx0 >= sample.width || sy0 >= sample.height) return null;
+  let data: Uint8ClampedArray;
+  try {
+    data = ctx.getImageData(sx0, sy0, Math.min(sw, sample.width - sx0), Math.min(sh, sample.height - sy0)).data;
+  } catch {
+    return null;
+  }
+  const darkPixels: Array<{ lum: number; r: number; g: number; b: number }> = [];
+  const lightPixels: Array<{ lum: number; r: number; g: number; b: number }> = [];
+  for (let i = 0; i < data.length; i += 4) {
+    const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    if (Math.abs(lum - fillLuminance) < 30) continue; // 背景像素跳过
+    if (lum < fillLuminance) {
+      darkPixels.push({ lum, r: data[i], g: data[i + 1], b: data[i + 2] });
+    } else {
+      lightPixels.push({ lum, r: data[i], g: data[i + 1], b: data[i + 2] });
+    }
+  }
+  const total = darkPixels.length + lightPixels.length;
+  if (total < 30) return null; // 区域内基本没有文字像素
+  const average = (pixels: Array<{ lum: number; r: number; g: number; b: number }>, takeDarkest: boolean) => {
+    pixels.sort((a, b) => (takeDarkest ? a.lum - b.lum : b.lum - a.lum));
+    const take = Math.max(8, Math.floor(pixels.length * 0.1));
+    const picked = pixels.slice(0, take);
+    const r = picked.reduce((s, p) => s + p.r, 0) / picked.length;
+    const g = picked.reduce((s, p) => s + p.g, 0) / picked.length;
+    const b = picked.reduce((s, p) => s + p.b, 0) / picked.length;
+    return `rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`;
+  };
+  if (darkPixels.length >= lightPixels.length && darkPixels.length >= total * 0.3) {
+    return average(darkPixels, true); // 取最暗一簇,贴近真实墨色
+  }
+  if (lightPixels.length > darkPixels.length && lightPixels.length >= total * 0.3) {
+    return average(lightPixels, false); // 取最亮一簇(白字/亮字)
+  }
+  return null;
+}
+
+function ensureSampleCanvas(img: HTMLImageElement): {
+  sample: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D | null;
+  scaleX: number;
+  scaleY: number;
+} {
   if (!sampleCanvas) {
     sampleCanvas = document.createElement("canvas");
   }
@@ -1302,40 +1410,9 @@ function sampleBoxColor(img: HTMLImageElement, x: number, y: number, w: number, 
   sample.height = Math.max(1, Math.round(img.naturalHeight * scale));
   sample.getContext("2d")?.drawImage(img, 0, 0, sample.width, sample.height);
   const ctx = sample.getContext("2d", { willReadFrequently: true });
-  if (!ctx) return "#ffffff";
   const scaleX = sample.width / (img.offsetWidth || img.naturalWidth);
   const scaleY = sample.height / (img.offsetHeight || img.naturalHeight);
-  // 采样点放在框外一圈:漫画气泡通常以白色为底,取中位数抗气泡描边干扰
-  const pad = Math.max(3, Math.min(10, w * 0.08, h * 0.08));
-  const points: Array<[number, number]> = [
-    [x - pad, y - pad], [x + w / 2, y - pad], [x + w + pad, y - pad],
-    [x - pad, y + h / 2], [x + w + pad, y + h / 2],
-    [x - pad, y + h + pad], [x + w / 2, y + h + pad], [x + w + pad, y + h + pad],
-  ];
-  const rs: number[] = [], gs: number[] = [], bs: number[] = [];
-  for (const [px, py] of points) {
-    const sx = Math.round(px * scaleX);
-    const sy = Math.round(py * scaleY);
-    if (sx < 0 || sy < 0 || sx >= sample.width || sy >= sample.height) continue;
-    const data = ctx.getImageData(sx, sy, 1, 1).data;
-    if (data[3] === 0) continue;
-    rs.push(data[0]); gs.push(data[1]); bs.push(data[2]);
-  }
-  if (rs.length === 0) return "#ffffff";
-  const median = (values: number[]) => {
-    values.sort((a, b) => a - b);
-    return values[Math.floor(values.length / 2)];
-  };
-  let r = median(rs), g = median(gs), b = median(bs);
-  // 采样到深色(描边/背景)时往白色方向混合,避免深色补丁
-  const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
-  if (luminance < 150) {
-    const mix = 0.5;
-    r = Math.round(r * (1 - mix) + 255 * mix);
-    g = Math.round(g * (1 - mix) + 255 * mix);
-    b = Math.round(b * (1 - mix) + 255 * mix);
-  }
-  return `rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`;
+  return { sample, ctx, scaleX, scaleY };
 }
 
 function roundRect(
@@ -1501,6 +1578,7 @@ function translateBusy(index: number): boolean {
 }
 
 function renderTranslateBadge(index: number) {
+  updateWindowTitle(); // 标题栏状态跟随任意徽标刷新
   const container = document.querySelector<HTMLElement>(`.stream-photo[data-index="${index}"]`);
   if (!container) return;
   container.querySelector(".stream-translate-badge")?.remove();
@@ -1565,6 +1643,7 @@ function updateTranslateBadges() {
   }
   for (const index of indices) renderTranslateBadge(index);
   if (state.lightboxIndex >= 0) renderLightboxTranslateBadge();
+  updateWindowTitle(); // 标题栏同步翻译开关状态
 }
 
 // ---- 悬停原文提示:翻译后鼠标移到译文字块上,可查看原文 ----
@@ -2258,6 +2337,7 @@ function syncToolbar() {
     readerSettings.hidden = false;
     const albumTitle = state.currentAlbum?.title;
     viewTitle.textContent = (albumTitle && titleTranslationCache.get(albumTitle)) || albumTitle || "阅读";
+    updateWindowTitle();
     sidebar.classList.add("hidden");
     shell.classList.add("reader-mode");
   } else {
@@ -2359,26 +2439,45 @@ function applyTagSearch(tag: string) {
 }
 
 const APP_TITLE = "wnacg · 桌面阅读器";
+let windowTitleBase: string | null = null; // 当前专辑标题(已按需翻译),null=列表
 
 async function applyAlbumTitle(title: string) {
   const trimmed = title.trim();
   if (!trimmed) return;
   const shown = await translatedAlbumTitle(trimmed);
+  windowTitleBase = shown;
   // 同步刷新 view-title（如果当前在 reader 视图）
   if (state.view === "reader") {
     viewTitle.textContent = shown;
   }
-  document.title = `${shown} · wnacg`;
-  try {
-    await invokeTauri<void>("set_window_title", { title: `${shown} · wnacg` });
-  } catch {
-    // 主窗口失败可忽略,前端 document.title 已经更新
-  }
+  updateWindowTitle();
 }
 
 function resetWindowTitle() {
-  document.title = APP_TITLE;
-  invokeTauri<void>("set_window_title", { title: APP_TITLE }).catch(() => {});
+  windowTitleBase = null;
+  updateWindowTitle();
+}
+
+// 标题栏显示翻译开关状态:开着=翻译开,进行中=翻译中…,失败=翻译失败
+function updateWindowTitle() {
+  let title = windowTitleBase || "";
+  if (title && state.view === "reader" && state.translateEnabled) {
+    const index = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+    if (index >= 0 && index < state.photos.length) {
+      if (state.translateFailed[index]) {
+        title += " · 翻译失败";
+      } else if (translateBusy(index)) {
+        title += " · 翻译中…";
+      } else {
+        title += " · 翻译开";
+      }
+    } else {
+      title += " · 翻译开";
+    }
+  }
+  const full = title ? `${title} · wnacg` : APP_TITLE;
+  document.title = full;
+  invokeTauri<void>("set_window_title", { title: full }).catch(() => {});
 }
 
 function renderAlbumCard(album: Album): HTMLElement {
