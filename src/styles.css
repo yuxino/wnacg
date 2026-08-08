@@ -563,6 +563,47 @@ button:has(> .icon + span) {
   flex: 0 0 auto;
 }
 
+.translate-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-subtle);
+  white-space: nowrap;
+  user-select: none;
+}
+
+.translate-status::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+}
+
+.translate-status.on::before {
+  background: #4caf7d;
+}
+
+.translate-status.working::before {
+  background: #ffd166;
+  animation: translate-pulse 1.1s ease-in-out infinite;
+}
+
+.translate-status.failed {
+  color: #ff8b8b;
+  border-color: rgba(255, 88, 88, 0.5);
+  cursor: pointer;
+}
+
+.translate-status.failed::before {
+  background: #ff5c5c;
+}
+
 .reader-settings {
   position: relative;
   display: flex;

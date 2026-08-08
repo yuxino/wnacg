@@ -277,6 +277,22 @@ setIconWithLabel(backButton, "arrowLeft", "返回");
 const toolbarLeft = document.querySelector<HTMLElement>(".toolbar-left")!;
 const pagerControls = document.querySelector<HTMLElement>("#pager-controls")!;
 
+const translateStatus = document.createElement("span");
+translateStatus.id = "translate-status";
+translateStatus.className = "translate-status";
+translateStatus.hidden = true;
+translateStatus.addEventListener("click", () => {
+  const index = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+  if (state.translateFailed[index]) {
+    delete state.translateFailed[index];
+    translateDone.delete(index);
+    queueOcrText(index);
+    queueTranslate(index);
+    refreshTranslateStatus();
+  }
+});
+pagerControls.append(translateStatus);
+
 const fullscreenButton = document.createElement("button");
 fullscreenButton.type = "button";
 fullscreenButton.className = "fullscreen-button";
@@ -1578,7 +1594,7 @@ function translateBusy(index: number): boolean {
 }
 
 function renderTranslateBadge(index: number) {
-  updateWindowTitle(); // 标题栏状态跟随任意徽标刷新
+  refreshTranslateStatus();
   const container = document.querySelector<HTMLElement>(`.stream-photo[data-index="${index}"]`);
   if (!container) return;
   container.querySelector(".stream-translate-badge")?.remove();
@@ -1643,7 +1659,7 @@ function updateTranslateBadges() {
   }
   for (const index of indices) renderTranslateBadge(index);
   if (state.lightboxIndex >= 0) renderLightboxTranslateBadge();
-  updateWindowTitle(); // 标题栏同步翻译开关状态
+  refreshTranslateStatus();
 }
 
 // ---- 悬停原文提示:翻译后鼠标移到译文字块上,可查看原文 ----
@@ -2338,6 +2354,7 @@ function syncToolbar() {
     const albumTitle = state.currentAlbum?.title;
     viewTitle.textContent = (albumTitle && titleTranslationCache.get(albumTitle)) || albumTitle || "阅读";
     updateWindowTitle();
+    refreshTranslateStatus();
     sidebar.classList.add("hidden");
     shell.classList.add("reader-mode");
   } else {
@@ -2458,26 +2475,37 @@ function resetWindowTitle() {
   updateWindowTitle();
 }
 
-// 标题栏显示翻译开关状态:开着=翻译开,进行中=翻译中…,失败=翻译失败
+// 窗口标题只显示专辑标题,翻译状态由工具栏的全屏按钮左侧徽标显示
 function updateWindowTitle() {
-  let title = windowTitleBase || "";
-  if (title && state.view === "reader" && state.translateEnabled) {
-    const index = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
-    if (index >= 0 && index < state.photos.length) {
-      if (state.translateFailed[index]) {
-        title += " · 翻译失败";
-      } else if (translateBusy(index)) {
-        title += " · 翻译中…";
-      } else {
-        title += " · 翻译开";
-      }
-    } else {
-      title += " · 翻译开";
-    }
-  }
+  const title = windowTitleBase || "";
   const full = title ? `${title} · wnacg` : APP_TITLE;
   document.title = full;
   invokeTauri<void>("set_window_title", { title: full }).catch(() => {});
+}
+
+// 工具栏"翻译中…"徽标:显示在全屏按钮左侧,开着/进行中/失败三态
+function refreshTranslateStatus() {
+  const status = document.getElementById("translate-status");
+  if (!status) return;
+  if (state.view !== "reader" || !state.translateEnabled) {
+    status.hidden = true;
+    return;
+  }
+  let label = "翻译开";
+  let className = "on";
+  const index = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+  if (index >= 0 && index < state.photos.length) {
+    if (state.translateFailed[index]) {
+      label = "翻译失败 · 点击重试";
+      className = "failed";
+    } else if (translateBusy(index)) {
+      label = "翻译中…";
+      className = "working";
+    }
+  }
+  status.textContent = label;
+  status.className = `translate-status ${className}`;
+  status.hidden = false;
 }
 
 function renderAlbumCard(album: Album): HTMLElement {
