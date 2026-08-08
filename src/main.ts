@@ -40,6 +40,7 @@ type ProgressState = {
 type DisplayImageResult = {
   url: string;
   viaFallback: boolean;
+  imageUrl: string;
 };
 
 type Tag = {
@@ -75,12 +76,16 @@ type ListSnapshot = {
 type ReaderWidth = "comfort" | "wide" | "edge";
 type ReaderGap = "relaxed" | "compact";
 type ReaderTheme = "warm" | "dark";
+type ReaderOcrLang = "zh" | "ja";
 
 type ReaderPrefs = {
   width: ReaderWidth;
   gap: ReaderGap;
   theme: ReaderTheme;
   conserveImages: boolean;
+  ocrBoxes: boolean;
+  ocrLang: ReaderOcrLang;
+  translateMode: boolean;
 };
 
 const readerPrefKey = "wnacg.readerPrefs.v1";
@@ -90,6 +95,9 @@ const defaultReaderPrefs: ReaderPrefs = {
   gap: "relaxed",
   theme: "dark",
   conserveImages: true,
+  ocrBoxes: false,
+  ocrLang: "ja",
+  translateMode: false,
 };
 
 function loadReaderPrefs(): ReaderPrefs {
@@ -104,6 +112,15 @@ function loadReaderPrefs(): ReaderPrefs {
       conserveImages: typeof parsed.conserveImages === "boolean"
         ? parsed.conserveImages
         : defaultReaderPrefs.conserveImages,
+      ocrBoxes: typeof parsed.ocrBoxes === "boolean"
+        ? parsed.ocrBoxes
+        : defaultReaderPrefs.ocrBoxes,
+      ocrLang: parsed.ocrLang === "zh" || parsed.ocrLang === "ja"
+        ? parsed.ocrLang
+        : defaultReaderPrefs.ocrLang,
+      translateMode: typeof parsed.translateMode === "boolean"
+        ? parsed.translateMode
+        : defaultReaderPrefs.translateMode,
     };
   } catch {
     return { ...defaultReaderPrefs };
@@ -115,8 +132,11 @@ const readerPrefs = loadReaderPrefs();
 const categories: Category[] = [
   { label: "更新", path: "/albums-index-page-{page}.html" },
   { label: "同人志 汉化", path: "/albums-index-page-{page}-cate-1.html" },
+  { label: "同人志 生肉", path: "/albums-index-page-{page}-cate-12.html" },
   { label: "单行本 汉化", path: "/albums-index-page-{page}-cate-9.html" },
+  { label: "单行本 生肉", path: "/albums-index-page-{page}-cate-13.html" },
   { label: "短篇 汉化", path: "/albums-index-page-{page}-cate-10.html" },
+  { label: "短篇 生肉", path: "/albums-index-page-{page}-cate-14.html" },
   { label: "韩漫 汉化", path: "/albums-index-page-{page}-cate-20.html" },
 ];
 
@@ -158,6 +178,30 @@ const state = {
   readerGap: readerPrefs.gap,
   readerTheme: readerPrefs.theme,
   conserveImages: readerPrefs.conserveImages,
+  ocrEnabled: readerPrefs.ocrBoxes,
+  ocrLang: readerPrefs.ocrLang,
+  translateEnabled: readerPrefs.translateMode,
+  ocrRegions: {} as Record<number, OcrRegion[]>,
+  ocrFailed: {} as Record<number, string>,
+  translateTexts: {} as Record<number, string[]>,
+  translateFailed: {} as Record<number, string>,
+  imageUrls: {} as Record<number, string>,
+};
+
+const preloadInFlight = new Set<number>();
+
+type OcrRegion = {
+  text: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+};
+
+type OcrPageResult = {
+  index: number;
+  regions: OcrRegion[];
+  error: string | null;
 };
 
 // ---- icons (inline SVG, lucide-style, 24x24 viewBox, stroke 1.75) ----
@@ -413,6 +457,67 @@ function buildReaderSettingsPanel() {
         (v) => updateReaderPrefs({ conserveImages: v }),
       ),
     },
+    {
+      title: "OCR 文字框",
+      render: () => renderSegmented<boolean>(
+        [
+          { label: "关闭", value: false },
+          { label: "开启", value: true, hint: "O" },
+        ],
+        state.ocrEnabled,
+        (v) => {
+          if (v === state.ocrEnabled) return;
+          if (v) {
+            toggleReaderOcr(true);
+          } else {
+            updateReaderPrefs({ ocrBoxes: false });
+          }
+        },
+      ),
+    },
+    {
+      title: "OCR 语言",
+      render: () => renderSegmented<ReaderOcrLang>(
+        [
+          { label: "中文优先", value: "zh" },
+          { label: "日文优先", value: "ja" },
+        ],
+        state.ocrLang,
+        (v) => updateReaderPrefs({ ocrLang: v }),
+      ),
+    },
+    {
+      title: "翻译字幕",
+      render: () => renderSegmented<boolean>(
+        [
+          { label: "关闭", value: false },
+          { label: "开启", value: true, hint: "R" },
+        ],
+        state.translateEnabled,
+        (v) => toggleReaderTranslate(v),
+      ),
+    },
+    {
+      title: "生肉标题翻译",
+      render: () => renderSegmented<boolean>(
+        [
+          { label: "关闭", value: false },
+          { label: "开启", value: true },
+        ],
+        titleTranslateEnabled,
+        (v) => {
+          if (v === titleTranslateEnabled) return;
+          setTitleTranslate(v);
+          showToast(
+            v
+              ? "生肉标题翻译已开启，列表与详情标题将显示中文"
+              : "生肉标题翻译已关闭，恢复原标题",
+            "success",
+            2600,
+          );
+        },
+      ),
+    },
   ];
 
   function renderSegmented<V>(
@@ -521,6 +626,9 @@ function saveReaderPrefs() {
     gap: state.readerGap,
     theme: state.readerTheme,
     conserveImages: state.conserveImages,
+    ocrBoxes: state.ocrEnabled,
+    ocrLang: state.ocrLang,
+    translateMode: state.translateEnabled,
   };
   localStorage.setItem(readerPrefKey, JSON.stringify(prefs));
 }
@@ -539,11 +647,17 @@ function syncReaderControls() {
 
 function updateReaderPrefs(next: Partial<ReaderPrefs>) {
   const previousConserve = state.conserveImages;
+  const previousOcr = state.ocrEnabled;
+  const previousOcrLang = state.ocrLang;
+  const previousTranslate = state.translateEnabled;
   Object.assign(state, {
     readerWidth: next.width ?? state.readerWidth,
     readerGap: next.gap ?? state.readerGap,
     readerTheme: next.theme ?? state.readerTheme,
     conserveImages: next.conserveImages ?? state.conserveImages,
+    ocrEnabled: next.ocrBoxes ?? state.ocrEnabled,
+    ocrLang: next.ocrLang ?? state.ocrLang,
+    translateEnabled: next.translateMode ?? state.translateEnabled,
   });
   saveReaderPrefs();
   applyReaderPrefs();
@@ -554,6 +668,9 @@ function updateReaderPrefs(next: Partial<ReaderPrefs>) {
     gap: state.readerGap,
     theme: state.readerTheme,
     conserveImages: state.conserveImages,
+    ocrBoxes: state.ocrEnabled,
+    ocrLang: state.ocrLang,
+    translateMode: state.translateEnabled,
   }).catch(() => {});
 
   if (state.view === "reader" && previousConserve !== state.conserveImages) {
@@ -561,6 +678,55 @@ function updateReaderPrefs(next: Partial<ReaderPrefs>) {
   }
   if (!state.conserveImages && state.lightboxIndex >= 0) {
     preloadNeighbors(state.lightboxIndex);
+  }
+  if (previousOcr !== state.ocrEnabled) {
+    if (state.ocrEnabled) {
+      ocrPrefetchLoadedPages();
+    } else {
+      removeAllOcrOverlays();
+      removeAllTranslateOverlays();
+      ocrPendingIndices.clear();
+      ocrTextPending.clear();
+      state.translateTexts = {};
+    }
+  }
+  if (previousOcrLang !== state.ocrLang) {
+    // 识别语言变了,清掉旧结果重新识别
+    state.ocrRegions = {};
+    state.ocrFailed = {};
+    ocrPendingIndices.clear();
+    ocrTextPending.clear();
+    ocrTextDone.clear();
+    removeAllOcrOverlays();
+    removeAllTranslateOverlays();
+    state.translateTexts = {};
+    translatePending.clear();
+    translateDone.clear();
+    if (state.ocrEnabled) ocrPrefetchLoadedPages();
+  }
+  if (previousTranslate !== state.translateEnabled) {
+    if (state.translateEnabled) {
+      if (state.ocrLang !== "ja") {
+        showToast("翻译字幕需要日文识别，请将 OCR 语言切到「日文优先」", "info", 3600);
+        updateReaderPrefs({ ocrLang: "ja" });
+        return;
+      }
+      if (!state.ocrEnabled) {
+        void toggleReaderOcr(true);
+      }
+      removeAllOcrOverlays(); // 翻译开启时隐藏红框,只看译文
+      queueTranslate(state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex());
+      updateTranslateBadges();
+    } else {
+      removeAllTranslateOverlays();
+      translatePending.clear();
+      updateTranslateBadges();
+      if (state.ocrEnabled) {
+        const index = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+        renderStreamOcrOverlay(index);
+        renderLightboxOcrOverlay();
+      }
+    }
   }
 }
 
@@ -580,6 +746,939 @@ function toggleReaderTheme() {
 
 function toggleReaderPreload() {
   updateReaderPrefs({ conserveImages: !state.conserveImages });
+}
+
+// ---- 本地 OCR (文字区域框选) ----
+
+const OCR_BATCH = 4;
+const ocrPendingIndices = new Set<number>();
+let ocrBatchRunning = false;
+const ocrTextPending = new Set<number>();
+const ocrTextDone = new Set<number>();
+let ocrTextBatchRunning = false;
+let ocrMangaInitTried = false;
+
+function ocrLanguages(): string[] {
+  return state.ocrLang === "zh"
+    ? ["zh-Hans", "zh-Hant", "ja-JP", "en-US"]
+    : ["ja-JP", "zh-Hans", "zh-Hant", "en-US"];
+}
+
+function ocrEngine(): string {
+  // 日文优先:漫画专用本地引擎(竖排日文);中文优先:Apple Vision(横排中文)
+  return state.ocrLang === "ja" ? "manga" : "vision";
+}
+
+function isVisiblePage(index: number): boolean {
+  return index === state.lightboxIndex
+    || (state.lightboxIndex < 0 && index === currentStreamIndex());
+}
+
+function isNearPage(index: number): boolean {
+  // 翻译预取窗口:当前页前 1 后 3,提前识别+翻译,滚动过去时基本已就绪
+  if (index < 0 || index >= state.photos.length) return false;
+  if (state.lightboxIndex >= 0) {
+    return index >= state.lightboxIndex - 1 && index <= state.lightboxIndex + 3;
+  }
+  const current = currentStreamIndex();
+  return index >= current - 1 && index <= current + 3;
+}
+
+function queueOcrWindow(index: number) {
+  // 翻译开启:当前页前后窗口全部预识别+预翻译;关闭:只补当前页文字
+  for (let i = index - 1; i <= index + 3; i++) {
+    if (i < 0 || i >= state.photos.length) continue;
+    if (state.translateEnabled) {
+      queueOcrText(i);
+      queueTranslate(i);
+    } else if (i === index) {
+      queueOcrText(i);
+    }
+  }
+  if (state.translateEnabled) {
+    // 预取前方图片,让 OCR/翻译提前跑起来(翻译开启时不受省流限制)
+    for (const offset of [1, 2]) {
+      const ahead = index + offset;
+      if (ahead >= 0 && ahead < state.photos.length && !state.preloadedUrls[ahead]) {
+        void preloadFullImage(ahead);
+      }
+    }
+  }
+  updateTranslateBadges();
+}
+
+async function toggleReaderOcr(force?: boolean) {
+  const next = force ?? !state.ocrEnabled;
+  if (next === state.ocrEnabled) return;
+  if (!next) {
+    updateReaderPrefs({ ocrBoxes: false });
+    return;
+  }
+
+  const firstTime = ocrEngine() === "manga" && !ocrMangaInitTried;
+  if (ocrEngine() === "manga") ocrMangaInitTried = true;
+  const toast = showToast(
+    firstTime
+      ? "正在准备本地漫画 OCR（首次需下载约 230MB 模型，请稍候）…"
+      : "正在初始化本地 OCR 引擎…",
+    "info",
+    240_000,
+  );
+  try {
+    await invokeTauri<string>("ocr_engine_status", { engine: ocrEngine() });
+    toast();
+    updateReaderPrefs({ ocrBoxes: true });
+    showToast("本地 OCR 已开启，文字区域将自动框出", "success", 2600);
+  } catch (error) {
+    toast();
+    const message = error instanceof Error ? error.message : String(error);
+    showToast(`本地 OCR 不可用：${message}`, "error", 4800);
+  }
+}
+
+function getDisplayDataUrl(index: number): string | null {
+  const preloaded = state.preloadedUrls[index];
+  if (preloaded && preloaded.startsWith("data:")) return preloaded;
+
+  const container = document.querySelector<HTMLElement>(`.stream-photo[data-index="${index}"]`);
+  const streamImg = container?.querySelector<HTMLImageElement>(".stream-img");
+  if (streamImg?.src && streamImg.src.startsWith("data:")) return streamImg.src;
+
+  if (index === state.lightboxIndex) {
+    const lightboxImg = document.querySelector<HTMLImageElement>(".lightbox-image");
+    if (lightboxImg?.src && lightboxImg.src.startsWith("data:")) return lightboxImg.src;
+  }
+  return null;
+}
+
+function getOcrSources(index: number): { imageUrl: string | null; dataUrl: string | null } | null {
+  const imageUrl = state.imageUrls[index] || null;
+  const dataUrl = getDisplayDataUrl(index);
+  if (!imageUrl && !dataUrl) return null;
+  return { imageUrl, dataUrl };
+}
+
+function queueOcr(index: number) {
+  if (!state.ocrEnabled) return;
+  if (index < 0 || index >= state.photos.length) return;
+  if (state.ocrRegions[index] !== undefined || state.ocrFailed[index]) return;
+  if (ocrPendingIndices.has(index)) return;
+  if (!getOcrSources(index)) return; // 图片还没就绪,等加载后再触发
+  ocrPendingIndices.add(index);
+  pumpOcrQueue();
+}
+
+async function pumpOcrQueue() {
+  if (ocrBatchRunning || !state.ocrEnabled) return;
+
+  const items: Array<{ index: number; imageUrl: string | null; dataUrl: string | null }> = [];
+  for (const index of ocrPendingIndices) {
+    const sources = getOcrSources(index);
+    if (!sources) continue;
+    items.push({ index, imageUrl: sources.imageUrl, dataUrl: sources.dataUrl });
+    if (items.length >= OCR_BATCH) break;
+  }
+  if (items.length === 0) {
+    ocrPendingIndices.clear();
+    return;
+  }
+
+  ocrBatchRunning = true;
+  const token = state.readerToken;
+  try {
+    const results = await invokeTauri<OcrPageResult[]>("ocr_pages", {
+      pages: items.map((item) => ({
+        index: item.index,
+        imageUrl: item.imageUrl,
+        dataUrl: item.dataUrl,
+        languages: ocrLanguages(),
+        engine: ocrEngine(),
+        withText: false,
+      })),
+    });
+    for (const result of results) {
+      ocrPendingIndices.delete(result.index);
+      if (result.error) {
+        // 图片尚未就绪导致的失败是暂时的,等图片加载后会自动重新入队
+        if (!result.error.includes("等待")) {
+          state.ocrFailed[result.index] = result.error;
+        }
+      } else {
+        state.ocrRegions[result.index] = result.regions;
+      }
+    }
+    if (token === state.readerToken && state.view === "reader") {
+      for (const result of results) {
+        renderStreamOcrOverlay(result.index);
+        if (state.translateEnabled) {
+          renderTranslateBadge(result.index);
+          if (result.index === state.lightboxIndex) renderLightboxTranslateBadge();
+        }
+        if (
+          !result.error
+          && state.ocrLang === "ja"
+          && (isVisiblePage(result.index) || (state.translateEnabled && isNearPage(result.index)))
+        ) {
+          queueOcrText(result.index);
+        }
+      }
+      if (results.some((result) => result.index === state.lightboxIndex)) {
+        renderLightboxOcrOverlay();
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    for (const item of items) {
+      ocrPendingIndices.delete(item.index);
+      state.ocrFailed[item.index] = message;
+    }
+    showToast(`OCR 失败：${message}`, "error", 4200);
+  } finally {
+    ocrBatchRunning = false;
+    if (state.ocrEnabled && token === state.readerToken && state.view === "reader") {
+      window.setTimeout(() => pumpOcrQueue(), 0);
+    }
+  }
+}
+
+// 文字识别补跑:漫画引擎先出框(快),再对当前可见页补识别文字(慢),不阻塞浏览
+function queueOcrText(index: number) {
+  if (!state.ocrEnabled || state.ocrLang !== "ja") return;
+  if (index < 0 || index >= state.photos.length) return;
+  if (state.ocrRegions[index] === undefined || state.ocrFailed[index]) return;
+  if (ocrTextDone.has(index) || ocrTextPending.has(index)) return;
+  ocrTextPending.add(index);
+  pumpOcrTextQueue();
+}
+
+async function pumpOcrTextQueue() {
+  if (ocrTextBatchRunning || !state.ocrEnabled || state.ocrLang !== "ja") return;
+
+  const items: Array<{ index: number; imageUrl: string | null; dataUrl: string | null }> = [];
+  for (const index of ocrTextPending) {
+    const sources = getOcrSources(index);
+    if (!sources) continue;
+    items.push({ index, imageUrl: sources.imageUrl, dataUrl: sources.dataUrl });
+    if (items.length >= 4) break;
+  }
+  if (items.length === 0) {
+    ocrTextPending.clear();
+    return;
+  }
+
+  ocrTextBatchRunning = true;
+  const token = state.readerToken;
+  try {
+    const results = await invokeTauri<OcrPageResult[]>("ocr_pages", {
+      pages: items.map((item) => ({
+        index: item.index,
+        imageUrl: item.imageUrl,
+        dataUrl: item.dataUrl,
+        languages: ocrLanguages(),
+        engine: "manga",
+        withText: true,
+      })),
+    });
+    for (const result of results) {
+      ocrTextPending.delete(result.index);
+      if (result.error) {
+        if (!result.error.includes("等待")) {
+          ocrTextDone.add(result.index);
+        }
+      } else if (result.regions.length > 0) {
+        state.ocrRegions[result.index] = result.regions;
+        ocrTextDone.add(result.index);
+      } else {
+        ocrTextDone.add(result.index);
+      }
+    }
+    if (token === state.readerToken && state.view === "reader") {
+      for (const result of results) {
+        renderStreamOcrOverlay(result.index);
+        if (state.translateEnabled) {
+          renderTranslateBadge(result.index);
+          if (result.index === state.lightboxIndex) renderLightboxTranslateBadge();
+        }
+        if (state.translateEnabled && isNearPage(result.index)) {
+          queueTranslate(result.index);
+        }
+      }
+      if (results.some((result) => result.index === state.lightboxIndex)) {
+        renderLightboxOcrOverlay();
+        if (state.translateEnabled) queueTranslate(state.lightboxIndex);
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    for (const item of items) {
+      ocrTextPending.delete(item.index);
+      ocrTextDone.add(item.index);
+    }
+    showToast(`文字识别失败：${message}`, "error", 4200);
+  } finally {
+    ocrTextBatchRunning = false;
+    if (state.ocrEnabled && state.ocrLang === "ja") {
+      window.setTimeout(() => pumpOcrTextQueue(), 0);
+    }
+  }
+}
+
+// ---- 翻译字幕:遮住原文 + DeepSeek 翻译 ----
+
+const translatePending = new Set<number>();
+const translateDone = new Set<number>();
+let translateBatchRunning = false;
+
+async function toggleReaderTranslate(force?: boolean) {
+  const next = force ?? !state.translateEnabled;
+  if (next === state.translateEnabled) return;
+  if (!next) {
+    updateReaderPrefs({ translateMode: false });
+    return;
+  }
+  if (state.ocrLang !== "ja") {
+    updateReaderPrefs({ ocrLang: "ja" });
+  }
+  updateReaderPrefs({ translateMode: true });
+  if (!state.ocrEnabled) {
+    void toggleReaderOcr(true);
+  }
+  const target = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+  queueOcrWindow(target);
+}
+
+function queueTranslate(index: number) {
+  if (!state.translateEnabled || state.ocrLang !== "ja") return;
+  if (index < 0 || index >= state.photos.length) return;
+  const regions = state.ocrRegions[index];
+  if (!regions || regions.length === 0) return;
+  if (state.translateTexts[index]) {
+    // 已缓存过译文的页面,重新开启翻译时直接重画
+    translateDone.add(index);
+    renderTranslateOverlay(index);
+    return;
+  }
+  if (translateDone.has(index) || translatePending.has(index)) return;
+  if (!ocrTextDone.has(index)) {
+    // 文字识别还没补跑完,先补文字,完成后会再次触发翻译
+    queueOcrText(index);
+    return;
+  }
+  if (!regions.some((r) => r.text.trim())) {
+    translateDone.add(index); // 没有可翻译的文字,直接标记完成,避免徽标卡住
+    renderTranslateBadge(index);
+    if (index === state.lightboxIndex) renderLightboxTranslateBadge();
+    return;
+  }
+  translatePending.add(index);
+  renderTranslateBadge(index);
+  if (index === state.lightboxIndex) renderLightboxTranslateBadge();
+  pumpTranslateQueue();
+}
+
+async function pumpTranslateQueue() {
+  if (translateBatchRunning || !state.translateEnabled || state.ocrLang !== "ja") return;
+
+  const items: number[] = [];
+  for (const index of translatePending) {
+    if (state.ocrFailed[index]) continue;
+    const regions = state.ocrRegions[index];
+    if (!regions || regions.length === 0) continue;
+    if (!ocrTextDone.has(index)) {
+      translatePending.delete(index);
+      queueOcrText(index);
+      continue;
+    }
+    items.push(index);
+    if (items.length >= 3) break;
+  }
+  if (items.length === 0) {
+    translatePending.clear();
+    return;
+  }
+
+  translateBatchRunning = true;
+  const token = state.readerToken;
+  try {
+    // 多页并行翻译,哪页先返回先画哪页,不等最慢的一页
+    const jobs = items.map(async (index) => {
+      try {
+        const regions = state.ocrRegions[index] ?? [];
+        const texts = regions.map((r) => r.text);
+        const translated = await invokeTauri<string[]>("translate_dialogue", { texts });
+        translatePending.delete(index);
+        translateDone.add(index);
+        if (translated.length === texts.length) {
+          state.translateTexts[index] = translated;
+        }
+        if (token === state.readerToken) {
+          renderTranslateOverlay(index);
+          if (index === state.lightboxIndex) renderLightboxTranslateOverlay();
+        }
+        renderTranslateBadge(index);
+        if (index === state.lightboxIndex) renderLightboxTranslateBadge();
+        return { ok: true as const, message: "" };
+      } catch (error) {
+        translatePending.delete(index);
+        const message = error instanceof Error ? error.message : String(error);
+        state.translateFailed[index] = message;
+        renderTranslateBadge(index);
+        if (index === state.lightboxIndex) renderLightboxTranslateBadge();
+        return { ok: false as const, message };
+      }
+    });
+    const settled = await Promise.all(jobs);
+    for (const outcome of settled) {
+      if (!outcome.ok) {
+        showToast(`翻译失败：${outcome.message}`, "error", 4800);
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    showToast(`翻译失败：${message}`, "error", 4800);
+  } finally {
+    translateBatchRunning = false;
+    if (state.translateEnabled && state.ocrLang === "ja") {
+      window.setTimeout(() => pumpTranslateQueue(), 0);
+    }
+  }
+}
+
+function renderTranslateOverlay(index: number) {
+  const container = document.querySelector<HTMLElement>(`.stream-photo[data-index="${index}"]`);
+  if (!container) return;
+  const img = container.querySelector<HTMLImageElement>(".stream-img");
+  if (!img || !img.complete || img.naturalWidth === 0) return;
+  container.querySelector(".stream-translate-overlay")?.remove();
+  if (!state.translateEnabled) return;
+
+  const regions = state.ocrRegions[index];
+  const texts = state.translateTexts[index];
+  if (!regions || !texts) return;
+
+  const canvas = document.createElement("canvas");
+  canvas.className = "stream-translate-overlay";
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width = Math.max(1, Math.round(container.clientWidth * dpr));
+  canvas.height = Math.max(1, Math.round(container.clientHeight * dpr));
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.scale(dpr, dpr);
+  ctx.drawImage(img, 0, 0, container.clientWidth, container.clientHeight);
+  for (let i = 0; i < regions.length; i++) {
+    const region = regions[i];
+    const translated = texts[i]?.trim();
+    if (!translated) continue;
+    const x = region.x * container.clientWidth;
+    const y = region.y * container.clientHeight;
+    const w = region.w * container.clientWidth;
+    const h = region.h * container.clientHeight;
+    if (w < 4 || h < 4) continue;
+    drawCoverAndText(ctx, img, x, y, w, h, translated);
+  }
+  container.append(canvas);
+  attachTranslateTooltip(canvas, regions);
+  renderTranslateBadge(index);
+}
+
+function renderLightboxTranslateOverlay() {
+  const wrap = document.querySelector<HTMLElement>(".lightbox-image-wrap");
+  const img = document.querySelector<HTMLImageElement>(".lightbox-image");
+  wrap?.querySelector(".lightbox-translate-overlay")?.remove();
+  if (!wrap || !img || !img.complete || img.naturalWidth === 0) return;
+  if (!state.translateEnabled) return;
+
+  const regions = state.ocrRegions[state.lightboxIndex];
+  const texts = state.translateTexts[state.lightboxIndex];
+  if (!regions || !texts) return;
+
+  const canvas = document.createElement("canvas");
+  canvas.className = "lightbox-translate-overlay";
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  canvas.width = Math.max(1, Math.round(img.offsetWidth * dpr));
+  canvas.height = Math.max(1, Math.round(img.offsetHeight * dpr));
+  canvas.style.left = `${img.offsetLeft}px`;
+  canvas.style.top = `${img.offsetTop}px`;
+  canvas.style.width = `${img.offsetWidth}px`;
+  canvas.style.height = `${img.offsetHeight}px`;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  ctx.scale(dpr, dpr);
+  ctx.drawImage(img, 0, 0, img.offsetWidth, img.offsetHeight);
+  for (let i = 0; i < regions.length; i++) {
+    const region = regions[i];
+    const translated = texts[i]?.trim();
+    if (!translated) continue;
+    const x = region.x * img.offsetWidth;
+    const y = region.y * img.offsetHeight;
+    const w = region.w * img.offsetWidth;
+    const h = region.h * img.offsetHeight;
+    if (w < 4 || h < 4) continue;
+    drawCoverAndText(ctx, img, x, y, w, h, translated);
+  }
+  wrap.append(canvas);
+  attachTranslateTooltip(canvas, regions);
+  renderLightboxTranslateBadge();
+}
+
+function drawCoverAndText(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  text: string,
+) {
+  text = normalizeCjkText(text);
+  const fill = sampleBoxColor(img, x, y, w, h);
+  ctx.save();
+  ctx.fillStyle = fill;
+  ctx.beginPath();
+  const radius = Math.min(12, w * 0.1, h * 0.1);
+  roundRect(ctx, x, y, w, h, radius);
+  ctx.fill();
+  // 边缘柔化:两层同色低透明度描边,向外过渡更自然
+  ctx.globalAlpha = 0.3;
+  ctx.lineWidth = Math.min(4, Math.max(2, w * 0.015));
+  ctx.strokeStyle = fill;
+  roundRect(ctx, x, y, w, h, radius);
+  ctx.stroke();
+  ctx.globalAlpha = 0.15;
+  ctx.lineWidth = Math.min(9, Math.max(4, w * 0.03));
+  ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  const [fr, fg, fb] = parseRgb(fill);
+  const luminance = 0.299 * fr + 0.587 * fg + 0.114 * fb;
+  const darkText = luminance > 150;
+  ctx.fillStyle = darkText ? "#1c1c1c" : "#ffffff";
+  ctx.textBaseline = "middle";
+  if (!darkText) {
+    // 深色气泡上白字加一点阴影,保证可读
+    ctx.shadowColor = "rgba(0, 0, 0, 0.55)";
+    ctx.shadowBlur = 2;
+    ctx.shadowOffsetY = 1;
+  }
+  const vertical = h > w * 1.15 && h > 40;
+  if (vertical) {
+    drawVerticalText(ctx, text, x, y, w, h);
+  } else {
+    drawHorizontalText(ctx, text, x, y, w, h);
+  }
+  ctx.restore();
+}
+
+function parseRgb(color: string): [number, number, number] {
+  const match = color.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : [255, 255, 255];
+}
+
+function normalizeCjkText(text: string): string {
+  // 半角省略号/波浪线/感叹问号统一为全角,竖排时才不会出现散落的小圆点
+  return text
+    .replace(/\.\.\.+/g, "…")
+    .replace(/~/g, "～")
+    .replace(/!/g, "！")
+    .replace(/\?/g, "？")
+    .replace(/\./g, "。");
+}
+
+const MANGA_FONT_FAMILY =
+  `"圆体-简", "Yuanti SC", "Hiragino Maru Gothic ProN", ` +
+  `"PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif`;
+
+// 单张复用取色画布,限制分辨率避免大图占内存
+const SAMPLE_MAX_DIM = 1200;
+let sampleCanvas: HTMLCanvasElement | null = null;
+
+function sampleBoxColor(img: HTMLImageElement, x: number, y: number, w: number, h: number): string {
+  if (!sampleCanvas) {
+    sampleCanvas = document.createElement("canvas");
+  }
+  const sample = sampleCanvas;
+  const scale = Math.min(1, SAMPLE_MAX_DIM / Math.max(img.naturalWidth, img.naturalHeight));
+  sample.width = Math.max(1, Math.round(img.naturalWidth * scale));
+  sample.height = Math.max(1, Math.round(img.naturalHeight * scale));
+  sample.getContext("2d")?.drawImage(img, 0, 0, sample.width, sample.height);
+  const ctx = sample.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return "#ffffff";
+  const scaleX = sample.width / (img.offsetWidth || img.naturalWidth);
+  const scaleY = sample.height / (img.offsetHeight || img.naturalHeight);
+  // 采样点放在框外一圈:漫画气泡通常以白色为底,取中位数抗气泡描边干扰
+  const pad = Math.max(3, Math.min(10, w * 0.08, h * 0.08));
+  const points: Array<[number, number]> = [
+    [x - pad, y - pad], [x + w / 2, y - pad], [x + w + pad, y - pad],
+    [x - pad, y + h / 2], [x + w + pad, y + h / 2],
+    [x - pad, y + h + pad], [x + w / 2, y + h + pad], [x + w + pad, y + h + pad],
+  ];
+  const rs: number[] = [], gs: number[] = [], bs: number[] = [];
+  for (const [px, py] of points) {
+    const sx = Math.round(px * scaleX);
+    const sy = Math.round(py * scaleY);
+    if (sx < 0 || sy < 0 || sx >= sample.width || sy >= sample.height) continue;
+    const data = ctx.getImageData(sx, sy, 1, 1).data;
+    if (data[3] === 0) continue;
+    rs.push(data[0]); gs.push(data[1]); bs.push(data[2]);
+  }
+  if (rs.length === 0) return "#ffffff";
+  const median = (values: number[]) => {
+    values.sort((a, b) => a - b);
+    return values[Math.floor(values.length / 2)];
+  };
+  let r = median(rs), g = median(gs), b = median(bs);
+  // 采样到深色(描边/背景)时往白色方向混合,避免深色补丁
+  const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+  if (luminance < 150) {
+    const mix = 0.5;
+    r = Math.round(r * (1 - mix) + 255 * mix);
+    g = Math.round(g * (1 - mix) + 255 * mix);
+    b = Math.round(b * (1 - mix) + 255 * mix);
+  }
+  return `rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`;
+}
+
+function roundRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawHorizontalText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+) {
+  const fontFamily = MANGA_FONT_FAMILY;
+  const padding = Math.max(2, w * 0.04);
+  const innerW = w - padding * 2;
+  const innerH = h - padding * 2;
+  // 漫画嵌字常用轻微字距,Chrome 的 measureText 会一并计入
+  ctx.letterSpacing = "0.05em";
+  let fontSize = Math.max(9, Math.min(h * 0.48, innerW / 2.0));
+  const fit = () => {
+    while (fontSize > 7) {
+      ctx.font = `700 ${fontSize}px ${fontFamily}`;
+      const lines = wrapText(ctx, text, innerW);
+      if (lines.length * fontSize * 1.32 <= innerH) {
+        return lines;
+      }
+      fontSize -= 1;
+    }
+    ctx.font = `700 ${fontSize}px ${fontFamily}`;
+    return wrapText(ctx, text, innerW);
+  };
+  const lines = fit();
+  const lineHeight = fontSize * 1.32;
+  const totalH = lines.length * lineHeight;
+  let ty = y + (h - totalH) / 2 + lineHeight / 2;
+  for (const line of lines) {
+    const tw = ctx.measureText(line).width;
+    ctx.fillText(line, x + (w - tw) / 2, ty);
+    ty += lineHeight;
+  }
+}
+
+// 行首禁则:这些标点不放在行首,漫画嵌字排版规范
+const LINE_START_BAN = new Set([
+  "，", "。", "、", "！", "？", "；", "：", "”", "』", "」", "）", "〉", "》",
+  "]", ")", "!", "?", ".", ",", "…", "—", "～",
+]);
+
+function wrapText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] {
+  const lines: string[] = [];
+  let line = "";
+  for (const ch of text) {
+    const test = line + ch;
+    if (line && ctx.measureText(test).width > maxWidth) {
+      if (LINE_START_BAN.has(ch)) {
+        lines.push(line + ch);
+        line = "";
+      } else {
+        lines.push(line);
+        line = ch;
+      }
+    } else {
+      line = test;
+    }
+  }
+  if (line) lines.push(line);
+  return lines.length ? lines : [text];
+}
+
+function drawVerticalText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+) {
+  const fontFamily = MANGA_FONT_FAMILY;
+  const padding = Math.max(2, w * 0.06);
+  const innerW = w - padding * 2;
+  const innerH = h - padding * 2;
+  ctx.letterSpacing = "0em";
+  let fontSize = Math.max(9, Math.min(innerW * 0.95, innerH / 4.2));
+  const fit = () => {
+    while (fontSize > 7) {
+      ctx.font = `700 ${fontSize}px ${fontFamily}`;
+      const columns = Math.ceil(text.length * fontSize / innerH);
+      if (columns * fontSize <= innerW) return columns;
+      fontSize -= 1;
+    }
+    ctx.font = `700 ${fontSize}px ${fontFamily}`;
+    return Math.ceil(text.length * fontSize / innerH);
+  };
+  const columns = fit();
+  const perColumn = Math.floor(innerH / fontSize);
+  // 文字块整体居中于气泡:最右列中心 = 气泡中心 + 块宽一半 - 半字宽
+  const startX = x + w / 2 + (fontSize * columns - fontSize) / 2;
+  const step = fontSize * 1.05; // 竖排字间留一丝空气,避免过挤
+  ctx.textAlign = "center";
+  let cx = startX;
+  for (let i = 0; i < text.length; i += perColumn) {
+    const slice = Array.from(text.slice(i, i + perColumn));
+    let cy = y + padding + fontSize / 2;
+    for (const ch of slice) {
+      if (VERT_ROTATE.has(ch)) {
+        // 竖排标点与字母数字转 90°,符合中文/日文竖排习惯
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate(Math.PI / 2);
+        ctx.fillText(ch, 0, 0);
+        ctx.restore();
+      } else {
+        ctx.fillText(ch, cx, cy);
+      }
+      cy += step;
+    }
+    cx -= fontSize;
+  }
+  ctx.textAlign = "start";
+}
+
+const VERT_ROTATE = new Set([
+  "，", "。", "、", "！", "？", "；", "：", "…", "～", "—", "ー",
+  "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+  "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+  "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+  "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+  "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+]);
+
+function removeAllTranslateOverlays() {
+  document.querySelectorAll<HTMLElement>(
+    ".stream-translate-overlay, .lightbox-translate-overlay",
+  ).forEach((el) => el.remove());
+  hideTranslateTooltip();
+}
+
+// ---- 翻译状态徽标:让用户感知"正在翻译" ----
+
+function translateBusy(index: number): boolean {
+  if (index < 0 || index >= state.photos.length) return false;
+  if (translateDone.has(index)) return false;
+  if (state.translateFailed[index]) return false;
+  const regions = state.ocrRegions[index];
+  if (!regions || regions.length === 0) return false; // 还没框选出文字区域
+  // 有文字区域但还没翻译完成:识别/翻译任意阶段都显示"翻译中…"
+  return true;
+}
+
+function renderTranslateBadge(index: number) {
+  const container = document.querySelector<HTMLElement>(`.stream-photo[data-index="${index}"]`);
+  if (!container) return;
+  container.querySelector(".stream-translate-badge")?.remove();
+  if (!state.translateEnabled) return;
+  const failed = state.translateFailed[index];
+  const busy = translateBusy(index);
+  if (!failed && !busy) return;
+
+  const badge = document.createElement("button");
+  badge.type = "button";
+  badge.className = failed ? "translate-badge stream-translate-badge failed" : "translate-badge stream-translate-badge";
+  badge.textContent = failed ? "翻译失败 · 点击重试" : "翻译中…";
+  badge.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (failed) {
+      delete state.translateFailed[index];
+      translateDone.delete(index);
+      queueOcrText(index);
+      queueTranslate(index);
+      renderTranslateBadge(index);
+    }
+  });
+  container.append(badge);
+}
+
+function renderLightboxTranslateBadge() {
+  const wrap = document.querySelector<HTMLElement>(".lightbox-image-wrap");
+  wrap?.querySelector(".lightbox-translate-badge")?.remove();
+  if (!wrap || !state.translateEnabled) return;
+  const index = state.lightboxIndex;
+  const failed = state.translateFailed[index];
+  const busy = translateBusy(index);
+  if (!failed && !busy) return;
+  const badge = document.createElement("button");
+  badge.type = "button";
+  badge.className = failed ? "translate-badge lightbox-translate-badge failed" : "translate-badge lightbox-translate-badge";
+  badge.textContent = failed ? "翻译失败 · 点击重试" : "翻译中…";
+  badge.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (failed) {
+      delete state.translateFailed[index];
+      translateDone.delete(index);
+      queueOcrText(index);
+      queueTranslate(index);
+      renderLightboxTranslateBadge();
+    }
+  });
+  wrap.append(badge);
+}
+
+function updateTranslateBadges() {
+  const indices: number[] = [];
+  if (state.lightboxIndex >= 0) {
+    for (let i = state.lightboxIndex - 1; i <= state.lightboxIndex + 3; i++) {
+      if (i >= 0 && i < state.photos.length) indices.push(i);
+    }
+  } else {
+    const current = currentStreamIndex();
+    for (let i = current - 1; i <= current + 3; i++) {
+      if (i >= 0 && i < state.photos.length) indices.push(i);
+    }
+  }
+  for (const index of indices) renderTranslateBadge(index);
+  if (state.lightboxIndex >= 0) renderLightboxTranslateBadge();
+}
+
+// ---- 悬停原文提示:翻译后鼠标移到译文字块上,可查看原文 ----
+
+let translateTooltip: HTMLElement | null = null;
+
+function showTranslateTooltip(text: string, clientX: number, clientY: number) {
+  if (!translateTooltip) {
+    translateTooltip = document.createElement("div");
+    translateTooltip.className = "translate-tooltip";
+    translateTooltip.setAttribute("aria-hidden", "true");
+    document.body.append(translateTooltip);
+  }
+  translateTooltip.textContent = text;
+  translateTooltip.style.left = `${Math.min(clientX + 14, window.innerWidth - 280)}px`;
+  translateTooltip.style.top = `${Math.min(clientY + 14, window.innerHeight - 90)}px`;
+  translateTooltip.hidden = false;
+}
+
+function hideTranslateTooltip() {
+  if (translateTooltip) translateTooltip.hidden = true;
+}
+
+function attachTranslateTooltip(
+  canvas: HTMLCanvasElement,
+  regions: Array<{ text: string; x: number; y: number; w: number; h: number }> | undefined,
+) {
+  canvas.addEventListener("mousemove", (event) => {
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const nx = (event.clientX - rect.left) / rect.width;
+    const ny = (event.clientY - rect.top) / rect.height;
+    for (const region of regions ?? []) {
+      if (nx >= region.x && nx <= region.x + region.w && ny >= region.y && ny <= region.y + region.h) {
+        const ja = region.text.trim();
+        if (ja) {
+          showTranslateTooltip(ja, event.clientX, event.clientY);
+          return;
+        }
+      }
+    }
+    hideTranslateTooltip();
+  });
+  canvas.addEventListener("mouseleave", hideTranslateTooltip);
+}
+
+function ocrPrefetchLoadedPages() {
+  if (!state.ocrEnabled) return;
+  document.querySelectorAll<HTMLElement>(".stream-photo[data-state='loaded']").forEach((el) => {
+    const index = parseInt(el.dataset.index || "", 10);
+    if (!Number.isNaN(index)) queueOcr(index);
+  });
+  if (state.lightboxIndex >= 0) queueOcr(state.lightboxIndex);
+}
+
+function renderStreamOcrOverlay(index: number) {
+  if (state.translateEnabled) return; // 翻译模式不画红框
+  const container = document.querySelector<HTMLElement>(`.stream-photo[data-index="${index}"]`);
+  if (!container) return;
+  if (!container.querySelector(".stream-img")) return; // 图片还没就位,加载完成后会重画
+  container.querySelector(".stream-ocr-overlay")?.remove();
+  const regions = state.ocrRegions[index];
+  if (!regions || regions.length === 0) return;
+
+  const overlay = document.createElement("div");
+  overlay.className = "stream-ocr-overlay";
+  overlay.setAttribute("aria-hidden", "true");
+  for (const region of regions) {
+    const box = document.createElement("div");
+    box.className = "ocr-box";
+    box.style.left = `${region.x * 100}%`;
+    box.style.top = `${region.y * 100}%`;
+    box.style.width = `${region.w * 100}%`;
+    box.style.height = `${region.h * 100}%`;
+    if (region.text) box.title = region.text;
+    overlay.append(box);
+  }
+  container.append(overlay);
+}
+
+function renderLightboxOcrOverlay() {
+  if (state.translateEnabled) return; // 翻译模式不画红框
+  const wrap = document.querySelector<HTMLElement>(".lightbox-image-wrap");
+  const img = document.querySelector<HTMLImageElement>(".lightbox-image");
+  wrap?.querySelector(".lightbox-ocr-overlay")?.remove();
+  if (!wrap || !img || !img.complete || img.naturalWidth === 0) return;
+
+  const regions = state.ocrRegions[state.lightboxIndex];
+  if (!regions || regions.length === 0) return;
+
+  const overlay = document.createElement("div");
+  overlay.className = "lightbox-ocr-overlay";
+  overlay.setAttribute("aria-hidden", "true");
+  overlay.style.left = `${img.offsetLeft}px`;
+  overlay.style.top = `${img.offsetTop}px`;
+  overlay.style.width = `${img.offsetWidth}px`;
+  overlay.style.height = `${img.offsetHeight}px`;
+  for (const region of regions) {
+    const box = document.createElement("div");
+    box.className = "ocr-box";
+    box.style.left = `${region.x * 100}%`;
+    box.style.top = `${region.y * 100}%`;
+    box.style.width = `${region.w * 100}%`;
+    box.style.height = `${region.h * 100}%`;
+    if (region.text) box.title = region.text;
+    overlay.append(box);
+  }
+  wrap.append(overlay);
+}
+
+function removeAllOcrOverlays() {
+  document.querySelectorAll<HTMLElement>(".stream-ocr-overlay, .lightbox-ocr-overlay").forEach((el) => {
+    el.remove();
+  });
 }
 
 function updateReaderProgress() {
@@ -603,6 +1702,7 @@ function updateReaderProgress() {
       if (current !== lastReportedStreamIndex) {
         lastReportedStreamIndex = current;
         setSoftStatus(`正在阅读 ${current + 1} / ${total}`);
+        queueOcrWindow(current);
       }
     }
   } else {
@@ -829,16 +1929,18 @@ async function loadDisplayImageDataUrl(
   onProgress: (progress: ProgressState) => void,
 ): Promise<DisplayImageResult> {
   const imageUrl = await resolvePhotoImageUrlWithRetry(index, 2);
+  state.imageUrls[index] = imageUrl;
   const referer = state.photos[index]?.url;
   try {
     return {
       url: await fetchImageDataUrlWithProgress(imageUrl, referer, requestId, onProgress),
       viaFallback: false,
+      imageUrl,
     };
   } catch (error) {
     console.warn("Image proxy failed, falling back to direct URL", error);
     setSoftStatus("图片线路较慢，正在尝试备用显示");
-    return { url: imageUrl, viaFallback: true };
+    return { url: imageUrl, viaFallback: true, imageUrl };
   }
 }
 
@@ -882,20 +1984,34 @@ async function resolvePhotoImageUrlUntilSuccess(
 async function preloadFullImage(index: number, readerToken = state.readerToken): Promise<PreloadResult> {
   if (index < 0 || index >= state.photos.length) return "failed";
   if (state.preloadedUrls[index]) return "cached";
+  if (preloadInFlight.has(index)) return "failed";
+  preloadInFlight.add(index);
 
   try {
     const imageUrl = await resolvePhotoImageUrlWithRetry(index, 2);
-    if (readerToken !== state.readerToken || state.view !== "reader") return "failed";
+    state.imageUrls[index] = imageUrl;
+    if (readerToken !== state.readerToken || state.view !== "reader") {
+      preloadInFlight.delete(index);
+      return "failed";
+    }
     const image = await invokeTauri<ImageData>("fetch_image_data_url", {
       url: imageUrl,
       referer: state.photos[index]?.url ?? null,
     });
-    if (readerToken !== state.readerToken || state.view !== "reader") return "failed";
+    if (readerToken !== state.readerToken || state.view !== "reader") {
+      preloadInFlight.delete(index);
+      return "failed";
+    }
     state.preloadedUrls[index] = image.dataUrl;
     delete state.preloadFailures[index];
     preloadImage(image.dataUrl);
+    if (state.translateEnabled && isNearPage(index)) {
+      queueOcr(index); // 预取的图就绪后立即开识别
+    }
+    preloadInFlight.delete(index);
     return "loaded";
   } catch {
+    preloadInFlight.delete(index);
     if (readerToken !== state.readerToken || state.view !== "reader") return "failed";
     state.preloadFailures[index] = (state.preloadFailures[index] ?? 0) + 1;
     if (state.preloadFailures[index] > 3) return "failed";
@@ -924,12 +2040,163 @@ function albumSubtitle(album: Album) {
 }
 
 function displayTitle(album: Album) {
-  const title = String(album.title ?? "")
+  const title = cleanTitle(album.title);
+  const translated = titleTranslateEnabled ? titleTranslationCache.get(title) : undefined;
+
+  return translated || title || `AID ${album.aid}`;
+}
+
+// ---- 生肉标题翻译 ----
+
+const TITLE_TRANSLATE_KEY = "wnacg.titleTranslations.v1";
+const TITLE_TRANSLATE_ENABLED_KEY = "wnacg.titleTranslate.v1";
+const titleTranslationCache = new Map<string, string>();
+const titleTranslatePending = new Set<string>();
+const titleTranslateFailed = new Set<string>();
+let titleTranslateEnabled = false;
+
+function cleanTitle(title: string): string {
+  return String(title ?? "")
     .replace(/[\u200B-\u200D\uFEFF]/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
 
-  return title || `AID ${album.aid}`;
+function loadTitleTranslateState() {
+  try {
+    titleTranslateEnabled = localStorage.getItem(TITLE_TRANSLATE_ENABLED_KEY) === "1";
+    const raw = localStorage.getItem(TITLE_TRANSLATE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Record<string, string>;
+      for (const [key, value] of Object.entries(parsed)) {
+        if (key && value && value !== key) titleTranslationCache.set(key, value);
+      }
+    }
+  } catch {
+    // 本地缓存损坏时忽略
+  }
+}
+
+function saveTitleTranslationCache() {
+  try {
+    localStorage.setItem(
+      TITLE_TRANSLATE_KEY,
+      JSON.stringify(Object.fromEntries(titleTranslationCache)),
+    );
+  } catch {
+    // 存储满时忽略
+  }
+}
+
+function syncTitleTranslateToggle() {
+  const toggle = document.querySelector<HTMLInputElement>("#title-translate-toggle");
+  if (toggle) toggle.checked = titleTranslateEnabled;
+}
+
+function looksJapanese(title: string): boolean {
+  // 含平假名/片假名即视为生肉日文标题
+  return /[\u3040-\u30ff]/.test(title);
+}
+
+async function translateVisibleTitles() {
+  if (!titleTranslateEnabled || state.view !== "list") return;
+  const seen = new Set<string>();
+  const titles: string[] = [];
+  for (const album of state.albums) {
+    const title = cleanTitle(album.title);
+    if (!title || !looksJapanese(title)) continue;
+    if (titleTranslationCache.has(title) || titleTranslatePending.has(title) || titleTranslateFailed.has(title)) {
+      continue;
+    }
+    if (seen.has(title)) continue;
+    seen.add(title);
+    titles.push(title);
+  }
+  if (titles.length === 0) return;
+
+  for (const title of titles) titleTranslatePending.add(title);
+  try {
+    const results = await invokeTauri<string[]>("translate_titles", { titles });
+    for (let i = 0; i < titles.length; i++) {
+      const title = titles[i];
+      titleTranslatePending.delete(title);
+      const translated = results[i]?.trim();
+      if (translated && translated !== title) {
+        titleTranslationCache.set(title, translated);
+        titleTranslateFailed.delete(title);
+      } else {
+        titleTranslateFailed.add(title);
+      }
+    }
+    saveTitleTranslationCache();
+    applyTitleTranslations();
+  } catch {
+    for (const title of titles) {
+      titleTranslatePending.delete(title);
+      titleTranslateFailed.add(title);
+    }
+  }
+}
+
+function applyTitleTranslations() {
+  document.querySelectorAll<HTMLElement>(".album-card").forEach((card) => {
+    const original = card.dataset.originalTitle;
+    if (!original) return;
+    const translated = titleTranslateEnabled ? titleTranslationCache.get(original) : undefined;
+    const visible = translated || original;
+    const titleEl = card.querySelector<HTMLElement>(".card-title");
+    if (titleEl) titleEl.textContent = visible;
+    const cover = card.querySelector<HTMLElement>(".cover");
+    if (cover) cover.dataset.title = visible;
+    card.dataset.title = visible;
+    card.setAttribute("aria-label", `打开《${visible}》`);
+    card.title =
+      translated && translated !== original
+        ? `${visible}\n原文：${original}\n点击在新窗口打开`
+        : `${visible}\n点击在新窗口打开`;
+  });
+}
+
+function setTitleTranslate(enabled: boolean) {
+  titleTranslateEnabled = enabled;
+  localStorage.setItem(TITLE_TRANSLATE_ENABLED_KEY, enabled ? "1" : "0");
+  syncTitleTranslateToggle();
+  applyTitleTranslations();
+  if (titleTranslateEnabled) {
+    translateVisibleTitles();
+    if (state.view === "reader" && state.currentAlbum?.title) {
+      void applyAlbumTitle(state.currentAlbum.title); // 阅读器内标题同步翻译
+    }
+  }
+}
+
+function toggleTitleTranslate() {
+  setTitleTranslate(!titleTranslateEnabled);
+}
+
+async function translatedAlbumTitle(title: string): Promise<string> {
+  if (!titleTranslateEnabled || !looksJapanese(title)) return title;
+  const cached = titleTranslationCache.get(title);
+  if (cached) return cached;
+  if (titleTranslatePending.has(title) || titleTranslateFailed.has(title)) return title;
+  titleTranslatePending.add(title);
+  try {
+    const results = await invokeTauri<string[]>("translate_titles", { titles: [title] });
+    const translated = results[0]?.trim();
+    if (translated && translated !== title) {
+      titleTranslationCache.set(title, translated);
+      titleTranslateFailed.delete(title);
+      saveTitleTranslationCache();
+      return translated;
+    }
+    titleTranslateFailed.add(title);
+    return title;
+  } catch {
+    titleTranslateFailed.add(title);
+    return title;
+  } finally {
+    titleTranslatePending.delete(title);
+  }
 }
 
 function saveListSnapshot() {
@@ -958,6 +2225,7 @@ function restoreListSnapshot() {
   renderCategories();
   syncToolbar();
   renderAlbums(state.albums);
+  translateVisibleTitles();
   setStatus(snapshot.status || `已恢复 ${state.albums.length} 项 · 第 ${state.page} 页`);
   requestAnimationFrame(() => {
     resultGrid.scrollTop = snapshot.scrollTop;
@@ -988,7 +2256,8 @@ function syncToolbar() {
     refreshButton.hidden = true;
     fullscreenButton.hidden = false;
     readerSettings.hidden = false;
-    viewTitle.textContent = state.currentAlbum?.title ?? "阅读";
+    const albumTitle = state.currentAlbum?.title;
+    viewTitle.textContent = (albumTitle && titleTranslationCache.get(albumTitle)) || albumTitle || "阅读";
     sidebar.classList.add("hidden");
     shell.classList.add("reader-mode");
   } else {
@@ -1094,13 +2363,14 @@ const APP_TITLE = "wnacg · 桌面阅读器";
 async function applyAlbumTitle(title: string) {
   const trimmed = title.trim();
   if (!trimmed) return;
+  const shown = await translatedAlbumTitle(trimmed);
   // 同步刷新 view-title（如果当前在 reader 视图）
   if (state.view === "reader") {
-    viewTitle.textContent = trimmed;
+    viewTitle.textContent = shown;
   }
-  document.title = `${trimmed} · wnacg`;
+  document.title = `${shown} · wnacg`;
   try {
-    await invokeTauri<void>("set_window_title", { title: `${trimmed} · wnacg` });
+    await invokeTauri<void>("set_window_title", { title: `${shown} · wnacg` });
   } catch {
     // 主窗口失败可忽略,前端 document.title 已经更新
   }
@@ -1119,17 +2389,18 @@ function renderAlbumCard(album: Album): HTMLElement {
 
   const titleText = displayTitle(album);
   const subtitleText = albumSubtitle(album);
+  card.dataset.originalTitle = cleanTitle(album.title);
   card.dataset.title = titleText;
   card.dataset.subtitle = subtitleText;
   card.setAttribute("aria-label", `打开《${titleText}》`);
   card.title = `${titleText}\n点击在新窗口打开`;
   card.addEventListener("click", () => {
-    openAlbumInNewWindow(album.aid, titleText);
+    openAlbumInNewWindow(album.aid, card.dataset.title || titleText);
   });
   card.addEventListener("keydown", (event) => {
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
-      openAlbumInNewWindow(album.aid, titleText);
+      openAlbumInNewWindow(album.aid, card.dataset.title || titleText);
     }
   });
 
@@ -1346,6 +2617,7 @@ async function loadAlbums() {
       showEmpty(state.mode === "search" || state.mode === "tag" ? "没有找到匹配结果" : "这一页没有内容");
     } else {
       renderAlbums(albums);
+      translateVisibleTitles();
       resultGrid.scrollTop = 0;
       saveListSnapshot();
     }
@@ -1424,6 +2696,7 @@ async function loadNextPage() {
     syncToolbar();
     setStatus(`第 ${state.page} 页 · 已加载 ${state.albums.length} 项`);
     saveListSnapshot();
+    translateVisibleTitles();
   } catch (error) {
     if (token !== state.listToken || state.view !== "list" || contextKey !== listContextKey()) return;
     removeLoadMoreRow();
@@ -1568,6 +2841,29 @@ async function loadStreamImage(container: HTMLElement) {
       container.dataset.state = "loaded";
       container.replaceChildren(img);
       setSoftStatus(`已加载 ${index + 1} / ${state.photos.length}`);
+      if (state.ocrEnabled) {
+        queueOcr(index);
+        queueOcr(index - 1);
+        queueOcr(index + 1);
+      }
+      // OCR 结果可能已缓存(比如预载阶段就识别完了),等淡入动画结束再画框,避免错位
+      if (state.ocrRegions[index] !== undefined) {
+        window.setTimeout(() => {
+          if (token === state.readerToken && container.dataset.state === "loaded") {
+            renderStreamOcrOverlay(index);
+          }
+        }, 450);
+      }
+      if (state.translateEnabled && state.translateTexts[index] !== undefined) {
+        window.setTimeout(() => {
+          if (token === state.readerToken && container.dataset.state === "loaded") {
+            renderTranslateOverlay(index);
+          }
+        }, 450);
+      }
+      if (state.translateEnabled) {
+        window.setTimeout(() => renderTranslateBadge(index), 450);
+      }
     }, { once: true });
     img.addEventListener("error", () => {
       if (token !== state.readerToken) return;
@@ -1624,6 +2920,10 @@ async function loadAlbumReader(aid: string, title: string) {
   state.lightboxIndex = -1;
   state.preloadedUrls = {};
   state.preloadFailures = {};
+  state.ocrRegions = {};
+  state.ocrFailed = {};
+  state.imageUrls = {};
+  ocrPendingIndices.clear();
   syncToolbar();
   if (standalone) {
     showStandaloneSkeleton(aid);
@@ -1679,6 +2979,10 @@ function backToList(options: { restore?: boolean } = {}) {
   state.retryNotice = "";
   state.lightboxProgress = null;
   state.preloadFailures = {};
+  state.ocrRegions = {};
+  state.ocrFailed = {};
+  state.imageUrls = {};
+  ocrPendingIndices.clear();
   document.querySelector(".lightbox")?.remove();
   teardownReaderObserver();
   resultGrid.className = "result-grid";
@@ -1912,6 +3216,8 @@ async function openLightbox(index: number) {
   state.lightboxProgress = null;
   state.retryNotice = "";
   renderLightbox();
+  queueOcrWindow(index);
+  updateTranslateBadges();
 
   // use preloaded URL if available
   if (state.preloadedUrls[index]) {
@@ -1944,6 +3250,7 @@ async function loadCurrentPhoto(index: number, token = ++state.lightboxToken) {
         setStatus(`${state.retryNotice}: ${message}`);
       },
     );
+    state.imageUrls[index] = rawImageUrl;
     if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
     const requestId = `lightbox-${token}-${index}-${Date.now()}`;
     try {
@@ -2036,6 +3343,29 @@ function navigateLightbox(delta: number) {
   }
 }
 
+function bindLightboxImageLoad(img: HTMLImageElement) {
+  img.addEventListener("load", () => {
+    applyLightboxZoomAndPan();
+    if (state.ocrEnabled) {
+      queueOcr(state.lightboxIndex);
+      queueOcr(state.lightboxIndex - 1);
+      queueOcr(state.lightboxIndex + 1);
+      if (state.ocrRegions[state.lightboxIndex] !== undefined) {
+        // 结果已缓存时等淡入动画结束再画,避免短暂错位
+        window.setTimeout(renderLightboxOcrOverlay, 650);
+      } else {
+        renderLightboxOcrOverlay();
+      }
+    }
+    if (state.translateEnabled) {
+      queueTranslate(state.lightboxIndex);
+      if (state.translateTexts[state.lightboxIndex]) {
+        window.setTimeout(renderLightboxTranslateOverlay, 650);
+      }
+    }
+  }, { once: true });
+}
+
 function renderLightbox() {
   const existing = document.querySelector(".lightbox");
   if (state.lightboxIndex === -1) {
@@ -2072,7 +3402,7 @@ function renderLightbox() {
       img.alt = label;
       img.src = state.lightboxImageUrl;
       img.draggable = false;
-      img.addEventListener("load", applyLightboxZoomAndPan, { once: true });
+      bindLightboxImageLoad(img);
       img.addEventListener("error", () => {
         state.lightboxImageUrl = "__error__";
         renderLightbox();
@@ -2119,7 +3449,7 @@ function renderLightbox() {
     img.alt = label;
     img.src = state.lightboxImageUrl;
     img.draggable = false;
-    img.addEventListener("load", applyLightboxZoomAndPan, { once: true });
+    bindLightboxImageLoad(img);
     img.addEventListener("error", () => {
       state.lightboxImageUrl = "__error__";
       renderLightbox();
@@ -2321,6 +3651,14 @@ document.addEventListener("keydown", (e) => {
       }
       return;
     }
+    if (e.key.toLowerCase() === "o") {
+      toggleReaderOcr();
+      return;
+    }
+    if (e.key.toLowerCase() === "r") {
+      toggleReaderTranslate();
+      return;
+    }
     if (e.key === "Escape") {
       closeLightbox();
     } else if (e.key === "ArrowLeft") {
@@ -2365,6 +3703,14 @@ document.addEventListener("keydown", (e) => {
     }
     if (e.key.toLowerCase() === "p") {
       toggleReaderPreload();
+      return;
+    }
+    if (e.key.toLowerCase() === "o") {
+      toggleReaderOcr();
+      return;
+    }
+    if (e.key.toLowerCase() === "r") {
+      toggleReaderTranslate();
       return;
     }
     if (state.photos.length > 0) {
@@ -2488,10 +3834,17 @@ function getInitialAlbumFromHash(): string | null {
 renderCategories();
 syncFullscreenState();
 
+loadTitleTranslateState();
+syncTitleTranslateToggle();
+document.querySelector<HTMLInputElement>("#title-translate-toggle")
+  ?.addEventListener("change", toggleTitleTranslate);
+
 // 跨窗口同步阅读偏好(主题/版心等)
 listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
   const payload = event.payload || {};
   let dirty = false;
+  let ocrLangChanged = false;
+  let ocrBoxesChanged = false;
   if (payload.theme && payload.theme !== state.readerTheme) {
     state.readerTheme = payload.theme;
     dirty = true;
@@ -2508,11 +3861,42 @@ listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
     state.conserveImages = payload.conserveImages;
     dirty = true;
   }
+  if (typeof payload.ocrBoxes === "boolean" && payload.ocrBoxes !== state.ocrEnabled) {
+    state.ocrEnabled = payload.ocrBoxes;
+    ocrBoxesChanged = true;
+    dirty = true;
+  }
+  if ((payload.ocrLang === "zh" || payload.ocrLang === "ja") && payload.ocrLang !== state.ocrLang) {
+    state.ocrLang = payload.ocrLang;
+    ocrLangChanged = true;
+    dirty = true;
+  }
   if (dirty) {
     applyReaderPrefs();
     syncReaderControls();
+    if (state.ocrEnabled) {
+      if (ocrLangChanged) {
+        // 识别语言变了,清掉旧结果重新识别
+        state.ocrRegions = {};
+        state.ocrFailed = {};
+        ocrPendingIndices.clear();
+        removeAllOcrOverlays();
+      }
+      if (ocrBoxesChanged || ocrLangChanged) {
+        ocrPrefetchLoadedPages();
+      }
+    } else {
+      removeAllOcrOverlays();
+      ocrPendingIndices.clear();
+    }
   }
 }).catch((err) => console.error("listen(reader-prefs-changed) failed:", err));
+
+window.addEventListener("resize", () => {
+  if (state.ocrEnabled && state.lightboxIndex >= 0) {
+    renderLightboxOcrOverlay();
+  }
+});
 
 const initialAid = getInitialAlbumFromHash();
 if (initialAid) {

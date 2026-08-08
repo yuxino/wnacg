@@ -11,6 +11,9 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
+mod ocr;
+mod translate;
+
 const BASE_URLS: [&str; 1] = ["https://www.wn03.cfd"];
 static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
     let mut headers = reqwest::header::HeaderMap::new();
@@ -924,8 +927,9 @@ async fn fetch_image_data_url(url: String, referer: Option<String>) -> Result<Im
         return Err("不允许加载非 WNACG 图片域名".to_string());
     }
 
-    let (content_type, bytes) = fetch_binary(url, referer).await?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let (content_type, bytes) = fetch_binary(url.clone(), referer).await?;
+    ocr::cache_image_bytes(&url, bytes.clone());
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
     Ok(ImageData {
         data_url: format!("data:{content_type};base64,{encoded}"),
@@ -959,8 +963,9 @@ async fn fetch_image_data_url_progress(
         return Err("不允许加载非 WNACG 图片域名".to_string());
     }
 
-    let (content_type, bytes) = fetch_binary_with_progress(app, request_id, url, referer).await?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let (content_type, bytes) = fetch_binary_with_progress(app, request_id, url.clone(), referer).await?;
+    ocr::cache_image_bytes(&url, bytes.clone());
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
     Ok(ImageData {
         data_url: format!("data:{content_type};base64,{encoded}"),
@@ -1104,7 +1109,12 @@ pub fn run() {
             open_album_window,
             set_window_title,
             close_current_window,
-            search_tag_in_main
+            search_tag_in_main,
+            ocr::ocr_pages,
+            ocr::ocr_engine_status,
+            translate::translate_dialogue,
+            translate::translate_engine_status,
+            translate::translate_titles
         ])
         .setup(|app| {
             let show = MenuItemBuilder::with_id("show", "显示").build(app)?;
