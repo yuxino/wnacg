@@ -406,17 +406,13 @@ button:has(> .icon + span) {
 }
 
 .brand-mark {
-  display: grid;
+  display: block;
   width: 42px;
   height: 42px;
-  place-items: center;
-  border: 1px solid var(--accent);
-  border-radius: var(--radius-md);
-  color: var(--text-on-accent);
-  background: var(--accent);
-  font-family: Georgia, serif;
-  font-size: var(--text-2xl);
-  font-weight: 700;
+  border-radius: 10px;
+  object-fit: cover;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  user-select: none;
 }
 
 .brand h1,
