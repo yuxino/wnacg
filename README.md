@@ -1,6 +1,6 @@
 <div align="center">
   <br>
-  <img src="docs/images/wnacg-avatar.png" width="112" alt="wnacg">
+  <img src="public/app-icon.png" width="112" alt="wnacg">
   <h1>wnacg</h1>
 </div>
 
