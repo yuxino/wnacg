@@ -18,6 +18,14 @@
 
 > 仅限成年人使用。仓库只有源码，没有安装包。
 
+## 功能
+
+- 分类 / 关键词 / 标签搜索，列表封面高斯模糊
+- 连续阅读、阅读进度记忆、显示设置本机保存，支持多窗口打开作品
+- **本地 OCR 文字框**：横排中文走 Apple Vision；竖排日文（生肉最头疼的縦書き）走漫画专用模型（comic-text-detector 框区域 + manga-ocr 认字）。模型约 230MB，首次使用时自动下载到本机，识别全程离线
+- **翻译字幕**：识别出日文后调 DeepSeek 翻译，原文字幕盖掉，译文按气泡排版嵌回原位（横排自动换行、竖排从右往左、圆体字、标点转正）。当前页前后三页提前翻译，翻页基本不用等；悬停译文可看原文，失败可点击重试
+- **生肉标题翻译**：列表和详情标题一键转中文，作者 / 社团 / DL 版等方括号内容保留原文，翻译结果本地缓存
+
 ## 截图
 
 ![作品列表，封面已做高斯模糊](docs/images/wnacg-library-masked.jpg)
@@ -26,7 +34,9 @@
 
 ## 运行
 
-需要 [Node.js](https://nodejs.org/)、[Rust](https://www.rust-lang.org/tools/install) 和 [Tauri 2 的系统依赖](https://v2.tauri.app/start/prerequisites/)。
+需要 [Node.js](https://nodejs.org/)、[Rust](https://www.rust-lang.org/tools/install) 和 [Tauri 2 的系统依赖](https://v2.tauri.app/start/prerequisites/)。macOS 上本地 OCR 还需要 Xcode 命令行工具（swiftc）；漫画引擎首次使用时会用 cargo 编译一次。
+
+DeepSeek 密钥：翻译功能读取 `~/Library/Application Support/wnacg/config.json` 里的 `deepseekApiKey`，也可以设置环境变量 `DEEPSEEK_API_KEY` 覆盖。
 
 ```bash
 git clone https://github.com/yuxino/wnacg.git
