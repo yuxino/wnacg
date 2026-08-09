@@ -2,54 +2,55 @@
   <br>
   <img src="public/app-icon.png" width="112" alt="wnacg">
   <h1>wnacg</h1>
+  <p><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
 </div>
 
-<p align="center">给 wnacg 套了个桌面壳，顺手塞了个翻译组。</p>
+<p align="center">A desktop shell for wnacg, with a translation team living inside.</p>
 
 <p align="center">
-  <a href="#截图"><strong>截图</strong></a>
-  · <a href="#有什么">有什么</a>
-  · <a href="#本地跑">本地跑</a>
-  · <a href="#先说好">先说好</a>
+  <a href="#screenshots"><strong>Screenshots</strong></a>
+  · <a href="#whats-inside">What's inside</a>
+  · <a href="#run-locally">Run locally</a>
+  · <a href="#fair-warning">Fair warning</a>
 </p>
 
 <br>
 
-浏览器标签开烦了，就写了这个。分类、关键词和标签都能搜，点进去直接往下看；阅读位置和显示设置存在本机，关掉再打开还是上次那页。
+I got tired of juggling browser tabs, so I wrote this. Search by category, keyword, or tag, open a title, and just scroll. Reading position and display settings are stored locally — close it and come back to the same page.
 
-> 18+。仓库只有源码，没有安装包。
+> 18+. Source code only, no installers.
 
-## 截图
+## Screenshots
 
-首页。左边选分类、关键词或者搜索，右边往下翻，封面默认高斯模糊。
+The home screen. Pick a category, keyword, or search on the left; scroll the grid on the right. Covers are blurred by default.
 
-![作品列表，封面已做高斯模糊](docs/images/wnacg-library-masked.jpg)
+![Album list with Gaussian-blurred covers](docs/images/wnacg-library-masked.jpg)
 
-点开就是连续阅读，进度和设置都记在本机，也能扔到单独的窗口里。
+Opening a title gives you continuous reading. Progress and settings are remembered, and a book can be moved to its own window.
 
-![连续阅读页，图片已做高斯模糊](docs/images/wnacg-reader-masked.jpg)
+![Continuous reading view, images blurred](docs/images/wnacg-reader-masked.jpg)
 
-生肉最头疼的是竖排日文。本地 OCR 先把字框出来、认出来，再调 DeepSeek 翻译，最后按原气泡嵌回原位。
+The most annoying part of raw manga is vertical Japanese. Local OCR finds and reads the text, DeepSeek translates it, and the Chinese is typeset back into the original bubble.
 
-![智能翻译：日文竖排原文](docs/images/wnacg-translate-before.jpg)
+![Smart translation: original vertical Japanese](docs/images/wnacg-translate-before.jpg)
 
-![智能翻译：译文嵌回原气泡，竖排从右往左](docs/images/wnacg-translate-after.jpg)
+![Smart translation: Chinese typeset back into the bubble, right to left](docs/images/wnacg-translate-after.jpg)
 
-## 有什么
+## What's inside
 
-- 分类 / 关键词 / 标签搜索，封面高斯模糊
-- 连续阅读、全屏和缩放，阅读位置和显示设置本机保存，支持多窗口打开作品
-- **本地 OCR 文字框**：横排中文走 Apple Vision；竖排日文（生肉最头疼的縦書き）走漫画专用模型（comic-text-detector 找框 + manga-ocr 认字）。模型约 230MB，首次使用时自动下载到本机，识别全程离线
-- **翻译字幕**：识别出日文后调 DeepSeek 翻译，原文字幕盖掉，译文按气泡排版嵌回原位（横排自动换行、竖排从右往左、圆体字、标点转正）。当前页前 1 页、后 3 页提前翻译，翻页基本不用等；悬停译文可看原文，失败可点击重试
-- **生肉标题翻译**：列表和详情标题一键转中文，作者 / 社团 / DL 版等方括号内容保留原文，翻译结果本地缓存
+- Search by category / keyword / tag, with blurred covers
+- Continuous reading, fullscreen and zoom, reading position and display settings saved locally, multiple windows per book
+- **Local OCR boxes**: horizontal Chinese uses Apple Vision; vertical Japanese (the most annoying kind) uses manga-specific models — `comic-text-detector` finds the boxes, `manga-ocr` reads the text. Models are ~230MB, downloaded automatically on first use, and recognition stays fully offline
+- **Translated subtitles**: recognized Japanese goes to DeepSeek, the original is covered, and the translation is typeset back into the bubble — horizontal wraps, vertical reads right to left, rounded font, normalized punctuation. One page behind and three ahead are pre-translated, so turning pages usually needs no wait; hover to see the original, click to retry on failure
+- **Title translation**: one click turns list and detail titles into Chinese, keeping bracketed author / circle / DL metadata intact, cached locally
 
-壳是 Tauri 2，界面用 TypeScript，抓取和图片代理在 Rust 里。
+It's a Tauri 2 shell with a TypeScript frontend; scraping and image proxying live in Rust.
 
-## 本地跑
+## Run locally
 
-需要 [Node.js](https://nodejs.org/)、[Rust](https://www.rust-lang.org/tools/install) 和 [Tauri 2 的系统依赖](https://v2.tauri.app/start/prerequisites/)。macOS 上本地 OCR 还需要 Xcode 命令行工具（swiftc）；漫画引擎首次使用时会用 cargo 编译一次。
+You'll need [Node.js](https://nodejs.org/), [Rust](https://www.rust-lang.org/tools/install), and [Tauri 2's system dependencies](https://v2.tauri.app/start/prerequisites/). On macOS, local OCR also needs the Xcode command line tools (`swiftc`); the manga engine compiles once with cargo on first use.
 
-DeepSeek 密钥：翻译功能读取 `~/Library/Application Support/wnacg/config.json` 里的 `deepseekApiKey`，也可以设置环境变量 `DEEPSEEK_API_KEY` 覆盖。
+DeepSeek key: translation reads `deepseekApiKey` from `~/Library/Application Support/wnacg/config.json`, or you can set the `DEEPSEEK_API_KEY` environment variable instead.
 
 ```bash
 git clone https://github.com/yuxino/wnacg.git
@@ -58,14 +59,14 @@ npm install
 npm run tauri dev
 ```
 
-打包：
+To build:
 
 ```bash
 npm run tauri build
 ```
 
-## 先说好
+## Fair warning
 
-仓库里没有第三方内容，也不会替你上传或者保存。用的时候自己看所在地法律和站点规则；侵权内容别存、别传，涉及未成年人或非自愿私密内容的东西更不要碰。
+The repo contains no third-party content and won't upload or store anything for you. Mind your local laws and the site's rules; don't keep or share infringing content, and stay away from anything involving minors or non-consensual private content.
 
-上游改版以后项目可能会坏。有问题可以开 Issue，想改直接提 PR。Issue、提交和截图里不要放露骨内容。
+The project may break when the upstream site changes. Open an issue for problems, or a PR if you want to fix something. Keep explicit content out of issues, commits, and screenshots.
