@@ -32,6 +32,10 @@
 
 ![连续阅读页，图片已做高斯模糊](docs/images/wnacg-reader-masked.jpg)
 
+![智能翻译：日文竖排原文](docs/images/wnacg-translate-before.jpg)
+
+![智能翻译：译文嵌回原气泡，竖排从右往左](docs/images/wnacg-translate-after.jpg)
+
 ## 运行
 
 需要 [Node.js](https://nodejs.org/)、[Rust](https://www.rust-lang.org/tools/install) 和 [Tauri 2 的系统依赖](https://v2.tauri.app/start/prerequisites/)。macOS 上本地 OCR 还需要 Xcode 命令行工具（swiftc）；漫画引擎首次使用时会用 cargo 编译一次。
