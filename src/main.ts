@@ -2422,7 +2422,7 @@ function syncToolbar() {
   if (state.view === "reader") {
     backButton.hidden = false;
     setIconWithLabel(backButton, standalone ? "x" : "arrowLeft", standalone ? "关闭" : "返回");
-    backButton.title = standalone ? "关闭窗口 (Esc)" : "返回 (Esc)";
+    backButton.title = standalone ? "关闭窗口 (Esc/X)" : "返回 (Esc/X)";
     backButton.setAttribute("aria-label", standalone ? "关闭窗口" : "返回列表");
     pagerControls.hidden = false;
     refreshButton.hidden = true;
@@ -3871,7 +3871,7 @@ document.addEventListener("keydown", (e) => {
       toggleReaderTranslate();
       return;
     }
-    if (e.key === "Escape") {
+    if (e.key === "Escape" || e.key.toLowerCase() === "x") {
       closeLightbox();
     } else if (e.key === "ArrowLeft") {
       navigateLightbox(-1);
@@ -3961,6 +3961,17 @@ document.addEventListener("keydown", (e) => {
       return;
     }
     backToList();
+  } else if (
+    state.view === "reader"
+    && e.key.toLowerCase() === "x"
+    && !(e.target instanceof HTMLInputElement)
+    && !(e.target instanceof HTMLTextAreaElement)
+  ) {
+    if (state.fullscreen) {
+      toggleFullscreen();
+      return;
+    }
+    backToList();
   }
 });
 
@@ -3989,7 +4000,7 @@ backButton.addEventListener("click", () => backToList());
 
 backButton.textContent = "←";
 backButton.setAttribute("aria-label", "返回列表");
-backButton.title = "返回 (Esc)";
+backButton.title = "返回 (Esc/X)";
 
 jumpTopButton.addEventListener("click", () => {
   resultGrid.scrollTo({ top: 0, behavior: "smooth" });
