@@ -666,6 +666,10 @@ function updateReaderPrefs(next: Partial<ReaderPrefs>) {
   const previousOcr = state.ocrEnabled;
   const previousOcrLang = state.ocrLang;
   const previousTranslate = state.translateEnabled;
+  // 联动：翻译字幕(R)关掉时，OCR 文字框(O)也跟着关
+  if (previousTranslate && next.translateMode === false) {
+    next.ocrBoxes = false;
+  }
   Object.assign(state, {
     readerWidth: next.width ?? state.readerWidth,
     readerGap: next.gap ?? state.readerGap,
@@ -696,6 +700,7 @@ function updateReaderPrefs(next: Partial<ReaderPrefs>) {
     preloadNeighbors(state.lightboxIndex);
   }
   if (previousOcr !== state.ocrEnabled) {
+    ocrEnableToken++; // OCR 开关变了,作废还在初始化中的“开启”请求
     if (state.ocrEnabled) {
       ocrPrefetchLoadedPages();
     } else {
@@ -769,6 +774,8 @@ function toggleReaderPreload() {
 const OCR_BATCH = 4;
 const ocrPendingIndices = new Set<number>();
 let ocrBatchRunning = false;
+// OCR 开关竞态令牌:引擎初始化期间开关被再次切换时,用来取消过期的“开启”请求
+let ocrEnableToken = 0;
 const ocrTextPending = new Set<number>();
 const ocrTextDone = new Set<number>();
 let ocrTextBatchRunning = false;
@@ -826,6 +833,7 @@ function queueOcrWindow(index: number) {
 async function toggleReaderOcr(force?: boolean) {
   const next = force ?? !state.ocrEnabled;
   if (next === state.ocrEnabled) return;
+  const token = ++ocrEnableToken;
   if (!next) {
     updateReaderPrefs({ ocrBoxes: false });
     return;
@@ -842,6 +850,11 @@ async function toggleReaderOcr(force?: boolean) {
   );
   try {
     await invokeTauri<string>("ocr_engine_status", { engine: ocrEngine() });
+    if (token !== ocrEnableToken) {
+      // 等待引擎期间开关又被切换(比如 R 关了联动把 O 关掉),放弃本次开启
+      toast();
+      return;
+    }
     toast();
     updateReaderPrefs({ ocrBoxes: true });
     showToast("本地 OCR 已开启，文字区域将自动框出", "success", 2600);
@@ -3990,6 +4003,7 @@ listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
   }
   if (typeof payload.ocrBoxes === "boolean" && payload.ocrBoxes !== state.ocrEnabled) {
     state.ocrEnabled = payload.ocrBoxes;
+    ocrEnableToken++; // 其它窗口改了 OCR 开关,同样作废进行中的“开启”请求
     ocrBoxesChanged = true;
     dirty = true;
   }
