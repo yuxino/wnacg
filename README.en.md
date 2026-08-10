@@ -40,7 +40,7 @@ The most annoying part of raw manga is vertical Japanese. Local OCR finds and re
 
 - Search by category / keyword / tag, with blurred covers
 - Continuous reading, fullscreen and zoom, reading position and display settings saved locally, multiple windows per book
-- **Local OCR boxes**: horizontal Chinese uses Apple Vision; vertical Japanese (the most annoying kind) uses manga-specific models — `comic-text-detector` finds the boxes, `manga-ocr` reads the text. Models are ~230MB, downloaded automatically on first use, and recognition stays fully offline
+- **Local OCR engine** (invisible, powers translation): horizontal Chinese uses Apple Vision; vertical Japanese (the most annoying kind) uses manga-specific models — `comic-text-detector` finds the boxes, `manga-ocr` reads the text. Models are ~230MB, downloaded automatically on first use, and recognition stays fully offline
 - **Translated subtitles**: recognized Japanese goes to DeepSeek, the original is covered, and the translation is typeset back into the bubble — horizontal wraps, vertical reads right to left, rounded font, normalized punctuation. One page behind and three ahead are pre-translated, so turning pages usually needs no wait; hover to see the original, click to retry on failure
 - **Title translation**: one click turns list and detail titles into Chinese, keeping bracketed author / circle / DL metadata intact, cached locally
 

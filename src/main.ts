@@ -76,12 +76,14 @@ type ListSnapshot = {
 type ReaderWidth = "comfort" | "wide" | "edge";
 type ReaderGap = "relaxed" | "compact";
 type ReaderTheme = "warm" | "dark";
+type ReaderFit = "width" | "page";
 type ReaderOcrLang = "zh" | "ja";
 
 type ReaderPrefs = {
   width: ReaderWidth;
   gap: ReaderGap;
   theme: ReaderTheme;
+  fit: ReaderFit;
   conserveImages: boolean;
   ocrBoxes: boolean;
   ocrLang: ReaderOcrLang;
@@ -94,6 +96,7 @@ const defaultReaderPrefs: ReaderPrefs = {
   width: "comfort",
   gap: "relaxed",
   theme: "dark",
+  fit: "width",
   conserveImages: true,
   ocrBoxes: false,
   ocrLang: "ja",
@@ -121,6 +124,7 @@ function loadReaderPrefs(): ReaderPrefs {
       translateMode: typeof parsed.translateMode === "boolean"
         ? parsed.translateMode
         : defaultReaderPrefs.translateMode,
+      fit: parsed.fit === "page" ? "page" : defaultReaderPrefs.fit,
     };
   } catch {
     return { ...defaultReaderPrefs };
@@ -177,6 +181,7 @@ const state = {
   readerWidth: readerPrefs.width,
   readerGap: readerPrefs.gap,
   readerTheme: readerPrefs.theme,
+  readerFit: readerPrefs.fit,
   conserveImages: readerPrefs.conserveImages,
   ocrEnabled: readerPrefs.ocrBoxes,
   ocrLang: readerPrefs.ocrLang,
@@ -463,6 +468,17 @@ function buildReaderSettingsPanel() {
       ),
     },
     {
+      title: "整页显示",
+      render: () => renderSegmented<ReaderFit>(
+        [
+          { label: "关闭", value: "width" },
+          { label: "开启", value: "page", hint: "V" },
+        ],
+        state.readerFit,
+        (v) => updateReaderPrefs({ fit: v }),
+      ),
+    },
+    {
       title: "图片策略",
       render: () => renderSegmented<boolean>(
         [
@@ -471,24 +487,6 @@ function buildReaderSettingsPanel() {
         ],
         state.conserveImages,
         (v) => updateReaderPrefs({ conserveImages: v }),
-      ),
-    },
-    {
-      title: "OCR 文字框",
-      render: () => renderSegmented<boolean>(
-        [
-          { label: "关闭", value: false },
-          { label: "开启", value: true, hint: "O" },
-        ],
-        state.ocrEnabled,
-        (v) => {
-          if (v === state.ocrEnabled) return;
-          if (v) {
-            toggleReaderOcr(true);
-          } else {
-            updateReaderPrefs({ ocrBoxes: false });
-          }
-        },
       ),
     },
     {
@@ -641,6 +639,7 @@ function saveReaderPrefs() {
     width: state.readerWidth,
     gap: state.readerGap,
     theme: state.readerTheme,
+    fit: state.readerFit,
     conserveImages: state.conserveImages,
     ocrBoxes: state.ocrEnabled,
     ocrLang: state.ocrLang,
@@ -653,6 +652,7 @@ function applyReaderPrefs() {
   shell.dataset.readerWidth = state.readerWidth;
   shell.dataset.readerGap = state.readerGap;
   shell.dataset.readerTheme = state.readerTheme;
+  shell.dataset.readerFit = state.readerFit;
   shell.classList.toggle("reader-low-data", state.conserveImages);
 }
 
@@ -663,10 +663,11 @@ function syncReaderControls() {
 
 function updateReaderPrefs(next: Partial<ReaderPrefs>) {
   const previousConserve = state.conserveImages;
+  const previousFit = state.readerFit;
   const previousOcr = state.ocrEnabled;
   const previousOcrLang = state.ocrLang;
   const previousTranslate = state.translateEnabled;
-  // 联动：翻译字幕(R)关掉时，OCR 文字框(O)也跟着关
+  // 联动：翻译字幕(R)关掉时，OCR 识别管线也跟着关，避免后台空转
   if (previousTranslate && next.translateMode === false) {
     next.ocrBoxes = false;
   }
@@ -674,6 +675,7 @@ function updateReaderPrefs(next: Partial<ReaderPrefs>) {
     readerWidth: next.width ?? state.readerWidth,
     readerGap: next.gap ?? state.readerGap,
     readerTheme: next.theme ?? state.readerTheme,
+    readerFit: next.fit ?? state.readerFit,
     conserveImages: next.conserveImages ?? state.conserveImages,
     ocrEnabled: next.ocrBoxes ?? state.ocrEnabled,
     ocrLang: next.ocrLang ?? state.ocrLang,
@@ -687,12 +689,16 @@ function updateReaderPrefs(next: Partial<ReaderPrefs>) {
     width: state.readerWidth,
     gap: state.readerGap,
     theme: state.readerTheme,
+    fit: state.readerFit,
     conserveImages: state.conserveImages,
     ocrBoxes: state.ocrEnabled,
     ocrLang: state.ocrLang,
     translateMode: state.translateEnabled,
   }).catch(() => {});
 
+  if (state.view === "reader" && previousFit !== state.readerFit) {
+    redrawReaderOverlays();
+  }
   if (state.view === "reader" && previousConserve !== state.conserveImages) {
     setupStreamObserver();
   }
@@ -765,6 +771,10 @@ function toggleReaderTheme() {
   updateReaderPrefs({ theme: state.readerTheme === "dark" ? "warm" : "dark" });
 }
 
+function toggleReaderFit() {
+  updateReaderPrefs({ fit: state.readerFit === "page" ? "width" : "page" });
+}
+
 function toggleReaderPreload() {
   updateReaderPrefs({ conserveImages: !state.conserveImages });
 }
@@ -776,6 +786,29 @@ const ocrPendingIndices = new Set<number>();
 let ocrBatchRunning = false;
 // OCR 开关竞态令牌:引擎初始化期间开关被再次切换时,用来取消过期的“开启”请求
 let ocrEnableToken = 0;
+// 文字框红框仅调试用:默认不画,正常用户无感知;调试时实时开关并记忆
+let ocrBoxDebug = (() => {
+  try {
+    return localStorage.getItem("wnacg.debugOcrBoxes.v1") === "1";
+  } catch {
+    return false;
+  }
+})();
+function setOcrBoxDebug(value: boolean) {
+  ocrBoxDebug = value;
+  try {
+    localStorage.setItem("wnacg.debugOcrBoxes.v1", value ? "1" : "0");
+  } catch {
+    // localStorage 不可用时只改内存,不影响本次会话
+  }
+  if (value) {
+    const index = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+    renderStreamOcrOverlay(index);
+    renderLightboxOcrOverlay();
+  } else {
+    removeAllOcrOverlays();
+  }
+}
 const ocrTextPending = new Set<number>();
 const ocrTextDone = new Set<number>();
 let ocrTextBatchRunning = false;
@@ -857,7 +890,7 @@ async function toggleReaderOcr(force?: boolean) {
     }
     toast();
     updateReaderPrefs({ ocrBoxes: true });
-    showToast("本地 OCR 已开启，文字区域将自动框出", "success", 2600);
+    showToast("本地 OCR 已开启", "success", 2600);
   } catch (error) {
     toast();
     const message = error instanceof Error ? error.message : String(error);
@@ -1188,22 +1221,29 @@ function renderTranslateOverlay(index: number) {
   const canvas = document.createElement("canvas");
   canvas.className = "stream-translate-overlay";
   const dpr = Math.min(2, window.devicePixelRatio || 1);
-  canvas.width = Math.max(1, Math.round(container.clientWidth * dpr));
-  canvas.height = Math.max(1, Math.round(container.clientHeight * dpr));
+  const w = img.offsetWidth;
+  const h = img.offsetHeight;
+  if (w < 4 || h < 4) return;
+  canvas.width = Math.max(1, Math.round(w * dpr));
+  canvas.height = Math.max(1, Math.round(h * dpr));
+  canvas.style.left = `${img.offsetLeft}px`;
+  canvas.style.top = `${img.offsetTop}px`;
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
   ctx.scale(dpr, dpr);
-  ctx.drawImage(img, 0, 0, container.clientWidth, container.clientHeight);
+  ctx.drawImage(img, 0, 0, w, h);
   for (let i = 0; i < regions.length; i++) {
     const region = regions[i];
     const translated = texts[i]?.trim();
     if (!translated) continue;
-    const x = region.x * container.clientWidth;
-    const y = region.y * container.clientHeight;
-    const w = region.w * container.clientWidth;
-    const h = region.h * container.clientHeight;
-    if (w < 4 || h < 4) continue;
-    drawCoverAndText(ctx, img, x, y, w, h, translated);
+    const x = region.x * w;
+    const y = region.y * h;
+    const rw = region.w * w;
+    const rh = region.h * h;
+    if (rw < 4 || rh < 4) continue;
+    drawCoverAndText(ctx, img, x, y, rw, rh, translated);
   }
   container.append(canvas);
   attachTranslateTooltip(canvas, regions);
@@ -1729,10 +1769,11 @@ function ocrPrefetchLoadedPages() {
 }
 
 function renderStreamOcrOverlay(index: number) {
-  if (state.translateEnabled) return; // 翻译模式不画红框
+  if (state.translateEnabled || !ocrBoxDebug) return; // 翻译模式/非调试不画红框
   const container = document.querySelector<HTMLElement>(`.stream-photo[data-index="${index}"]`);
   if (!container) return;
-  if (!container.querySelector(".stream-img")) return; // 图片还没就位,加载完成后会重画
+  const img = container.querySelector<HTMLImageElement>(".stream-img");
+  if (!img) return; // 图片还没就位,加载完成后会重画
   container.querySelector(".stream-ocr-overlay")?.remove();
   const regions = state.ocrRegions[index];
   if (!regions || regions.length === 0) return;
@@ -1740,6 +1781,11 @@ function renderStreamOcrOverlay(index: number) {
   const overlay = document.createElement("div");
   overlay.className = "stream-ocr-overlay";
   overlay.setAttribute("aria-hidden", "true");
+  // 框线对齐实际显示的图片(整页模式下图片可能居中缩放)
+  overlay.style.left = `${img.offsetLeft}px`;
+  overlay.style.top = `${img.offsetTop}px`;
+  overlay.style.width = `${img.offsetWidth}px`;
+  overlay.style.height = `${img.offsetHeight}px`;
   for (const region of regions) {
     const box = document.createElement("div");
     box.className = "ocr-box";
@@ -1754,7 +1800,7 @@ function renderStreamOcrOverlay(index: number) {
 }
 
 function renderLightboxOcrOverlay() {
-  if (state.translateEnabled) return; // 翻译模式不画红框
+  if (state.translateEnabled || !ocrBoxDebug) return; // 翻译模式/非调试不画红框
   const wrap = document.querySelector<HTMLElement>(".lightbox-image-wrap");
   const img = document.querySelector<HTMLImageElement>(".lightbox-image");
   wrap?.querySelector(".lightbox-ocr-overlay")?.remove();
@@ -1787,6 +1833,24 @@ function removeAllOcrOverlays() {
   document.querySelectorAll<HTMLElement>(".stream-ocr-overlay, .lightbox-ocr-overlay").forEach((el) => {
     el.remove();
   });
+}
+
+// 重画当前已加载页面的译文/调试红框(整页模式切换、窗口尺寸变化时对齐会变)
+function redrawReaderOverlays() {
+  document.querySelectorAll<HTMLElement>(".stream-photo[data-state='loaded']").forEach((el) => {
+    const index = parseInt(el.dataset.index || "", 10);
+    if (Number.isNaN(index)) return;
+    if (state.translateEnabled && state.translateTexts[index]) {
+      renderTranslateOverlay(index);
+    }
+    renderStreamOcrOverlay(index); // 调试红框,内部自行判断是否该画
+  });
+  if (state.lightboxIndex >= 0) {
+    if (state.translateEnabled && state.translateTexts[state.lightboxIndex]) {
+      renderLightboxTranslateOverlay();
+    }
+    renderLightboxOcrOverlay();
+  }
 }
 
 function updateReaderProgress() {
@@ -3761,6 +3825,14 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
+  // 调试用隐藏快捷键:Cmd/Ctrl+Shift+O 实时开关 OCR 文字框,无需重启
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") {
+    e.preventDefault();
+    setOcrBoxDebug(!ocrBoxDebug);
+    showToast(ocrBoxDebug ? "调试：显示 OCR 文字框" : "调试：隐藏 OCR 文字框", "info", 2200);
+    return;
+  }
+
   if (e.key === " " && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
     e.preventDefault();
     if (state.lightboxIndex >= 0) {
@@ -3791,7 +3863,7 @@ document.addEventListener("keydown", (e) => {
       }
       return;
     }
-    if (e.key.toLowerCase() === "o") {
+    if (ocrBoxDebug && e.key.toLowerCase() === "o") {
       toggleReaderOcr();
       return;
     }
@@ -3841,11 +3913,15 @@ document.addEventListener("keydown", (e) => {
       toggleReaderTheme();
       return;
     }
+    if (e.key.toLowerCase() === "v") {
+      toggleReaderFit();
+      return;
+    }
     if (e.key.toLowerCase() === "p") {
       toggleReaderPreload();
       return;
     }
-    if (e.key.toLowerCase() === "o") {
+    if (ocrBoxDebug && e.key.toLowerCase() === "o") {
       toggleReaderOcr();
       return;
     }
@@ -4007,6 +4083,10 @@ listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
     ocrBoxesChanged = true;
     dirty = true;
   }
+  if ((payload.fit === "page" || payload.fit === "width") && payload.fit !== state.readerFit) {
+    state.readerFit = payload.fit;
+    dirty = true;
+  }
   if ((payload.ocrLang === "zh" || payload.ocrLang === "ja") && payload.ocrLang !== state.ocrLang) {
     state.ocrLang = payload.ocrLang;
     ocrLangChanged = true;
@@ -4015,6 +4095,7 @@ listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
   if (dirty) {
     applyReaderPrefs();
     syncReaderControls();
+    redrawReaderOverlays();
     if (state.ocrEnabled) {
       if (ocrLangChanged) {
         // 识别语言变了,清掉旧结果重新识别
@@ -4037,6 +4118,7 @@ window.addEventListener("resize", () => {
   if (state.ocrEnabled && state.lightboxIndex >= 0) {
     renderLightboxOcrOverlay();
   }
+  redrawReaderOverlays();
 });
 
 const initialAid = getInitialAlbumFromHash();
