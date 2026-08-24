@@ -51,7 +51,15 @@ type Tag = {
 type AlbumDetail = {
   photos: PhotoEntry[];
   tags: Tag[];
+  categories: Tag[];
+  author?: Tag | null;
   title?: string | null;
+};
+
+type BrowseKind = "tag" | "author" | "classification";
+
+type BrowseLinkRequest = Tag & {
+  kind: BrowseKind;
 };
 
 type PreloadResult = "loaded" | "failed" | "cached";
@@ -192,9 +200,10 @@ const categories: Category[] = [
 
 const state = {
   view: "list" as "list" | "reader",
-  mode: "category" as "category" | "search" | "tag",
+  mode: "category" as "category" | "search" | BrowseKind,
   category: categories[0],
   query: "",
+  linkPath: "",
   page: 1,
   albums: [] as Album[],
   listSnapshots: {} as Record<string, ListSnapshot>,
@@ -205,6 +214,8 @@ const state = {
   currentAlbum: null as { aid: string; title: string } | null,
   photos: [] as PhotoEntry[],
   tags: [] as Tag[],
+  albumCategories: [] as Tag[],
+  author: null as Tag | null,
   preloadedUrls: {} as Record<number, string>, // index -> full image URL
   listToken: 0,
   readerToken: 0,
@@ -402,6 +413,27 @@ fullscreenButton.hidden = true;
 fullscreenButton.addEventListener("click", () => toggleFullscreen());
 pagerControls.append(fullscreenButton);
 
+const readerInfo = document.createElement("div");
+readerInfo.className = "reader-info";
+readerInfo.hidden = true;
+
+const readerInfoButton = document.createElement("button");
+readerInfoButton.type = "button";
+readerInfoButton.className = "reader-setting-button reader-info-trigger";
+readerInfoButton.textContent = "作品信息";
+readerInfoButton.setAttribute("aria-haspopup", "true");
+readerInfoButton.setAttribute("aria-expanded", "false");
+
+const readerInfoPanel = document.createElement("div");
+readerInfoPanel.className = "reader-info-panel";
+readerInfoPanel.hidden = true;
+readerInfoPanel.setAttribute("role", "dialog");
+readerInfoPanel.setAttribute("aria-label", "作品信息");
+readerInfoPanel.addEventListener("click", (event) => event.stopPropagation());
+
+readerInfo.append(readerInfoButton, readerInfoPanel);
+pagerControls.append(readerInfo);
+
 const readerSettings = document.createElement("div");
 readerSettings.className = "reader-settings";
 readerSettings.hidden = true;
@@ -495,7 +527,7 @@ pagerBar.append(pagerBarFirst, pagerBarPrev, pagerBarLabel, pagerBarInput, pager
 workspace.append(pagerBar);
 
 function syncPagerBar() {
-  const visible = state.view === "list" && state.mode !== "tag";
+  const visible = state.view === "list" && !isLinkedMode();
   pagerBar.hidden = !visible;
   if (!visible) return;
   pagerBarLabel.textContent = "第";
@@ -660,8 +692,34 @@ function buildReaderSettingsPanel() {
 }
 
 let readerSettingsOpen = false;
+let readerInfoOpen = false;
+
+function setReaderInfoOpen(open: boolean) {
+  if (open && readerSettingsOpen) setReaderSettingsOpen(false);
+  readerInfoOpen = open && !readerInfoButton.disabled;
+  readerInfoPanel.hidden = !readerInfoOpen;
+  readerInfoButton.classList.toggle("active", readerInfoOpen);
+  readerInfoButton.setAttribute("aria-expanded", String(readerInfoOpen));
+  if (readerInfoOpen) {
+    readerInfoPanel.replaceChildren(buildAlbumMetadata("reader-info-metadata"));
+  }
+}
+
+function syncReaderInfo() {
+  const hasMetadata = state.albumCategories.length > 0 || Boolean(state.author) || state.tags.length > 0;
+  readerInfo.hidden = state.view !== "reader";
+  readerInfoButton.disabled = !hasMetadata;
+  readerInfoButton.title = hasMetadata ? "查看分类、作者与标签" : "正在获取作品信息";
+  if (!hasMetadata || state.view !== "reader") setReaderInfoOpen(false);
+}
+
+readerInfoButton.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setReaderInfoOpen(!readerInfoOpen);
+});
 
 function setReaderSettingsOpen(open: boolean) {
+  if (open && readerInfoOpen) setReaderInfoOpen(false);
   readerSettingsOpen = open;
   readerSettingsPanel.hidden = !open;
   readerSettingsButton.classList.toggle("active", open);
@@ -674,6 +732,10 @@ function toggleReaderSettingsPanel() {
 }
 
 document.addEventListener("click", (event) => {
+  if (readerInfoOpen) {
+    const target = event.target as Node;
+    if (!readerInfo.contains(target)) setReaderInfoOpen(false);
+  }
   if (!readerSettingsOpen) return;
   const target = event.target as Node;
   if (readerSettings.contains(target)) return;
@@ -2151,7 +2213,7 @@ function currentStreamIndex() {
     return index;
   }
   // Both resultGrid and the photos currently share .workspace as offsetParent.
-  // Anchor to the scroller itself so a wrapping tag bar before the first page
+  // Anchor to the scroller itself so wrapping metadata before the first page
   // cannot shift page detection.
   const probe = resultGrid.offsetTop + resultGrid.scrollTop + resultGrid.clientHeight * 0.35;
   let index = Math.max(0, Math.min(photos.length - 1, streamIndexHint));
@@ -2240,8 +2302,12 @@ function pagePath(path: string, page = state.page) {
   return path.replace("{page}", String(page));
 }
 
+function isLinkedMode(mode = state.mode): mode is BrowseKind {
+  return mode === "tag" || mode === "author" || mode === "classification";
+}
+
 function listContextKey() {
-  return [state.mode, state.query, state.category.path].join("\n");
+  return [state.mode, state.query, state.category.path, state.linkPath].join("\n");
 }
 
 function updateListControls() {
@@ -2267,8 +2333,12 @@ function updateJumpTopButton() {
 }
 
 async function fetchAlbums(page: number, contextKey = listContextKey()) {
-  const [mode, query, categoryPath] = contextKey.split("\n") as [typeof state.mode, string, string];
-  if (mode === "tag") return invokeTauri<Album[]>("search_tag", { tag: query });
+  const [mode, query, categoryPath, linkPath] = contextKey.split("\n") as [typeof state.mode, string, string, string];
+  if (isLinkedMode(mode)) {
+    if (linkPath) return invokeTauri<Album[]>("fetch_albums", { path: linkPath });
+    if (mode === "tag") return invokeTauri<Album[]>("search_tag", { tag: query });
+    throw new Error("缺少对应的列表链接");
+  }
   if (mode === "search") return invokeTauri<Album[]>("search_albums", { query, page });
   return invokeTauri<Album[]>("fetch_albums", { path: pagePath(categoryPath, page) });
 }
@@ -2711,12 +2781,15 @@ function syncToolbar() {
     readerSettings.hidden = false;
     viewTitle.textContent =
       state.mode === "tag" ? `标签：${state.query}` :
+      state.mode === "author" ? `作者：${state.query}` :
+      state.mode === "classification" ? `分类：${state.query}` :
       state.mode === "search" ? `搜索：${state.query || "未输入"}` : state.category.label;
     sidebar.classList.remove("hidden");
     shell.classList.remove("reader-mode");
   }
   syncReaderControls();
   syncPagerBar();
+  syncReaderInfo();
   updateReaderProgress();
   syncReaderPageControls();
   updateListControls();
@@ -2738,6 +2811,7 @@ function renderCategories() {
         state.mode = "category";
         state.category = cat;
         state.query = "";
+        state.linkPath = "";
         searchInput.value = "";
         state.page = 1;
         state.allLoaded = false;
@@ -2774,33 +2848,46 @@ async function closeStandaloneWindow() {
   }
 }
 
-async function triggerTagSearch(tag: string) {
-  const trimmed = tag.trim();
-  if (!trimmed) return;
+async function triggerDetailBrowse(kind: BrowseKind, item: Tag) {
+  const name = item.name.trim();
+  const path = item.path.trim();
+  if (!name || !path) return;
   if (shell.classList.contains("standalone-album")) {
-    // 子窗口:通知主窗口去搜索,自己保留
+    // 子窗口:通知主窗口打开对应列表,自己保留
     try {
-      await invokeTauri<void>("search_tag_in_main", { tag: trimmed });
+      await invokeTauri<void>("browse_link_in_main", { kind, name, path });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      showToast(`无法在主窗口搜索：${message}`, "error", 3000);
+      showToast(`无法在主窗口打开列表：${message}`, "error", 3000);
     }
     return;
   }
-  // 主窗口:本地直接切到 tag 搜索
-  applyTagSearch(trimmed);
+  applyLinkedBrowse({ kind, name, path });
 }
 
-function applyTagSearch(tag: string) {
-  state.mode = "tag";
-  state.query = tag;
+function applyLinkedBrowse(request: BrowseLinkRequest) {
+  state.mode = request.kind;
+  state.query = request.name.trim();
+  state.linkPath = request.path.trim();
   state.page = 1;
-  searchInput.value = tag;
+  state.allLoaded = false;
+  state.loadMoreError = "";
+  searchInput.value = state.query;
   if (state.view === "reader") {
     backToList({ restore: false });
   } else {
     loadAlbums();
   }
+}
+
+function applyTagSearch(tag: string) {
+  const name = tag.trim();
+  if (!name) return;
+  applyLinkedBrowse({
+    kind: "tag",
+    name,
+    path: `/albums-index-tag-${encodeURIComponent(name)}.html`,
+  });
 }
 
 const APP_TITLE = "wnacg · 桌面阅读器";
@@ -2924,7 +3011,7 @@ function renderAlbums(albums: Album[]) {
     card.style.setProperty("--card-order", String(i));
     return card;
   }));
-  if (albums.length > 0 && state.mode !== "tag" && !state.allLoaded) setupInfiniteScroll();
+  if (albums.length > 0 && !isLinkedMode() && !state.allLoaded) setupInfiniteScroll();
 }
 
 function insertBeforeSentinel(node: Node) {
@@ -3027,7 +3114,7 @@ function showEmpty(text: string) {
   card.className = "state-card empty-state";
   const icon = document.createElement("div");
   icon.className = "empty-state-icon";
-  icon.textContent = state.mode === "search" || state.mode === "tag" ? "🔍" : "·";
+  icon.textContent = state.mode === "search" || isLinkedMode() ? "🔍" : "·";
   const title = document.createElement("h3");
   title.className = "empty-state-title";
   title.textContent = text;
@@ -3091,11 +3178,11 @@ async function loadAlbums() {
 
     if (token !== state.listToken || state.view !== "list" || contextKey !== listContextKey()) return;
     state.page = page;
-    state.allLoaded = albums.length === 0 || state.mode === "tag";
+    state.allLoaded = albums.length === 0 || isLinkedMode();
     state.albums = albums;
     syncToolbar();
     if (albums.length === 0) {
-      showEmpty(state.mode === "search" || state.mode === "tag" ? "没有找到匹配结果" : "这一页没有内容");
+      showEmpty(state.mode === "search" || isLinkedMode() ? "没有找到匹配结果" : "这一页没有内容");
     } else {
       renderAlbums(albums);
       translateVisibleTitles();
@@ -3125,8 +3212,8 @@ async function loadAlbums() {
 
 function jumpToPage(targetPage: number) {
   const page = Math.max(1, Math.floor(targetPage));
-  if (state.mode === "tag") {
-    showToast("标签搜索为单页结果", "info");
+  if (isLinkedMode()) {
+    showToast("当前列表为单页结果", "info");
     return;
   }
   if (page === state.page && state.albums.length > 0) {
@@ -3141,7 +3228,7 @@ function jumpToPage(targetPage: number) {
 
 async function loadNextPage() {
   if (state.listLoading || state.loadingMore || state.allLoaded || state.loadMoreError || state.view !== "list") return;
-  if (state.mode === "tag") return; // tag search is single-page
+  if (isLinkedMode()) return;
   const token = state.listToken;
   const contextKey = listContextKey();
   const page = state.page + 1;
@@ -3210,7 +3297,44 @@ function teardownReaderObserver() {
   streamQueue = [];
 }
 
-function renderReaderGrid(tags = state.tags) {
+function buildAlbumMetadata(className = "album-metadata") {
+  const metadata = document.createElement("section");
+  metadata.className = className;
+  metadata.setAttribute("aria-label", "作品信息");
+
+  const appendRow = (labelText: string, items: Tag[], kind: BrowseKind, tagStyle = false) => {
+    if (items.length === 0) return;
+    const row = document.createElement("div");
+    row.className = "metadata-row";
+    const label = document.createElement("span");
+    label.className = "metadata-label";
+    label.textContent = labelText;
+    const values = document.createElement("div");
+    values.className = "metadata-values";
+    for (const item of items) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = tagStyle ? "tag-btn" : "metadata-link";
+      button.textContent = item.name;
+      button.title = `查看${labelText}“${item.name}”的作品`;
+      button.addEventListener("click", () => triggerDetailBrowse(kind, item));
+      values.append(button);
+    }
+    row.append(label, values);
+    metadata.append(row);
+  };
+
+  appendRow("分类", state.albumCategories, "classification");
+  appendRow("作者", state.author ? [state.author] : [], "author");
+  appendRow("标签", state.tags, "tag", true);
+  return metadata;
+}
+
+function renderReaderGrid(
+  tags = state.tags,
+  albumCategories = state.albumCategories,
+  author = state.author,
+) {
   teardownReaderObserver();
   streamIndexHint = 0;
   lastReportedStreamIndex = -1;
@@ -3220,20 +3344,8 @@ function renderReaderGrid(tags = state.tags) {
 
   const frag = document.createDocumentFragment();
 
-  if (tags && tags.length > 0) {
-    const tagBar = document.createElement("div");
-    tagBar.className = "tag-bar";
-    for (const tag of tags) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "tag-btn";
-      btn.textContent = tag.name;
-      btn.addEventListener("click", () => {
-        triggerTagSearch(tag.name);
-      });
-      tagBar.append(btn);
-    }
-    frag.append(tagBar);
+  if (albumCategories.length > 0 || author || tags.length > 0) {
+    frag.append(buildAlbumMetadata());
   }
 
   for (let start = 0; start < state.photos.length; start += 2) {
@@ -3462,6 +3574,8 @@ async function loadAlbumReader(aid: string, title: string) {
   state.currentAlbum = { aid, title: placeholderTitle };
   state.photos = [];
   state.tags = [];
+  state.albumCategories = [];
+  state.author = null;
   state.preloadedUrls = {};
   state.preloadFailures = {};
   state.ocrRegions = {};
@@ -3481,7 +3595,10 @@ async function loadAlbumReader(aid: string, title: string) {
     const detail = await invokeTauri<AlbumDetail>("fetch_album_photos", { aid });
     if (token !== state.readerToken || state.view !== "reader" || state.currentAlbum?.aid !== aid) return;
     state.photos = detail.photos;
-    state.tags = detail.tags;
+    state.tags = detail.tags ?? [];
+    state.albumCategories = detail.categories ?? [];
+    state.author = detail.author ?? null;
+    syncReaderInfo();
     const resolvedTitle = (detail.title || title || "").trim() || `作品 ${aid}`;
     state.currentAlbum = { aid, title: resolvedTitle };
     applyAlbumTitle(resolvedTitle);
@@ -3490,7 +3607,7 @@ async function loadAlbumReader(aid: string, title: string) {
       setStatus("暂无内容");
       return;
     }
-    renderReaderGrid(detail.tags);
+    renderReaderGrid(state.tags, state.albumCategories, state.author);
     setStatus(`共 ${detail.photos.length} 张`);
   } catch (error) {
     if (token !== state.readerToken || state.view !== "reader" || state.currentAlbum?.aid !== aid) return;
@@ -3515,6 +3632,8 @@ function backToList(options: { restore?: boolean } = {}) {
   resetWindowTitle();
   state.photos = [];
   state.tags = [];
+  state.albumCategories = [];
+  state.author = null;
   state.preloadedUrls = {};
   state.preloadFailures = {};
   state.ocrRegions = {};
@@ -3679,6 +3798,7 @@ searchForm.addEventListener("submit", (event) => {
 
   state.mode = "search";
   state.query = query;
+  state.linkPath = "";
   searchInput.value = query;
   state.page = 1;
   state.allLoaded = false;
@@ -3773,7 +3893,7 @@ function teardownInfiniteScroll() {
 
 function setupInfiniteScroll() {
   teardownInfiniteScroll();
-  if (state.view !== "list" || state.mode === "tag" || state.allLoaded || state.loadMoreError) return;
+  if (state.view !== "list" || isLinkedMode() || state.allLoaded || state.loadMoreError) return;
 
   scrollSentinel = document.createElement("div");
   scrollSentinel.className = "scroll-sentinel";
@@ -3944,7 +4064,19 @@ if (initialAid) {
   loadAlbumReader(initialAid, "");
 } else {
   loadAlbums();
-  // 主窗口:监听子窗口发来的标签搜索请求
+  // 主窗口:监听子窗口发来的详情链接浏览请求
+  listen<BrowseLinkRequest>("browse-link", (event) => {
+    const request = event.payload;
+    if (!request || !isLinkedMode(request.kind)) return;
+    if (!request.name?.trim() || !request.path?.trim()) return;
+    applyLinkedBrowse({
+      kind: request.kind,
+      name: request.name.trim(),
+      path: request.path.trim(),
+    });
+  }).catch((err) => console.error("listen(browse-link) failed:", err));
+
+  // 兼容旧版子窗口发出的标签事件。
   listen<string>("search-tag", (event) => {
     const tag = typeof event.payload === "string" ? event.payload : String(event.payload ?? "");
     if (!tag.trim()) return;

@@ -78,7 +78,7 @@ struct PhotoImage {
     url: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct Tag {
     name: String,
     path: String,
@@ -89,7 +89,17 @@ struct Tag {
 struct AlbumDetail {
     photos: Vec<PhotoEntry>,
     tags: Vec<Tag>,
+    categories: Vec<Tag>,
+    author: Option<Tag>,
     title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowseLinkRequest {
+    kind: String,
+    name: String,
+    path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -944,6 +954,46 @@ fn parse_album_tags(html: &str, base_url: &str) -> Vec<Tag> {
         .collect()
 }
 
+fn parse_album_categories(html: &str, base_url: &str) -> Vec<Tag> {
+    let document = Html::parse_document(html);
+    let Ok(selector) = Selector::parse(
+        "#bread .bread a[href*='albums-index-cate-'], .png.bread a[href*='albums-index-cate-']",
+    ) else {
+        return vec![];
+    };
+    let mut seen = HashSet::new();
+
+    document
+        .select(&selector)
+        .filter_map(|element| {
+            let href = element.value().attr("href")?;
+            let name = cleaned_text(&element.text().collect::<Vec<_>>().join(" "));
+            if name.is_empty() || href.is_empty() || !seen.insert(href.to_string()) {
+                return None;
+            }
+            Some(Tag {
+                name,
+                path: normalize_url(base_url, href),
+            })
+        })
+        .collect()
+}
+
+fn parse_album_author(html: &str, base_url: &str) -> Option<Tag> {
+    let document = Html::parse_document(html);
+    let selector = Selector::parse(".uwuinfo a[href*='albums-user-uid-']").ok()?;
+    let element = document.select(&selector).next()?;
+    let href = element.value().attr("href")?;
+    let name = cleaned_text(&element.text().collect::<Vec<_>>().join(" "));
+    if name.is_empty() || href.is_empty() {
+        return None;
+    }
+    Some(Tag {
+        name,
+        path: normalize_url(base_url, href),
+    })
+}
+
 fn parse_album_title(html: &str) -> Option<String> {
     let document = Html::parse_document(html);
 
@@ -1016,12 +1066,16 @@ async fn fetch_album_photos(aid: String, _app: tauri::AppHandle) -> Result<Album
                 }
 
                 let tags = parse_album_tags(&first_html, base_url);
+                let categories = parse_album_categories(&first_html, base_url);
+                let author = parse_album_author(&first_html, base_url);
                 let title = parse_album_title(&first_html);
                 let mut seen = HashSet::new();
                 photos.retain(|photo| seen.insert(photo.id.clone()));
                 return Ok(AlbumDetail {
                     photos,
                     tags,
+                    categories,
+                    author,
                     title,
                 });
             }
@@ -1252,6 +1306,43 @@ fn search_tag_in_main(app: tauri::AppHandle, tag: String) -> Result<(), String> 
         .map_err(|err| format!("通知主窗口失败：{err}"))
 }
 
+#[tauri::command]
+fn browse_link_in_main(
+    app: tauri::AppHandle,
+    kind: String,
+    name: String,
+    path: String,
+) -> Result<(), String> {
+    let kind = kind.trim();
+    let name = name.trim();
+    let path = path.trim();
+    if !matches!(kind, "tag" | "author" | "classification") {
+        return Err("不支持的列表类型".to_string());
+    }
+    if name.is_empty() || path.is_empty() {
+        return Err("缺少列表信息".to_string());
+    }
+    // Reuse the same URL allow-list as the fetch commands before passing this
+    // link to the main window.
+    build_url(BASE_URLS[0], path)?;
+
+    let main = app
+        .get_webview_window("main")
+        .ok_or_else(|| "找不到主窗口".to_string())?;
+    main.show().ok();
+    main.unminimize().ok();
+    main.set_focus().ok();
+    main.emit(
+        "browse-link",
+        BrowseLinkRequest {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            path: path.to_string(),
+        },
+    )
+    .map_err(|err| format!("通知主窗口失败：{err}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1270,6 +1361,7 @@ pub fn run() {
             set_window_title,
             close_current_window,
             search_tag_in_main,
+            browse_link_in_main,
             ocr::ocr_pages,
             ocr::ocr_engine_status,
             translate::translate_dialogue,
@@ -1359,6 +1451,42 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_album_browse_links_with_their_real_paths() {
+        let html = r#"
+            <div id="bread"><div class="png bread">
+              <a href="/">首頁</a>
+              <a href="/albums-index-cate-5.html">同人誌</a>
+              <a href="/albums-index-cate-1.html">漢化</a>
+            </div></div>
+            <div class="addtags">標籤：
+              <a class="tagshow" href="/albums-index-tag-Story.html">Story</a>
+            </div>
+            <div class="uwuinfo">
+              <a href="/albums-user-uid-42.html"><img src="avatar.jpg"><p>Uploader</p></a>
+            </div>
+        "#;
+
+        let categories = parse_album_categories(html, "https://www.wn03.cfd");
+        assert_eq!(categories.len(), 2);
+        assert_eq!(categories[0].name, "同人誌");
+        assert_eq!(
+            categories[1].path,
+            "https://www.wn03.cfd/albums-index-cate-1.html"
+        );
+
+        let tags = parse_album_tags(html, "https://www.wn03.cfd");
+        assert_eq!(tags.len(), 1);
+        assert_eq!(
+            tags[0].path,
+            "https://www.wn03.cfd/albums-index-tag-Story.html"
+        );
+
+        let author = parse_album_author(html, "https://www.wn03.cfd").expect("author");
+        assert_eq!(author.name, "Uploader");
+        assert_eq!(author.path, "https://www.wn03.cfd/albums-user-uid-42.html");
+    }
 
     #[test]
     fn image_progress_throttle_limits_fast_updates_and_duplicate_percentages() {
