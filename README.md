@@ -34,7 +34,7 @@ npm run tauri dev
 npm run tauri build
 ```
 
-翻译功能读取 `~/Library/Application Support/wnacg/config.json` 中的 `deepseekApiKey`，也可以通过 `DEEPSEEK_API_KEY` 环境变量配置。
+DeepSeek 密钥可在应用的阅读设置中配置，并安全保存在 macOS 钥匙串。旧版的 `config.json` 或 `DEEPSEEK_API_KEY` 环境变量会在首次读取时自动迁移。
 
 ## 说明
 

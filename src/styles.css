@@ -645,6 +645,7 @@ button:has(> .icon + span) {
   grid-template-columns: 72px minmax(0, 1fr);
   align-items: center;
   gap: var(--space-3);
+  min-width: 0;
 }
 
 .settings-label {
@@ -704,6 +705,54 @@ button:has(> .icon + span) {
   background: rgba(0, 0, 0, 0.18);
   color: inherit;
   opacity: 0.7;
+}
+
+.api-key-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-1);
+  width: 100%;
+  min-width: 0;
+}
+
+.api-key-input {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  outline: none;
+  background: var(--bg-canvas);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-sm);
+}
+
+.api-key-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+
+.api-key-save {
+  min-height: 30px;
+  height: 30px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-raised);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+
+.api-key-status {
+  grid-column: 1 / -1;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+}
+
+.api-key-status.configured {
+  color: var(--text-secondary);
 }
 
 .reader-setting-button,

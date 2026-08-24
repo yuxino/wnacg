@@ -461,6 +461,90 @@ readerSettings.append(readerSettingsButton, readerSettingsPanel);
 
 pagerControls.append(readerSettings);
 
+let deepseekKeyConfigured: boolean | null = null;
+
+function syncDeepseekKeyControl() {
+  const status = readerSettingsPanel.querySelector<HTMLElement>(".api-key-status");
+  const input = readerSettingsPanel.querySelector<HTMLInputElement>(".api-key-input");
+  if (status) {
+    status.textContent = deepseekKeyConfigured === null
+      ? "检查中"
+      : deepseekKeyConfigured ? "已安全保存到钥匙串" : "尚未配置";
+    status.classList.toggle("configured", deepseekKeyConfigured === true);
+  }
+  if (input) {
+    input.placeholder = deepseekKeyConfigured ? "输入新密钥可替换" : "粘贴 API Key";
+  }
+}
+
+async function refreshDeepseekKeyStatus() {
+  try {
+    await invokeTauri<string>("translate_engine_status");
+    deepseekKeyConfigured = true;
+  } catch {
+    deepseekKeyConfigured = false;
+  }
+  syncDeepseekKeyControl();
+}
+
+function renderDeepseekKeyControl() {
+  const form = document.createElement("form");
+  form.className = "api-key-control";
+
+  const input = document.createElement("input");
+  input.type = "password";
+  input.className = "api-key-input";
+  input.autocomplete = "new-password";
+  input.spellcheck = false;
+  input.setAttribute("aria-label", "DeepSeek API Key");
+
+  const save = document.createElement("button");
+  save.type = "submit";
+  save.className = "api-key-save";
+  save.textContent = "保存";
+
+  const status = document.createElement("span");
+  status.className = "api-key-status";
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const apiKey = input.value.trim();
+    if (!apiKey) {
+      input.focus();
+      return;
+    }
+    input.disabled = true;
+    save.disabled = true;
+    save.textContent = "保存中";
+    try {
+      await invokeTauri<void>("set_deepseek_api_key", { apiKey });
+      deepseekKeyConfigured = true;
+      input.value = "";
+      titleTranslateFailed.clear();
+      state.translateFailed = {};
+      translateDone.clear();
+      if (state.translateEnabled && state.view === "reader") {
+        queueOcrWindow(currentStreamIndex());
+      }
+      translateVisibleTitles();
+      refreshTranslateStatus();
+      showToast("DeepSeek 密钥已保存到 macOS 钥匙串", "success", 3200);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      showToast(`密钥保存失败：${message}`, "error", 4200);
+    } finally {
+      input.disabled = false;
+      save.disabled = false;
+      save.textContent = "保存";
+      syncDeepseekKeyControl();
+    }
+  });
+
+  form.append(input, save, status);
+  window.requestAnimationFrame(syncDeepseekKeyControl);
+  return form;
+}
+
 const jumpTopButton = document.createElement("button");
 jumpTopButton.type = "button";
 jumpTopButton.className = "jump-top";
@@ -527,7 +611,7 @@ pagerBar.append(pagerBarFirst, pagerBarPrev, pagerBarLabel, pagerBarInput, pager
 workspace.append(pagerBar);
 
 function syncPagerBar() {
-  const visible = state.view === "list" && !isLinkedMode();
+  const visible = state.view === "list";
   pagerBar.hidden = !visible;
   if (!visible) return;
   pagerBarLabel.textContent = "第";
@@ -649,6 +733,10 @@ function buildReaderSettingsPanel() {
           );
         },
       ),
+    },
+    {
+      title: "DeepSeek",
+      render: renderDeepseekKeyControl,
     },
   ];
 
@@ -2302,6 +2390,22 @@ function pagePath(path: string, page = state.page) {
   return path.replace("{page}", String(page));
 }
 
+function linkedPagePath(path: string, page: number) {
+  if (page <= 1) return path;
+
+  const albumIndexPath = /(\/albums-index-)(?:page-\d+-)?((?:tag-.+?|cate-\d+))(?=\.html(?:[?#]|$))/;
+  if (albumIndexPath.test(path)) {
+    return path.replace(albumIndexPath, `$1page-${page}-$2`);
+  }
+
+  const authorPath = /(\/albums-user-)(?:page-\d+-)?(uid-\d+)(?=\.html(?:[?#]|$))/;
+  if (authorPath.test(path)) {
+    return path.replace(authorPath, `$1page-${page}-$2`);
+  }
+
+  throw new Error("当前列表地址暂不支持继续翻页");
+}
+
 function isLinkedMode(mode = state.mode): mode is BrowseKind {
   return mode === "tag" || mode === "author" || mode === "classification";
 }
@@ -2335,8 +2439,12 @@ function updateJumpTopButton() {
 async function fetchAlbums(page: number, contextKey = listContextKey()) {
   const [mode, query, categoryPath, linkPath] = contextKey.split("\n") as [typeof state.mode, string, string, string];
   if (isLinkedMode(mode)) {
-    if (linkPath) return invokeTauri<Album[]>("fetch_albums", { path: linkPath });
-    if (mode === "tag") return invokeTauri<Album[]>("search_tag", { tag: query });
+    if (linkPath) return invokeTauri<Album[]>("fetch_albums", { path: linkedPagePath(linkPath, page) });
+    if (mode === "tag") {
+      if (page === 1) return invokeTauri<Album[]>("search_tag", { tag: query });
+      const tagPath = `/albums-index-tag-${encodeURIComponent(query)}.html`;
+      return invokeTauri<Album[]>("fetch_albums", { path: linkedPagePath(tagPath, page) });
+    }
     throw new Error("缺少对应的列表链接");
   }
   if (mode === "search") return invokeTauri<Album[]>("search_albums", { query, page });
@@ -3011,7 +3119,7 @@ function renderAlbums(albums: Album[]) {
     card.style.setProperty("--card-order", String(i));
     return card;
   }));
-  if (albums.length > 0 && !isLinkedMode() && !state.allLoaded) setupInfiniteScroll();
+  if (albums.length > 0 && !state.allLoaded) setupInfiniteScroll();
 }
 
 function insertBeforeSentinel(node: Node) {
@@ -3178,7 +3286,7 @@ async function loadAlbums() {
 
     if (token !== state.listToken || state.view !== "list" || contextKey !== listContextKey()) return;
     state.page = page;
-    state.allLoaded = albums.length === 0 || isLinkedMode();
+    state.allLoaded = albums.length === 0;
     state.albums = albums;
     syncToolbar();
     if (albums.length === 0) {
@@ -3212,10 +3320,6 @@ async function loadAlbums() {
 
 function jumpToPage(targetPage: number) {
   const page = Math.max(1, Math.floor(targetPage));
-  if (isLinkedMode()) {
-    showToast("当前列表为单页结果", "info");
-    return;
-  }
   if (page === state.page && state.albums.length > 0) {
     resultGrid.scrollTo({ top: 0, behavior: "smooth" });
     return;
@@ -3228,7 +3332,6 @@ function jumpToPage(targetPage: number) {
 
 async function loadNextPage() {
   if (state.listLoading || state.loadingMore || state.allLoaded || state.loadMoreError || state.view !== "list") return;
-  if (isLinkedMode()) return;
   const token = state.listToken;
   const contextKey = listContextKey();
   const page = state.page + 1;
@@ -3249,7 +3352,14 @@ async function loadNextPage() {
     removeLoadMoreRow();
     if (token !== state.listToken || state.view !== "list" || contextKey !== listContextKey()) return;
 
-    if (albums.length === 0) {
+    const seenAids = new Set(state.albums.map((album) => album.aid));
+    const newAlbums = albums.filter((album) => {
+      if (seenAids.has(album.aid)) return false;
+      seenAids.add(album.aid);
+      return true;
+    });
+
+    if (newAlbums.length === 0) {
       state.allLoaded = true;
       teardownInfiniteScroll();
       showListEnd();
@@ -3260,10 +3370,10 @@ async function loadNextPage() {
     }
 
     state.page = page;
-    state.albums = [...state.albums, ...albums];
+    state.albums = [...state.albums, ...newAlbums];
     // Insert albums before the sentinel (keep sentinel at bottom)
-    for (let i = 0; i < albums.length; i++) {
-      const card = renderAlbumCard(albums[i]);
+    for (let i = 0; i < newAlbums.length; i++) {
+      const card = renderAlbumCard(newAlbums[i]);
       card.style.setProperty("--card-order", String(i));
       insertBeforeSentinel(card);
     }
@@ -3893,7 +4003,7 @@ function teardownInfiniteScroll() {
 
 function setupInfiniteScroll() {
   teardownInfiniteScroll();
-  if (state.view !== "list" || isLinkedMode() || state.allLoaded || state.loadMoreError) return;
+  if (state.view !== "list" || state.allLoaded || state.loadMoreError) return;
 
   scrollSentinel = document.createElement("div");
   scrollSentinel.className = "scroll-sentinel";
@@ -4058,6 +4168,7 @@ window.addEventListener("resize", () => {
 });
 
 const initialAid = getInitialAlbumFromHash();
+void refreshDeepseekKeyStatus();
 if (initialAid) {
   // 新窗口模式:隐藏 sidebar、跳过列表加载,直接进 reader
   shell.classList.add("standalone-album");

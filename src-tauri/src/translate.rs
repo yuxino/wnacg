@@ -6,6 +6,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 const API_URL: &str = "https://api.deepseek.com/chat/completions";
+const KEYCHAIN_SERVICE: &str = "com.yuxino.wnacg.translation";
+const KEYCHAIN_ACCOUNT: &str = "deepseek-api-key";
 const CHUNK_SIZE: usize = 30;
 const CACHE_VERSION: u32 = 1;
 const CACHE_FILE_NAME: &str = "translation-cache-v1.json";
@@ -337,10 +339,60 @@ fn store_cache_updates(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn keychain_api_key() -> Result<Option<String>, String> {
+    use security_framework::os::macos::keychain::SecKeychain;
+
+    let keychain =
+        SecKeychain::default().map_err(|error| format!("无法打开 macOS 默认钥匙串：{error}"))?;
+    match keychain.find_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+        Ok((password, _)) => {
+            let key = std::str::from_utf8(password.as_ref())
+                .map_err(|_| "钥匙串中的 DeepSeek 密钥格式无效".to_string())?
+                .trim()
+                .to_string();
+            Ok((!key.is_empty()).then_some(key))
+        }
+        Err(error) if error.code() == -25300 => Ok(None),
+        Err(error) => Err(format!("无法读取 macOS 钥匙串：{error}")),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_api_key() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn save_api_key_to_keychain(key: &str) -> Result<(), String> {
+    use security_framework::os::macos::keychain::SecKeychain;
+
+    SecKeychain::default()
+        .and_then(|keychain| {
+            keychain.set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key.as_bytes())
+        })
+        .map_err(|error| format!("无法保存到 macOS 钥匙串：{error}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn save_api_key_to_keychain(_key: &str) -> Result<(), String> {
+    Err("当前系统暂不支持安全保存 DeepSeek 密钥".to_string())
+}
+
+fn migrate_legacy_key(key: &str) -> String {
+    if let Err(error) = save_api_key_to_keychain(key) {
+        eprintln!("DeepSeek 密钥迁移失败：{error}");
+    }
+    key.to_string()
+}
+
 fn api_key() -> Result<String, String> {
+    if let Some(key) = keychain_api_key()? {
+        return Ok(key);
+    }
     if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
         if !key.trim().is_empty() {
-            return Ok(key.trim().to_string());
+            return Ok(migrate_legacy_key(key.trim()));
         }
     }
     let path = config_dir().join("config.json");
@@ -348,12 +400,22 @@ fn api_key() -> Result<String, String> {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(key) = value.get("deepseekApiKey").and_then(|v| v.as_str()) {
                 if !key.trim().is_empty() {
-                    return Ok(key.trim().to_string());
+                    return Ok(migrate_legacy_key(key.trim()));
                 }
             }
         }
     }
-    Err("未找到 DeepSeek API 密钥，请在 ~/Library/Application Support/wnacg/config.json 中配置 deepseekApiKey".to_string())
+    Err("未找到 DeepSeek API 密钥，请在阅读设置中保存密钥".to_string())
+}
+
+/// 将 DeepSeek 密钥保存到操作系统的安全凭据存储中。
+#[tauri::command]
+pub fn set_deepseek_api_key(api_key: String) -> Result<(), String> {
+    let key = api_key.trim();
+    if key.is_empty() {
+        return Err("DeepSeek API 密钥不能为空".to_string());
+    }
+    save_api_key_to_keychain(key)
 }
 
 #[derive(Debug, Deserialize)]

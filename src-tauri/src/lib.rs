@@ -1366,6 +1366,7 @@ pub fn run() {
             ocr::ocr_engine_status,
             translate::translate_dialogue,
             translate::translate_engine_status,
+            translate::set_deepseek_api_key,
             translate::translate_titles
         ])
         .setup(|app| {
