@@ -24,7 +24,9 @@ static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(||
     );
     headers.insert(
         reqwest::header::ACCEPT,
-        reqwest::header::HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
+        reqwest::header::HeaderValue::from_static(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        ),
     );
     headers.insert(
         reqwest::header::ACCEPT_LANGUAGE,
@@ -247,7 +249,10 @@ fn cleaned_text(value: &str) -> String {
 }
 
 fn parse_albums(html: &str, base_url: &str) -> Result<Vec<Album>, String> {
-    if html.contains("cf_chl") || html.contains("Just a moment") || html.contains("challenge-platform") {
+    if html.contains("cf_chl")
+        || html.contains("Just a moment")
+        || html.contains("challenge-platform")
+    {
         return Err("被 Cloudflare 校验拦截，当前抓取 API 暂时拿不到页面内容".to_string());
     }
 
@@ -296,7 +301,11 @@ fn parse_albums(html: &str, base_url: &str) -> Result<Vec<Album>, String> {
 
         let title = [
             cleaned_text(&link.text().collect::<Vec<_>>().join(" ")),
-            link.value().attr("title").unwrap_or_default().trim().to_string(),
+            link.value()
+                .attr("title")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
             img_title.unwrap_or_default(),
         ]
         .into_iter()
@@ -323,13 +332,16 @@ fn parse_albums(html: &str, base_url: &str) -> Result<Vec<Album>, String> {
 }
 
 fn parse_album_photos(html: &str, base_url: &str) -> Result<Vec<PhotoEntry>, String> {
-    if html.contains("cf_chl") || html.contains("Just a moment") || html.contains("challenge-platform") {
+    if html.contains("cf_chl")
+        || html.contains("Just a moment")
+        || html.contains("challenge-platform")
+    {
         return Err("被 Cloudflare 校验拦截，当前抓取 API 暂时拿不到页面内容".to_string());
     }
 
     let document = Html::parse_document(html);
-    let link_selector = Selector::parse("a[href*='photos-view']")
-        .map_err(|err| format!("选择器错误：{err}"))?;
+    let link_selector =
+        Selector::parse("a[href*='photos-view']").map_err(|err| format!("选择器错误：{err}"))?;
     let img_selector = Selector::parse("img").map_err(|err| format!("选择器错误：{err}"))?;
 
     let mut photos = Vec::new();
@@ -347,7 +359,12 @@ fn parse_album_photos(html: &str, base_url: &str) -> Result<Vec<PhotoEntry>, Str
 
         let title = cleaned_text(&link_ref.text().collect::<Vec<_>>().join(" "));
         let title = if title.is_empty() {
-            link_ref.value().attr("title").unwrap_or_default().trim().to_string()
+            link_ref
+                .value()
+                .attr("title")
+                .unwrap_or_default()
+                .trim()
+                .to_string()
         } else {
             title
         };
@@ -407,7 +424,8 @@ fn parse_album_photos(html: &str, base_url: &str) -> Result<Vec<PhotoEntry>, Str
 fn parse_album_max_page(html: &str) -> usize {
     let Some(re) = regex_lite::Regex::new(
         r#"(?:photos-index-page-|[?&]page=|[?&]p=)(\d+)(?:-aid-\d+\.html|[&#"'])?"#,
-    ).ok() else {
+    )
+    .ok() else {
         return 1;
     };
 
@@ -418,7 +436,10 @@ fn parse_album_max_page(html: &str) -> usize {
 }
 
 fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
-    if html.contains("cf_chl") || html.contains("Just a moment") || html.contains("challenge-platform") {
+    if html.contains("cf_chl")
+        || html.contains("Just a moment")
+        || html.contains("challenge-platform")
+    {
         return Err("被 Cloudflare 校验拦截".to_string());
     }
 
@@ -426,20 +447,35 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
 
     fn looks_like_ad(src: &str) -> bool {
         let s = src.to_lowercase();
-        s.contains("ad.") || s.contains("/ad/") || s.contains("banner") || s.contains("promo")
-            || s.contains("sponsor") || s.contains("logo") || s.contains("icon")
-            || s.contains("avatar") || s.contains("qr_code") || s.contains("weixin")
+        s.contains("ad.")
+            || s.contains("/ad/")
+            || s.contains("banner")
+            || s.contains("promo")
+            || s.contains("sponsor")
+            || s.contains("logo")
+            || s.contains("icon")
+            || s.contains("avatar")
+            || s.contains("qr_code")
+            || s.contains("weixin")
     }
 
     fn looks_like_photo(src: &str) -> bool {
         let s = src.to_lowercase();
-        s.contains(".jpg") || s.contains(".jpeg") || s.contains(".png")
-            || s.contains(".webp") || s.contains(".gif") || s.contains("/photos/")
-            || s.contains("/upload/") || s.contains("/images/") || s.contains("/img/")
+        s.contains(".jpg")
+            || s.contains(".jpeg")
+            || s.contains(".png")
+            || s.contains(".webp")
+            || s.contains(".gif")
+            || s.contains("/photos/")
+            || s.contains("/upload/")
+            || s.contains("/images/")
+            || s.contains("/img/")
     }
 
     fn attr_src<'a>(el: &'a scraper::ElementRef<'a>, attr: &str) -> Option<&'a str> {
-        el.value().attr(attr).filter(|s| !s.is_empty() && !s.starts_with("data:"))
+        el.value()
+            .attr(attr)
+            .filter(|s| !s.is_empty() && !s.starts_with("data:"))
     }
 
     // 1) meta og:image
@@ -447,7 +483,9 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
         if let Some(el) = document.select(&sel).next() {
             if let Some(src) = attr_src(&el, "content") {
                 if !looks_like_ad(src) {
-                    return Ok(PhotoImage { url: normalize_url(base_url, src) });
+                    return Ok(PhotoImage {
+                        url: normalize_url(base_url, src),
+                    });
                 }
             }
         }
@@ -458,7 +496,9 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
         if let Some(el) = document.select(&sel).next() {
             if let Some(src) = attr_src(&el, "href") {
                 if !looks_like_ad(src) {
-                    return Ok(PhotoImage { url: normalize_url(base_url, src) });
+                    return Ok(PhotoImage {
+                        url: normalize_url(base_url, src),
+                    });
                 }
             }
         }
@@ -484,7 +524,9 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
     ];
 
     for sel_str in targeted {
-        let Ok(sel) = Selector::parse(sel_str) else { continue };
+        let Ok(sel) = Selector::parse(sel_str) else {
+            continue;
+        };
         for img in document.select(&sel) {
             // try data-original first (often used for lazy-load)
             let src = attr_src(&img, "data-original")
@@ -492,8 +534,12 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
                 .or_else(|| attr_src(&img, "data-url"))
                 .or_else(|| attr_src(&img, "src"));
             let Some(src) = src else { continue };
-            if looks_like_ad(src) { continue; }
-            return Ok(PhotoImage { url: normalize_url(base_url, src) });
+            if looks_like_ad(src) {
+                continue;
+            }
+            return Ok(PhotoImage {
+                url: normalize_url(base_url, src),
+            });
         }
     }
 
@@ -508,7 +554,9 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
                 if let Some(m) = cap.get(1) {
                     let url = m.as_str();
                     if looks_like_photo(url) && !looks_like_ad(url) {
-                        return Ok(PhotoImage { url: normalize_url(base_url, url) });
+                        return Ok(PhotoImage {
+                            url: normalize_url(base_url, url),
+                        });
                     }
                 }
             }
@@ -517,12 +565,17 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
 
     // 5) regex search raw HTML for image URLs (catches JS vars, JSON, etc.)
     {
-        let re = regex_lite::Regex::new(r#"(?:https?:)?//[^"'\s<>\[\]{}()]+\.(?:jpg|jpeg|png|webp|gif)[^"'\s<>\[\]{}()]*"#).ok();
+        let re = regex_lite::Regex::new(
+            r#"(?:https?:)?//[^"'\s<>\[\]{}()]+\.(?:jpg|jpeg|png|webp|gif)[^"'\s<>\[\]{}()]*"#,
+        )
+        .ok();
         if let Some(re) = &re {
             for cap in re.captures_iter(html) {
                 let url = cap.get(0).unwrap().as_str();
                 if !looks_like_ad(url) && looks_like_photo(url) {
-                    return Ok(PhotoImage { url: normalize_url(base_url, url) });
+                    return Ok(PhotoImage {
+                        url: normalize_url(base_url, url),
+                    });
                 }
             }
         }
@@ -539,19 +592,28 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
             .or_else(|| attr_src(&img, "data-url"))
             .or_else(|| attr_src(&img, "src"));
         let Some(src) = src else { continue };
-        if looks_like_ad(src) { continue; }
+        if looks_like_ad(src) {
+            continue;
+        }
 
         let is_in_bad_area = img.ancestors().any(|el| {
-            el.value().as_element().map_or(false, |e| {
+            el.value().as_element().is_some_and(|e| {
                 let id = e.id().unwrap_or_default().to_lowercase();
                 let classes = e.classes().collect::<Vec<_>>().join(" ").to_lowercase();
-                id.contains("ad") || id.contains("banner") || classes.contains("ad")
-                    || classes.contains("banner") || id.contains("sidebar")
-                    || classes.contains("sidebar") || id.contains("footer")
-                    || classes.contains("footer") || id.contains("header")
+                id.contains("ad")
+                    || id.contains("banner")
+                    || classes.contains("ad")
+                    || classes.contains("banner")
+                    || id.contains("sidebar")
+                    || classes.contains("sidebar")
+                    || id.contains("footer")
+                    || classes.contains("footer")
+                    || id.contains("header")
             })
         });
-        if is_in_bad_area { continue; }
+        if is_in_bad_area {
+            continue;
+        }
 
         if looks_like_photo(src) {
             photo_candidates.push(src.to_string());
@@ -560,8 +622,14 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
         }
     }
 
-    for src in photo_candidates.iter().chain(other_candidates.iter()) {
-        return Ok(PhotoImage { url: normalize_url(base_url, src) });
+    if let Some(src) = photo_candidates
+        .iter()
+        .chain(other_candidates.iter())
+        .next()
+    {
+        return Ok(PhotoImage {
+            url: normalize_url(base_url, src),
+        });
     }
 
     Err("无法解析图片地址，页面结构可能变化或图片由脚本延迟加载".to_string())
@@ -569,40 +637,41 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
 
 async fn fetch_page(url: String, referer: Option<&str>) -> Result<String, String> {
     let referer = referer.unwrap_or("https://wnacg.com/");
-    let response = match client()?
-        .get(&url)
-        .header("referer", referer)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(err) => {
-            return fetch_page_via_curl(url, referer.to_string())
-                .await
-                .map_err(|fallback_err| format!("请求失败：{err}\n备用通道也失败：{fallback_err}"));
-        }
-    };
+    let response =
+        match client()?.get(&url).header("referer", referer).send().await {
+            Ok(r) => r,
+            Err(err) => {
+                return fetch_page_via_curl(url, referer.to_string()).await.map_err(
+                    |fallback_err| format!("请求失败：{err}\n备用通道也失败：{fallback_err}"),
+                );
+            }
+        };
 
     let status = response.status();
     if !response.status().is_success() {
         return fetch_page_via_curl(url, referer.to_string())
             .await
-            .map_err(|fallback_err| format!("服务返回 HTTP {status}\n备用通道也失败：{fallback_err}"));
+            .map_err(|fallback_err| {
+                format!("服务返回 HTTP {status}\n备用通道也失败：{fallback_err}")
+            });
     }
 
-    let body = match response.text().await {
-        Ok(b) => b,
-        Err(err) => {
-            return fetch_page_via_curl(url, referer.to_string())
-                .await
-                .map_err(|fallback_err| format!("读取响应失败：{err}\n备用通道也失败：{fallback_err}"));
-        }
-    };
+    let body =
+        match response.text().await {
+            Ok(b) => b,
+            Err(err) => {
+                return fetch_page_via_curl(url, referer.to_string()).await.map_err(
+                    |fallback_err| format!("读取响应失败：{err}\n备用通道也失败：{fallback_err}"),
+                );
+            }
+        };
 
     if body.is_empty() || looks_like_cloudflare_challenge(&body) {
         return fetch_page_via_curl(url, referer.to_string())
             .await
-            .map_err(|fallback_err| format!("站点返回空内容或被 CF 拦截\n备用通道也失败：{fallback_err}"));
+            .map_err(|fallback_err| {
+                format!("站点返回空内容或被 CF 拦截\n备用通道也失败：{fallback_err}")
+            });
     }
 
     Ok(body)
@@ -664,10 +733,16 @@ async fn fetch_page_via_curl(url: String, referer: String) -> Result<String, Str
 async fn fetch_binary(url: String, referer: Option<String>) -> Result<(String, Vec<u8>), String> {
     let mut request = client()?
         .get(&url)
-        .header("accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+        .header(
+            "accept",
+            "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        )
         .header("accept-language", "zh-CN,zh;q=0.9")
         .header("priority", "u=1, i")
-        .header("sec-ch-ua", r#""Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147""#)
+        .header(
+            "sec-ch-ua",
+            r#""Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147""#,
+        )
         .header("sec-ch-ua-mobile", "?0")
         .header("sec-ch-ua-platform", "macOS")
         .header("sec-fetch-dest", "image")
@@ -722,10 +797,16 @@ async fn fetch_binary_with_progress(
 ) -> Result<(String, Vec<u8>), String> {
     let mut request = client()?
         .get(&url)
-        .header("accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+        .header(
+            "accept",
+            "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        )
         .header("accept-language", "zh-CN,zh;q=0.9")
         .header("priority", "u=1, i")
-        .header("sec-ch-ua", r#""Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147""#)
+        .header(
+            "sec-ch-ua",
+            r#""Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147""#,
+        )
         .header("sec-ch-ua-mobile", "?0")
         .header("sec-ch-ua-platform", "macOS")
         .header("sec-fetch-dest", "image")
@@ -819,7 +900,10 @@ async fn fetch_albums(path: String, _app: tauri::AppHandle) -> Result<Vec<Album>
     for base_url in BASE_URLS {
         let url = build_url(base_url, &path)?;
 
-        match fetch_page(url, None).await.and_then(|html| parse_albums(&html, base_url)) {
+        match fetch_page(url, None)
+            .await
+            .and_then(|html| parse_albums(&html, base_url))
+        {
             Ok(albums) => return Ok(albums),
             Err(error) => errors.push(format!("{base_url}: {error}")),
         }
@@ -829,7 +913,11 @@ async fn fetch_albums(path: String, _app: tauri::AppHandle) -> Result<Vec<Album>
 }
 
 #[tauri::command]
-async fn search_albums(query: String, page: u32, app: tauri::AppHandle) -> Result<Vec<Album>, String> {
+async fn search_albums(
+    query: String,
+    page: u32,
+    app: tauri::AppHandle,
+) -> Result<Vec<Album>, String> {
     let page = page.max(1);
     let encoded_query = urlencoding::encode(query.trim());
     let path = format!("/search/index.php?q={encoded_query}&m=&f=_all&s=create_time_DESC&p={page}");
@@ -840,12 +928,20 @@ fn parse_album_tags(html: &str, base_url: &str) -> Vec<Tag> {
     let document = Html::parse_document(html);
     let tag_sel = Selector::parse("a.tagshow").ok();
     let Some(sel) = tag_sel else { return vec![] };
-    document.select(&sel).filter_map(|el| {
-        let href = el.value().attr("href")?;
-        let name = el.text().collect::<String>().trim().to_string();
-        if name.is_empty() || href.is_empty() { return None; }
-        Some(Tag { name, path: normalize_url(base_url, href) })
-    }).collect()
+    document
+        .select(&sel)
+        .filter_map(|el| {
+            let href = el.value().attr("href")?;
+            let name = el.text().collect::<String>().trim().to_string();
+            if name.is_empty() || href.is_empty() {
+                return None;
+            }
+            Some(Tag {
+                name,
+                path: normalize_url(base_url, href),
+            })
+        })
+        .collect()
 }
 
 fn parse_album_title(html: &str) -> Option<String> {
@@ -869,7 +965,7 @@ fn parse_album_title(html: &str) -> Option<String> {
                 return None;
             }
             let trimmed = raw
-                .split(|c| c == '|' || c == '-' || c == '_')
+                .split(['|', '-', '_'])
                 .next()
                 .unwrap_or(&raw)
                 .trim()
@@ -923,7 +1019,11 @@ async fn fetch_album_photos(aid: String, _app: tauri::AppHandle) -> Result<Album
                 let title = parse_album_title(&first_html);
                 let mut seen = HashSet::new();
                 photos.retain(|photo| seen.insert(photo.id.clone()));
-                return Ok(AlbumDetail { photos, tags, title });
+                return Ok(AlbumDetail {
+                    photos,
+                    tags,
+                    title,
+                });
             }
             Err(error) => errors.push(format!("{base_url}: {error}")),
         }
@@ -941,14 +1041,21 @@ async fn search_tag(tag: String, app: tauri::AppHandle) -> Result<Vec<Album>, St
 }
 
 #[tauri::command]
-async fn fetch_photo_image(page_url: String, album_url: Option<String>, _app: tauri::AppHandle) -> Result<PhotoImage, String> {
+async fn fetch_photo_image(
+    page_url: String,
+    album_url: Option<String>,
+    _app: tauri::AppHandle,
+) -> Result<PhotoImage, String> {
     let mut errors = Vec::new();
 
     for base_url in BASE_URLS {
         let url = build_url(base_url, &page_url)?;
         let referer = album_url.as_deref().or(Some(base_url));
 
-        match fetch_page(url, referer).await.and_then(|html| parse_photo_image(&html, base_url)) {
+        match fetch_page(url, referer)
+            .await
+            .and_then(|html| parse_photo_image(&html, base_url))
+        {
             Ok(photo) => return Ok(photo),
             Err(error) => errors.push(format!("{base_url}: {error}")),
         }
@@ -1015,7 +1122,8 @@ async fn fetch_image_data_url_progress(
         return Err("不允许加载非 WNACG 图片域名".to_string());
     }
 
-    let (content_type, bytes) = fetch_binary_with_progress(app, request_id, url.clone(), referer).await?;
+    let (content_type, bytes) =
+        fetch_binary_with_progress(app, request_id, url.clone(), referer).await?;
     ocr::cache_image_bytes(&url, bytes.clone());
     let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
@@ -1215,7 +1323,8 @@ pub fn run() {
                         hide_main_window(app);
                     }
                     "quit" => {
-                        app.state::<Arc<AtomicBool>>().store(true, Ordering::Relaxed);
+                        app.state::<Arc<AtomicBool>>()
+                            .store(true, Ordering::Relaxed);
                         app.exit(0);
                     }
                     _ => {}
@@ -1227,7 +1336,7 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        toggle_main_window(&tray.app_handle());
+                        toggle_main_window(tray.app_handle());
                     }
                 })
                 .build(app)?;

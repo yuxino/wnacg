@@ -135,7 +135,9 @@ impl ImageByteCache {
             self.order.retain(|key| key != &url);
         }
         while self.bytes + bytes.len() > IMAGE_CACHE_MAX_BYTES {
-            let Some(oldest) = self.order.pop_front() else { break };
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
             if let Some(removed) = self.entries.remove(&oldest) {
                 self.bytes = self.bytes.saturating_sub(removed.len());
             }
@@ -206,11 +208,7 @@ fn vision_helper_dir() -> PathBuf {
 }
 
 fn manga_helper_dir() -> PathBuf {
-    let hash = hash_sources(&[
-        MANGA_HELPER_VERSION,
-        MANGA_CARGO_TOML,
-        MANGA_HELPER_SOURCE,
-    ]);
+    let hash = hash_sources(&[MANGA_HELPER_VERSION, MANGA_CARGO_TOML, MANGA_HELPER_SOURCE]);
     std::env::temp_dir().join(format!("wnacg-ocr-manga-{hash:016x}"))
 }
 
@@ -299,12 +297,9 @@ fn ensure_manga_helper() -> Result<PathBuf, String> {
     let _guard = COMPILING.lock().map_err(|_| "OCR 初始化冲突".to_string())?;
 
     let dir = manga_helper_dir();
-    std::fs::create_dir_all(&dir.join("src"))
+    std::fs::create_dir_all(dir.join("src"))
         .map_err(|err| format!("无法创建 OCR 缓存目录：{err}"))?;
-    let bin = dir
-        .join("target")
-        .join("release")
-        .join("manga_ocr_helper");
+    let bin = dir.join("target").join("release").join("manga_ocr_helper");
     if bin.exists() {
         return Ok(bin);
     }
@@ -667,7 +662,8 @@ mod tests {
     #[test]
     fn manga_engine_detects_vertical_japanese() {
         let path = std::env::var("WNACG_OCR_TEST_IMAGE").unwrap_or_else(|_| {
-            "/Users/gavin/Documents/Codex/2026-08-07/wn/work/ocr-test/test_vertical3.png".to_string()
+            "/Users/gavin/Documents/Codex/2026-08-07/wn/work/ocr-test/test_vertical3.png"
+                .to_string()
         });
         let bytes = std::fs::read(&path).expect("测试图片不存在");
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -682,12 +678,12 @@ mod tests {
         let outputs = ocr_pages_sync(pages).expect("OCR 任务应成功");
         assert_eq!(outputs.len(), 1);
         let output = &outputs[0];
+        assert!(output.error.is_none(), "OCR 报错: {:?}", output.error);
         assert!(
-            output.error.is_none(),
-            "OCR 报错: {:?}",
-            output.error
+            output.regions.len() >= 2,
+            "检测到的区域太少: {:?}",
+            output.regions
         );
-        assert!(output.regions.len() >= 2, "检测到的区域太少: {:?}", output.regions);
         let texts: Vec<&str> = output.regions.iter().map(|r| r.text.as_str()).collect();
         eprintln!("识别文本: {texts:?}");
         assert!(

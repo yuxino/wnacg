@@ -8,20 +8,10 @@
 
 > 18+. Source code only. No third-party content or installers are included.
 
-## Screenshots
-
-![Library](docs/images/wnacg-library-masked.jpg)
-
-![Reader](docs/images/wnacg-reader-masked.jpg)
-
-![Before translation](docs/images/wnacg-translate-before.jpg)
-
-![After translation](docs/images/wnacg-translate-after.jpg)
-
 ## Features
 
 - Category, keyword, and tag search, with covers blurred by default
-- Continuous reading, fullscreen, zoom, multiple windows, and saved reading position
+- Continuous, single-page, and two-page reading with page controls, fullscreen, zoom, and multiple windows
 - Local OCR with Apple Vision, `comic-text-detector`, and `manga-ocr`
 - DeepSeek manga translation with vertical Japanese layout, bubble typesetting, and pre-translation
 

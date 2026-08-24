@@ -58,6 +58,8 @@ type PreloadResult = "loaded" | "failed" | "cached";
 
 type GestureEventLike = Event & {
   scale?: number;
+  clientX?: number;
+  clientY?: number;
 };
 
 type Category = {
@@ -81,14 +83,13 @@ type PersistentListEntry = {
 
 type ReaderWidth = "comfort" | "wide" | "edge";
 type ReaderGap = "relaxed" | "compact";
-type ReaderTheme = "warm" | "dark";
-type ReaderFit = "width" | "page";
+type ReaderFit = "width" | "page" | "spread";
 type ReaderOcrLang = "zh" | "ja";
 
 type ReaderPrefs = {
   width: ReaderWidth;
+  zoom: number;
   gap: ReaderGap;
-  theme: ReaderTheme;
   fit: ReaderFit;
   conserveImages: boolean;
   ocrBoxes: boolean;
@@ -99,6 +100,14 @@ type ReaderPrefs = {
 const readerPrefKey = "wnacg.readerPrefs.v1";
 const persistentListCacheKey = "wnacg.listCache.v1";
 const persistentListMaxAge = 24 * 60 * 60 * 1000;
+const READER_ZOOM_MIN = 0.5;
+const READER_ZOOM_MAX = 2.5;
+const READER_ZOOM_STEP = 0.1;
+
+function normalizeReaderZoom(value: number) {
+  if (!Number.isFinite(value)) return 1;
+  return Math.max(READER_ZOOM_MIN, Math.min(READER_ZOOM_MAX, value));
+}
 
 function readPersistentList(contextKey: string, page: number): Album[] | null {
   try {
@@ -131,8 +140,8 @@ function writePersistentList(contextKey: string, page: number, albums: Album[]) 
 
 const defaultReaderPrefs: ReaderPrefs = {
   width: "comfort",
+  zoom: 1,
   gap: "relaxed",
-  theme: "dark",
   fit: "width",
   conserveImages: true,
   ocrBoxes: false,
@@ -145,23 +154,23 @@ function loadReaderPrefs(): ReaderPrefs {
     const raw = localStorage.getItem(readerPrefKey);
     if (!raw) return { ...defaultReaderPrefs };
     const parsed = JSON.parse(raw) as Partial<ReaderPrefs>;
+    const ocrBoxes = typeof parsed.ocrBoxes === "boolean"
+      ? parsed.ocrBoxes
+      : defaultReaderPrefs.ocrBoxes;
+    const ocrLang = parsed.ocrLang === "zh" || parsed.ocrLang === "ja"
+      ? parsed.ocrLang
+      : defaultReaderPrefs.ocrLang;
     return {
       width: parsed.width === "wide" || parsed.width === "edge" ? parsed.width : defaultReaderPrefs.width,
+      zoom: typeof parsed.zoom === "number" ? normalizeReaderZoom(parsed.zoom) : defaultReaderPrefs.zoom,
       gap: parsed.gap === "compact" ? "compact" : defaultReaderPrefs.gap,
-      theme: parsed.theme === "warm" ? "warm" : defaultReaderPrefs.theme,
       conserveImages: typeof parsed.conserveImages === "boolean"
         ? parsed.conserveImages
         : defaultReaderPrefs.conserveImages,
-      ocrBoxes: typeof parsed.ocrBoxes === "boolean"
-        ? parsed.ocrBoxes
-        : defaultReaderPrefs.ocrBoxes,
-      ocrLang: parsed.ocrLang === "zh" || parsed.ocrLang === "ja"
-        ? parsed.ocrLang
-        : defaultReaderPrefs.ocrLang,
-      translateMode: typeof parsed.translateMode === "boolean"
-        ? parsed.translateMode
-        : defaultReaderPrefs.translateMode,
-      fit: parsed.fit === "page" ? "page" : defaultReaderPrefs.fit,
+      ocrBoxes,
+      ocrLang,
+      translateMode: parsed.translateMode === true && ocrBoxes && ocrLang === "ja",
+      fit: parsed.fit === "page" || parsed.fit === "spread" ? parsed.fit : defaultReaderPrefs.fit,
     };
   } catch {
     return { ...defaultReaderPrefs };
@@ -196,28 +205,15 @@ const state = {
   currentAlbum: null as { aid: string; title: string } | null,
   photos: [] as PhotoEntry[],
   tags: [] as Tag[],
-  lightboxIndex: -1,
-  lightboxImageUrl: null as string | null,
   preloadedUrls: {} as Record<number, string>, // index -> full image URL
   listToken: 0,
   readerToken: 0,
-  lightboxToken: 0,
-  lightboxZoom: 1,
-  lightboxPanX: 0,
-  lightboxPanY: 0,
-  lightboxPanning: false,
-  lightboxPanStartX: 0,
-  lightboxPanStartY: 0,
-  lightboxPanBaseX: 0,
-  lightboxPanBaseY: 0,
-  gestureStartZoom: 1,
   preloadFailures: {} as Record<number, number>,
-  retryNotice: "",
-  lightboxProgress: null as ProgressState | null,
   fullscreen: false,
   readerWidth: readerPrefs.width,
+  readerZoom: readerPrefs.zoom,
+  readerGestureStartZoom: readerPrefs.zoom,
   readerGap: readerPrefs.gap,
-  readerTheme: readerPrefs.theme,
   readerFit: readerPrefs.fit,
   conserveImages: readerPrefs.conserveImages,
   ocrEnabled: readerPrefs.ocrBoxes,
@@ -231,8 +227,7 @@ const state = {
 };
 
 // Every consumer shares the same full-image request for a page. This avoids the
-// reader, lightbox and translation prefetch downloading the same image in
-// parallel.
+// reader and translation prefetch downloading the same image in parallel.
 const preloadInFlight = new Map<number, Promise<PreloadResult>>();
 const ocrByteCacheUrls = new Set<string>();
 
@@ -273,7 +268,6 @@ const ICON_PATHS: Record<string, string> = {
   search: 'M11 11a7 7 0 1 0 7-7 7 7 0 0 0-7 7z M21 21l-4.35-4.35',
   plus: 'M12 5v14 M5 12h14',
   minus: 'M5 12h14',
-  resetZoom: 'M3 3h6v6 M21 21h-6v-6 M21 3l-7 7 M3 21l7-7',
 };
 
 function icon(name: keyof typeof ICON_PATHS, size = 16): SVGElement {
@@ -328,8 +322,8 @@ translateStatus.id = "translate-status";
 translateStatus.className = "translate-status";
 translateStatus.hidden = true;
 translateStatus.addEventListener("click", () => {
-  const index = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
-  if (state.translateFailed[index]) {
+  const index = visibleReaderIndices().find((visibleIndex) => state.translateFailed[visibleIndex]);
+  if (index !== undefined) {
     delete state.translateFailed[index];
     translateDone.delete(index);
     queueOcrText(index);
@@ -338,6 +332,67 @@ translateStatus.addEventListener("click", () => {
   }
 });
 pagerControls.append(translateStatus);
+
+const readerPageControls = document.createElement("div");
+readerPageControls.className = "reader-page-controls";
+readerPageControls.hidden = true;
+readerPageControls.setAttribute("role", "group");
+readerPageControls.setAttribute("aria-label", "阅读翻页");
+
+const readerPagePrevButton = document.createElement("button");
+readerPagePrevButton.type = "button";
+readerPagePrevButton.title = "上一页 (←)";
+readerPagePrevButton.setAttribute("aria-label", "上一页");
+readerPagePrevButton.append(icon("chevronLeft", 15));
+readerPagePrevButton.addEventListener("click", () => turnReaderPage(-1));
+
+const readerPageLabel = document.createElement("span");
+readerPageLabel.className = "reader-page-label";
+readerPageLabel.textContent = "1 / 1";
+readerPageLabel.setAttribute("aria-live", "polite");
+
+const readerPageNextButton = document.createElement("button");
+readerPageNextButton.type = "button";
+readerPageNextButton.title = "下一页 (→)";
+readerPageNextButton.setAttribute("aria-label", "下一页");
+readerPageNextButton.append(icon("chevronRight", 15));
+readerPageNextButton.addEventListener("click", () => turnReaderPage(1));
+
+readerPageControls.append(readerPagePrevButton, readerPageLabel, readerPageNextButton);
+pagerControls.append(readerPageControls);
+
+const readerZoomControls = document.createElement("div");
+readerZoomControls.className = "reader-zoom-controls";
+readerZoomControls.hidden = true;
+readerZoomControls.setAttribute("role", "group");
+readerZoomControls.setAttribute("aria-label", "阅读缩放");
+
+const readerZoomOutButton = document.createElement("button");
+readerZoomOutButton.type = "button";
+readerZoomOutButton.className = "reader-zoom-step";
+readerZoomOutButton.title = "缩小 (−)";
+readerZoomOutButton.setAttribute("aria-label", "缩小阅读页面");
+readerZoomOutButton.append(icon("minus", 14));
+readerZoomOutButton.addEventListener("click", () => adjustReaderZoom(-READER_ZOOM_STEP));
+
+const readerZoomResetButton = document.createElement("button");
+readerZoomResetButton.type = "button";
+readerZoomResetButton.className = "reader-zoom-value";
+readerZoomResetButton.title = "触摸板双指捏合缩放 · 点击恢复 100%";
+readerZoomResetButton.setAttribute("aria-label", "当前阅读缩放 100%，点击恢复");
+readerZoomResetButton.textContent = "100%";
+readerZoomResetButton.addEventListener("click", () => setReaderZoom(1));
+
+const readerZoomInButton = document.createElement("button");
+readerZoomInButton.type = "button";
+readerZoomInButton.className = "reader-zoom-step";
+readerZoomInButton.title = "放大 (+)";
+readerZoomInButton.setAttribute("aria-label", "放大阅读页面");
+readerZoomInButton.append(icon("plus", 14));
+readerZoomInButton.addEventListener("click", () => adjustReaderZoom(READER_ZOOM_STEP));
+
+readerZoomControls.append(readerZoomOutButton, readerZoomResetButton, readerZoomInButton);
+pagerControls.append(readerZoomControls);
 
 const fullscreenButton = document.createElement("button");
 fullscreenButton.type = "button";
@@ -483,7 +538,7 @@ function buildReaderSettingsPanel() {
           { label: "贴边", value: "edge", hint: "W" },
         ],
         state.readerWidth,
-        (v) => updateReaderPrefs({ width: v }),
+        (v) => updateReaderPrefs({ width: v, zoom: 1 }),
       ),
     },
     {
@@ -498,25 +553,15 @@ function buildReaderSettingsPanel() {
       ),
     },
     {
-      title: "阅读背景",
-      render: () => renderSegmented<ReaderTheme>(
-        [
-          { label: "暗场", value: "dark" },
-          { label: "暖色", value: "warm", hint: "T" },
-        ],
-        state.readerTheme,
-        (v) => updateReaderPrefs({ theme: v }),
-      ),
-    },
-    {
-      title: "整页显示",
+      title: "阅读方式",
       render: () => renderSegmented<ReaderFit>(
         [
-          { label: "关闭", value: "width" },
-          { label: "开启", value: "page", hint: "V" },
+          { label: "连续", value: "width" },
+          { label: "单页", value: "page" },
+          { label: "双页", value: "spread", hint: "V" },
         ],
         state.readerFit,
-        (v) => updateReaderPrefs({ fit: v }),
+        (v) => updateReaderPrefs({ fit: v, zoom: v === "width" ? state.readerZoom : 1 }),
       ),
     },
     {
@@ -675,26 +720,33 @@ function setStatus(message: string) {
   statusLabel.textContent = message;
 }
 
-function saveReaderPrefs() {
-  const prefs: ReaderPrefs = {
+function currentReaderPrefs(): ReaderPrefs {
+  return {
     width: state.readerWidth,
+    zoom: state.readerZoom,
     gap: state.readerGap,
-    theme: state.readerTheme,
     fit: state.readerFit,
     conserveImages: state.conserveImages,
     ocrBoxes: state.ocrEnabled,
     ocrLang: state.ocrLang,
     translateMode: state.translateEnabled,
   };
-  localStorage.setItem(readerPrefKey, JSON.stringify(prefs));
+}
+
+function saveReaderPrefs() {
+  localStorage.setItem(readerPrefKey, JSON.stringify(currentReaderPrefs()));
+}
+
+function broadcastReaderPrefs() {
+  emit("reader-prefs-changed", currentReaderPrefs()).catch(() => {});
 }
 
 function applyReaderPrefs() {
   shell.dataset.readerWidth = state.readerWidth;
   shell.dataset.readerGap = state.readerGap;
-  shell.dataset.readerTheme = state.readerTheme;
   shell.dataset.readerFit = state.readerFit;
   shell.classList.toggle("reader-low-data", state.conserveImages);
+  applyReaderZoomLayout();
 }
 
 function syncReaderControls() {
@@ -703,19 +755,35 @@ function syncReaderControls() {
 }
 
 function updateReaderPrefs(next: Partial<ReaderPrefs>) {
+  const previousWidth = state.readerWidth;
+  const previousZoom = state.readerZoom;
   const previousConserve = state.conserveImages;
   const previousFit = state.readerFit;
   const previousOcr = state.ocrEnabled;
   const previousOcrLang = state.ocrLang;
   const previousTranslate = state.translateEnabled;
-  // 联动：翻译字幕(R)关掉时，OCR 识别管线也跟着关，避免后台空转
+  const currentIndexBeforeLayout = state.view === "reader" ? currentStreamIndex() : -1;
+  // 显式关闭翻译时一并停掉 OCR，避免后台空转。
   if (previousTranslate && next.translateMode === false) {
     next.ocrBoxes = false;
   }
+  // 翻译只能运行在“日文 OCR 已开启”的有效组合中。语言或 OCR 被切走时，
+  // 立即关闭翻译，避免界面显示开启但管线永远不会工作的中间状态。
+  const nextTranslate = next.translateMode ?? previousTranslate;
+  const nextOcr = next.ocrBoxes ?? state.ocrEnabled;
+  const nextOcrLang = next.ocrLang ?? state.ocrLang;
+  if (nextTranslate && (!nextOcr || nextOcrLang !== "ja")) {
+    next.translateMode = false;
+  }
+  const readerAnchor = state.view === "reader"
+    && next.fit === undefined
+    && (next.width !== undefined || next.zoom !== undefined || next.gap !== undefined)
+    ? captureReaderAnchor()
+    : null;
   Object.assign(state, {
     readerWidth: next.width ?? state.readerWidth,
+    readerZoom: next.zoom === undefined ? state.readerZoom : normalizeReaderZoom(next.zoom),
     readerGap: next.gap ?? state.readerGap,
-    readerTheme: next.theme ?? state.readerTheme,
     readerFit: next.fit ?? state.readerFit,
     conserveImages: next.conserveImages ?? state.conserveImages,
     ocrEnabled: next.ocrBoxes ?? state.ocrEnabled,
@@ -725,26 +793,26 @@ function updateReaderPrefs(next: Partial<ReaderPrefs>) {
   saveReaderPrefs();
   applyReaderPrefs();
   syncReaderControls();
-  // 广播给其它窗口同步主题
-  emit("reader-prefs-changed", {
-    width: state.readerWidth,
-    gap: state.readerGap,
-    theme: state.readerTheme,
-    fit: state.readerFit,
-    conserveImages: state.conserveImages,
-    ocrBoxes: state.ocrEnabled,
-    ocrLang: state.ocrLang,
-    translateMode: state.translateEnabled,
-  }).catch(() => {});
+  syncReaderPageControls();
+  if (previousFit === state.readerFit) restoreReaderAnchor(readerAnchor);
+  // 广播给其它窗口同步阅读布局
+  broadcastReaderPrefs();
 
   if (state.view === "reader" && previousFit !== state.readerFit) {
-    redrawReaderOverlays();
+    window.requestAnimationFrame(() => {
+      scrollToStreamIndex(Math.max(0, currentIndexBeforeLayout), "auto");
+      setupStreamObserver();
+      updateReaderProgress();
+      redrawReaderOverlays();
+    });
+  } else if (
+    state.view === "reader"
+    && (previousWidth !== state.readerWidth || previousZoom !== state.readerZoom)
+  ) {
+    window.requestAnimationFrame(redrawReaderOverlays);
   }
   if (state.view === "reader" && previousConserve !== state.conserveImages) {
     setupStreamObserver();
-  }
-  if (!state.conserveImages && state.lightboxIndex >= 0) {
-    preloadNeighbors(state.lightboxIndex);
   }
   if (previousOcr !== state.ocrEnabled) {
     ocrEnableToken++; // OCR 开关变了,作废还在初始化中的“开启”请求
@@ -780,16 +848,15 @@ function updateReaderPrefs(next: Partial<ReaderPrefs>) {
         void toggleReaderOcr(true);
       }
       removeAllOcrOverlays(); // 翻译开启时隐藏红框,只看译文
-      queueTranslate(state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex());
+      queueTranslate(currentStreamIndex());
       updateTranslateBadges();
     } else {
       removeAllTranslateOverlays();
       translatePending.clear();
       updateTranslateBadges();
       if (state.ocrEnabled) {
-        const index = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+        const index = currentStreamIndex();
         renderStreamOcrOverlay(index);
-        renderLightboxOcrOverlay();
       }
     }
   }
@@ -798,23 +865,164 @@ function updateReaderPrefs(next: Partial<ReaderPrefs>) {
 function cycleReaderWidth() {
   const order: ReaderWidth[] = ["comfort", "wide", "edge"];
   const next = order[(order.indexOf(state.readerWidth) + 1) % order.length];
-  updateReaderPrefs({ width: next });
+  updateReaderPrefs({ width: next, zoom: 1 });
 }
 
 function toggleReaderGap() {
   updateReaderPrefs({ gap: state.readerGap === "relaxed" ? "compact" : "relaxed" });
 }
 
-function toggleReaderTheme() {
-  updateReaderPrefs({ theme: state.readerTheme === "dark" ? "warm" : "dark" });
-}
-
 function toggleReaderFit() {
-  updateReaderPrefs({ fit: state.readerFit === "page" ? "width" : "page" });
+  const order: ReaderFit[] = ["width", "page", "spread"];
+  const next = order[(order.indexOf(state.readerFit) + 1) % order.length];
+  updateReaderPrefs({ fit: next, zoom: next === "width" ? state.readerZoom : 1 });
 }
 
 function toggleReaderPreload() {
   updateReaderPrefs({ conserveImages: !state.conserveImages });
+}
+
+type ReaderAnchor = {
+  index: number;
+  ratioX: number;
+  ratioY: number;
+  clientX: number;
+  clientY: number;
+};
+
+let readerAnchorFrame = 0;
+let readerPendingAnchor: ReaderAnchor | null = null;
+let readerZoomCommitTimer = 0;
+
+function readerBaseWidth() {
+  const viewport = resultGrid.clientWidth || workspace.clientWidth || window.innerWidth;
+  if (state.readerWidth === "edge") return viewport;
+  return Math.min(viewport, state.readerWidth === "wide" ? 1120 : 960);
+}
+
+function syncReaderZoomControls() {
+  const percent = Math.round(state.readerZoom * 100);
+  readerZoomResetButton.textContent = `${percent}%`;
+  readerZoomResetButton.classList.toggle("active", Math.abs(state.readerZoom - 1) > 0.01);
+  readerZoomResetButton.setAttribute(
+    "aria-label",
+    `当前阅读缩放 ${percent}%，点击恢复 100%`,
+  );
+  readerZoomOutButton.disabled = state.readerZoom <= READER_ZOOM_MIN + 0.001;
+  readerZoomInButton.disabled = state.readerZoom >= READER_ZOOM_MAX - 0.001;
+}
+
+function applyReaderZoomLayout() {
+  const baseWidth = readerBaseWidth();
+  if (baseWidth > 0) {
+    shell.style.setProperty("--reader-page-width", `${Math.round(baseWidth * state.readerZoom)}px`);
+  }
+  syncReaderZoomControls();
+}
+
+function captureReaderAnchor(clientX?: number, clientY?: number): ReaderAnchor | null {
+  if (state.view !== "reader") return null;
+  const gridRect = resultGrid.getBoundingClientRect();
+  if (gridRect.width < 1 || gridRect.height < 1) return null;
+
+  const fallbackX = gridRect.left + gridRect.width / 2;
+  const fallbackY = gridRect.top + gridRect.height * 0.42;
+  const pointX = Math.max(gridRect.left + 1, Math.min(gridRect.right - 1, clientX ?? fallbackX));
+  const pointY = Math.max(gridRect.top + 1, Math.min(gridRect.bottom - 1, clientY ?? fallbackY));
+  const hit = document.elementFromPoint(pointX, pointY);
+  let photo = hit instanceof Element ? hit.closest<HTMLElement>(".stream-photo") : null;
+  if (!photo || !resultGrid.contains(photo)) {
+    const current = currentStreamIndex();
+    photo = document.querySelector<HTMLElement>(`.stream-photo[data-index="${Math.max(0, current)}"]`);
+  }
+  if (!photo) return null;
+
+  const rect = photo.getBoundingClientRect();
+  if (rect.width < 1 || rect.height < 1) return null;
+  const ratioX = Math.max(0, Math.min(1, (pointX - rect.left) / rect.width));
+  const ratioY = Math.max(0, Math.min(1, (pointY - rect.top) / rect.height));
+  return {
+    index: Number(photo.dataset.index) || 0,
+    ratioX,
+    ratioY,
+    clientX: pointX,
+    clientY: pointY,
+  };
+}
+
+function restoreReaderAnchor(anchor: ReaderAnchor | null) {
+  if (!anchor) return;
+  // Multiple gesture events can arrive before the next paint. Keep the first
+  // visual anchor for that frame and apply it once to the latest page width.
+  readerPendingAnchor ??= anchor;
+  if (readerAnchorFrame) window.cancelAnimationFrame(readerAnchorFrame);
+  readerAnchorFrame = window.requestAnimationFrame(() => {
+    readerAnchorFrame = 0;
+    const pending = readerPendingAnchor;
+    readerPendingAnchor = null;
+    if (!pending) return;
+    if (state.view !== "reader") return;
+    const photo = document.querySelector<HTMLElement>(`.stream-photo[data-index="${pending.index}"]`);
+    if (!photo) return;
+    const rect = photo.getBoundingClientRect();
+    const nextX = rect.left + rect.width * pending.ratioX;
+    const nextY = rect.top + rect.height * pending.ratioY;
+    resultGrid.scrollBy({
+      left: nextX - pending.clientX,
+      top: nextY - pending.clientY,
+      behavior: "auto",
+    });
+  });
+}
+
+function commitReaderZoom() {
+  if (readerZoomCommitTimer) {
+    window.clearTimeout(readerZoomCommitTimer);
+    readerZoomCommitTimer = 0;
+  }
+  resultGrid.classList.remove("reader-zooming");
+  saveReaderPrefs();
+  broadcastReaderPrefs();
+  if (readerSettingsOpen) buildReaderSettingsPanel();
+  window.requestAnimationFrame(redrawReaderOverlays);
+}
+
+function scheduleReaderZoomCommit() {
+  if (readerZoomCommitTimer) window.clearTimeout(readerZoomCommitTimer);
+  readerZoomCommitTimer = window.setTimeout(commitReaderZoom, 160);
+}
+
+function setReaderZoom(value: number, clientX?: number, clientY?: number) {
+  if (state.view !== "reader") return;
+  const next = normalizeReaderZoom(value);
+  if (Math.abs(next - state.readerZoom) < 0.001) return;
+  const leavingPagedFit = state.readerFit !== "width";
+  const currentIndex = currentStreamIndex();
+
+  const anchor = leavingPagedFit ? null : captureReaderAnchor(clientX, clientY);
+  if (leavingPagedFit) {
+    state.readerFit = "width";
+    shell.dataset.readerFit = "width";
+    showToast("已切换到连续阅读，可自由缩放", "info", 2200);
+  }
+  state.readerZoom = next;
+  resultGrid.classList.add("reader-zooming");
+  applyReaderZoomLayout();
+  syncReaderPageControls();
+  if (leavingPagedFit) {
+    window.requestAnimationFrame(() => {
+      scrollToStreamIndex(Math.max(0, currentIndex), "auto");
+      setupStreamObserver();
+    });
+  } else {
+    restoreReaderAnchor(anchor);
+  }
+  scheduleReaderZoomCommit();
+}
+
+function adjustReaderZoom(delta: number) {
+  const next = Math.round((state.readerZoom + delta) * 10) / 10;
+  setReaderZoom(next);
 }
 
 // ---- 本地 OCR (文字区域框选) ----
@@ -825,29 +1033,14 @@ let ocrBatchRunning = false;
 let readerPipelineEpoch = 0;
 // OCR 开关竞态令牌:引擎初始化期间开关被再次切换时,用来取消过期的“开启”请求
 let ocrEnableToken = 0;
-// 文字框红框仅调试用:默认不画,正常用户无感知;调试时实时开关并记忆
-let ocrBoxDebug = (() => {
+// 文字框红框仅调试用，默认不画；保留已有本地调试设置。
+const ocrBoxDebug = (() => {
   try {
     return localStorage.getItem("wnacg.debugOcrBoxes.v1") === "1";
   } catch {
     return false;
   }
 })();
-function setOcrBoxDebug(value: boolean) {
-  ocrBoxDebug = value;
-  try {
-    localStorage.setItem("wnacg.debugOcrBoxes.v1", value ? "1" : "0");
-  } catch {
-    // localStorage 不可用时只改内存,不影响本次会话
-  }
-  if (value) {
-    const index = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
-    renderStreamOcrOverlay(index);
-    renderLightboxOcrOverlay();
-  } else {
-    removeAllOcrOverlays();
-  }
-}
 const ocrTextPending = new Set<number>();
 const ocrTextInFlight = new Set<number>();
 const ocrTextDone = new Set<number>();
@@ -867,16 +1060,13 @@ function ocrEngine(): string {
 }
 
 function isVisiblePage(index: number): boolean {
-  return index === state.lightboxIndex
-    || (state.lightboxIndex < 0 && index === currentStreamIndex());
+  const current = currentStreamIndex();
+  return index === current || (state.readerFit === "spread" && index === current + 1);
 }
 
 function isNearPage(index: number): boolean {
   // 翻译预取窗口:当前页前 1 后 3,提前识别+翻译,滚动过去时基本已就绪
   if (index < 0 || index >= state.photos.length) return false;
-  if (state.lightboxIndex >= 0) {
-    return index >= state.lightboxIndex - 1 && index <= state.lightboxIndex + 3;
-  }
   const current = currentStreamIndex();
   return index >= current - 1 && index <= current + 3;
 }
@@ -954,11 +1144,6 @@ function getDisplayDataUrl(index: number): string | null {
   const container = document.querySelector<HTMLElement>(`.stream-photo[data-index="${index}"]`);
   const streamImg = container?.querySelector<HTMLImageElement>(".stream-img");
   if (streamImg?.src && streamImg.src.startsWith("data:")) return streamImg.src;
-
-  if (index === state.lightboxIndex) {
-    const lightboxImg = document.querySelector<HTMLImageElement>(".lightbox-image");
-    if (lightboxImg?.src && lightboxImg.src.startsWith("data:")) return lightboxImg.src;
-  }
   return null;
 }
 
@@ -1038,7 +1223,6 @@ async function pumpOcrQueue() {
         renderStreamOcrOverlay(result.index);
         if (state.translateEnabled) {
           renderTranslateBadge(result.index);
-          if (result.index === state.lightboxIndex) renderLightboxTranslateBadge();
         }
         if (
           !result.error
@@ -1047,9 +1231,6 @@ async function pumpOcrQueue() {
         ) {
           queueOcrText(result.index);
         }
-      }
-      if (results.some((result) => result.index === state.lightboxIndex)) {
-        renderLightboxOcrOverlay();
       }
     }
   } catch (error) {
@@ -1082,7 +1263,7 @@ function queueOcrText(index: number) {
 }
 
 function nextOcrTextIndex(): number | null {
-  const center = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+  const center = currentStreamIndex();
   const preferred = center >= 0 ? ocrWindowOrder(center) : [];
   for (const index of preferred) {
     if (ocrTextPending.has(index) && getOcrSources(index)) return index;
@@ -1139,10 +1320,6 @@ function pumpOcrTextQueue() {
       if (state.translateEnabled) {
         renderTranslateBadge(index);
         queueTranslate(index);
-        if (index === state.lightboxIndex) {
-          renderLightboxOcrOverlay();
-          renderLightboxTranslateBadge();
-        }
       }
     }).catch((error) => {
       if (token !== state.readerToken || aid !== state.currentAlbum?.aid || epoch !== readerPipelineEpoch || state.view !== "reader") return;
@@ -1195,9 +1372,12 @@ async function toggleReaderTranslate(force?: boolean) {
   if (state.ocrLang !== "ja") {
     updateReaderPrefs({ ocrLang: "ja" });
   }
+  if (!state.ocrEnabled) {
+    await toggleReaderOcr(true);
+    if (!state.ocrEnabled) return;
+  }
   updateReaderPrefs({ translateMode: true });
-  const target = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
-  queueOcrWindow(target);
+  queueOcrWindow(currentStreamIndex());
 }
 
 function queueTranslate(index: number) {
@@ -1220,17 +1400,15 @@ function queueTranslate(index: number) {
   if (!regions.some((r) => r.text.trim())) {
     translateDone.add(index); // 没有可翻译的文字,直接标记完成,避免徽标卡住
     renderTranslateBadge(index);
-    if (index === state.lightboxIndex) renderLightboxTranslateBadge();
     return;
   }
   translatePending.add(index);
   renderTranslateBadge(index);
-  if (index === state.lightboxIndex) renderLightboxTranslateBadge();
   pumpTranslateQueue();
 }
 
 function nextTranslateIndex(): number | null {
-  const center = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+  const center = currentStreamIndex();
   const preferred = center >= 0 ? ocrWindowOrder(center) : [];
   for (const index of preferred) {
     if (translatePending.has(index)) return index;
@@ -1261,15 +1439,12 @@ function pumpTranslateQueue() {
       translateDone.add(index);
       if (translated.length === texts.length) state.translateTexts[index] = translated;
       renderTranslateOverlay(index);
-      if (index === state.lightboxIndex) renderLightboxTranslateOverlay();
       renderTranslateBadge(index);
-      if (index === state.lightboxIndex) renderLightboxTranslateBadge();
     }).catch((error) => {
       if (token !== state.readerToken || aid !== state.currentAlbum?.aid || epoch !== readerPipelineEpoch || state.view !== "reader") return;
       const message = error instanceof Error ? error.message : String(error);
       state.translateFailed[index] = message;
       renderTranslateBadge(index);
-      if (index === state.lightboxIndex) renderLightboxTranslateBadge();
       showToast(`翻译失败：${message}`, "error", 4800);
     }).finally(() => {
       if (token === state.readerToken && aid === state.currentAlbum?.aid && epoch === readerPipelineEpoch) {
@@ -1295,9 +1470,13 @@ function renderTranslateOverlay(index: number) {
 
   const canvas = document.createElement("canvas");
   canvas.className = "stream-translate-overlay";
-  // Stream pages can keep several overlays alive; 1.5x is crisp on Retina
-  // while using 44% less canvas memory than 2x.
-  const dpr = Math.min(1.5, window.devicePixelRatio || 1);
+  // Keep the backing bitmap near the 100% memory budget as pages grow. The
+  // canvas is still displayed at the exact layout size, but extreme reader
+  // zoom cannot multiply every nearby translation overlay's memory by 6.25x.
+  const dpr = Math.max(
+    0.6,
+    Math.min(1.5, window.devicePixelRatio || 1, 1.5 / Math.max(1, state.readerZoom)),
+  );
   const w = img.offsetWidth;
   const h = img.offsetHeight;
   if (w < 4 || h < 4) return;
@@ -1325,46 +1504,6 @@ function renderTranslateOverlay(index: number) {
   container.append(canvas);
   attachTranslateTooltip(canvas, regions);
   renderTranslateBadge(index);
-}
-
-function renderLightboxTranslateOverlay() {
-  const wrap = document.querySelector<HTMLElement>(".lightbox-image-wrap");
-  const img = document.querySelector<HTMLImageElement>(".lightbox-image");
-  wrap?.querySelector(".lightbox-translate-overlay")?.remove();
-  if (!wrap || !img || !img.complete || img.naturalWidth === 0) return;
-  if (!state.translateEnabled) return;
-
-  const regions = state.ocrRegions[state.lightboxIndex];
-  const texts = state.translateTexts[state.lightboxIndex];
-  if (!regions || !texts) return;
-
-  const canvas = document.createElement("canvas");
-  canvas.className = "lightbox-translate-overlay";
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
-  canvas.width = Math.max(1, Math.round(img.offsetWidth * dpr));
-  canvas.height = Math.max(1, Math.round(img.offsetHeight * dpr));
-  canvas.style.left = `${img.offsetLeft}px`;
-  canvas.style.top = `${img.offsetTop}px`;
-  canvas.style.width = `${img.offsetWidth}px`;
-  canvas.style.height = `${img.offsetHeight}px`;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  const sampler = ensureSampleCanvas(img);
-  ctx.scale(dpr, dpr);
-  for (let i = 0; i < regions.length; i++) {
-    const region = regions[i];
-    const translated = texts[i]?.trim();
-    if (!translated) continue;
-    const x = region.x * img.offsetWidth;
-    const y = region.y * img.offsetHeight;
-    const w = region.w * img.offsetWidth;
-    const h = region.h * img.offsetHeight;
-    if (w < 4 || h < 4) continue;
-    drawCoverAndText(ctx, sampler, x, y, w, h, translated);
-  }
-  wrap.append(canvas);
-  attachTranslateTooltip(canvas, regions);
-  renderLightboxTranslateBadge();
 }
 
 function drawCoverAndText(
@@ -1730,9 +1869,7 @@ const VERT_ROTATE = new Set([
 ]);
 
 function removeAllTranslateOverlays() {
-  document.querySelectorAll<HTMLCanvasElement>(
-    ".stream-translate-overlay, .lightbox-translate-overlay",
-  ).forEach((canvas) => {
+  document.querySelectorAll<HTMLCanvasElement>(".stream-translate-overlay").forEach((canvas) => {
     canvas.width = 0;
     canvas.height = 0;
     canvas.remove();
@@ -1789,45 +1926,13 @@ function renderTranslateBadge(index: number) {
   container.append(badge);
 }
 
-function renderLightboxTranslateBadge() {
-  const wrap = document.querySelector<HTMLElement>(".lightbox-image-wrap");
-  wrap?.querySelector(".lightbox-translate-badge")?.remove();
-  if (!wrap || !state.translateEnabled) return;
-  const index = state.lightboxIndex;
-  const failed = state.translateFailed[index];
-  const busy = translateBusy(index);
-  if (!failed && !busy) return;
-  const badge = document.createElement("button");
-  badge.type = "button";
-  badge.className = failed ? "translate-badge lightbox-translate-badge failed" : "translate-badge lightbox-translate-badge";
-  badge.textContent = failed ? "翻译失败 · 点击重试" : "翻译中…";
-  badge.addEventListener("click", (event) => {
-    event.stopPropagation();
-    if (failed) {
-      delete state.translateFailed[index];
-      translateDone.delete(index);
-      queueOcrText(index);
-      queueTranslate(index);
-      renderLightboxTranslateBadge();
-    }
-  });
-  wrap.append(badge);
-}
-
 function updateTranslateBadges() {
   const indices: number[] = [];
-  if (state.lightboxIndex >= 0) {
-    for (let i = state.lightboxIndex - 1; i <= state.lightboxIndex + 3; i++) {
-      if (i >= 0 && i < state.photos.length) indices.push(i);
-    }
-  } else {
-    const current = currentStreamIndex();
-    for (let i = current - 1; i <= current + 3; i++) {
-      if (i >= 0 && i < state.photos.length) indices.push(i);
-    }
+  const current = currentStreamIndex();
+  for (let i = current - 1; i <= current + 3; i++) {
+    if (i >= 0 && i < state.photos.length) indices.push(i);
   }
   for (const index of indices) renderTranslateBadge(index);
-  if (state.lightboxIndex >= 0) renderLightboxTranslateBadge();
   refreshTranslateStatus();
 }
 
@@ -1878,7 +1983,7 @@ function attachTranslateTooltip(
 function ocrPrefetchLoadedPages() {
   if (!state.ocrEnabled) return;
   if (state.translateEnabled && state.ocrLang === "ja") {
-    const current = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+    const current = currentStreamIndex();
     if (current >= 0) queueOcrWindow(current);
     return;
   }
@@ -1886,7 +1991,6 @@ function ocrPrefetchLoadedPages() {
     const index = parseInt(el.dataset.index || "", 10);
     if (!Number.isNaN(index)) queueOcr(index);
   });
-  if (state.lightboxIndex >= 0) queueOcr(state.lightboxIndex);
 }
 
 function renderStreamOcrOverlay(index: number) {
@@ -1920,45 +2024,15 @@ function renderStreamOcrOverlay(index: number) {
   container.append(overlay);
 }
 
-function renderLightboxOcrOverlay() {
-  if (state.translateEnabled || !ocrBoxDebug) return; // 翻译模式/非调试不画红框
-  const wrap = document.querySelector<HTMLElement>(".lightbox-image-wrap");
-  const img = document.querySelector<HTMLImageElement>(".lightbox-image");
-  wrap?.querySelector(".lightbox-ocr-overlay")?.remove();
-  if (!wrap || !img || !img.complete || img.naturalWidth === 0) return;
-
-  const regions = state.ocrRegions[state.lightboxIndex];
-  if (!regions || regions.length === 0) return;
-
-  const overlay = document.createElement("div");
-  overlay.className = "lightbox-ocr-overlay";
-  overlay.setAttribute("aria-hidden", "true");
-  overlay.style.left = `${img.offsetLeft}px`;
-  overlay.style.top = `${img.offsetTop}px`;
-  overlay.style.width = `${img.offsetWidth}px`;
-  overlay.style.height = `${img.offsetHeight}px`;
-  for (const region of regions) {
-    const box = document.createElement("div");
-    box.className = "ocr-box";
-    box.style.left = `${region.x * 100}%`;
-    box.style.top = `${region.y * 100}%`;
-    box.style.width = `${region.w * 100}%`;
-    box.style.height = `${region.h * 100}%`;
-    if (region.text) box.title = region.text;
-    overlay.append(box);
-  }
-  wrap.append(overlay);
-}
-
 function removeAllOcrOverlays() {
-  document.querySelectorAll<HTMLElement>(".stream-ocr-overlay, .lightbox-ocr-overlay").forEach((el) => {
+  document.querySelectorAll<HTMLElement>(".stream-ocr-overlay").forEach((el) => {
     el.remove();
   });
 }
 
 // 重画当前已加载页面的译文/调试红框(整页模式切换、窗口尺寸变化时对齐会变)
 function redrawReaderOverlays() {
-  const center = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+  const center = currentStreamIndex();
   document.querySelectorAll<HTMLElement>(".stream-photo[data-state='loaded']").forEach((el) => {
     const index = parseInt(el.dataset.index || "", 10);
     if (Number.isNaN(index)) return;
@@ -1976,16 +2050,48 @@ function redrawReaderOverlays() {
     }
     renderStreamOcrOverlay(index); // 调试红框,内部自行判断是否该画
   });
-  if (state.lightboxIndex >= 0) {
-    if (state.translateEnabled && state.translateTexts[state.lightboxIndex]) {
-      renderLightboxTranslateOverlay();
-    }
-    renderLightboxOcrOverlay();
-  }
+}
+
+function visibleReaderIndices() {
+  const current = currentStreamIndex();
+  if (current < 0 || current >= state.photos.length) return [];
+  if (state.readerFit === "spread" && current + 1 < state.photos.length) return [current, current + 1];
+  return [current];
+}
+
+function readerPageStep() {
+  return state.readerFit === "spread" ? 2 : 1;
+}
+
+function readerRangeLabel(index: number) {
+  const total = state.photos.length;
+  if (total === 0) return "0 / 0";
+  const start = Math.max(0, Math.min(total - 1, index));
+  if (state.readerFit !== "spread") return `${start + 1} / ${total}`;
+  return `${start + 1}–${Math.min(start + 2, total)} / ${total}`;
+}
+
+function syncReaderPageControls() {
+  const paged = state.view === "reader" && state.readerFit !== "width" && state.photos.length > 0;
+  readerPageControls.hidden = !paged;
+  readerZoomControls.hidden = state.view !== "reader" || state.readerFit !== "width";
+  if (!paged) return;
+
+  const current = Math.max(0, currentStreamIndex());
+  const start = state.readerFit === "spread" ? Math.floor(current / 2) * 2 : current;
+  readerPageLabel.textContent = readerRangeLabel(start);
+  readerPagePrevButton.disabled = start <= 0;
+  readerPageNextButton.disabled = start + readerPageStep() >= state.photos.length;
+}
+
+function turnReaderPage(direction: -1 | 1) {
+  if (state.view !== "reader" || state.photos.length === 0) return;
+  const current = Math.max(0, currentStreamIndex());
+  scrollToStreamIndex(current + direction * readerPageStep(), "auto");
 }
 
 function updateReaderProgress() {
-  const active = state.view === "reader" && state.lightboxIndex < 0;
+  const active = state.view === "reader";
   readerProgress.hidden = !active;
   if (!active) {
     readerProgressFill.style.transform = "scaleX(0)";
@@ -1993,18 +2099,26 @@ function updateReaderProgress() {
     lastReportedStreamIndex = -1;
     return;
   }
-  const maxScroll = Math.max(1, resultGrid.scrollHeight - resultGrid.clientHeight);
-  const percent = Math.max(0, Math.min(100, (resultGrid.scrollTop / maxScroll) * 100));
+  const horizontal = state.readerFit === "spread";
+  const maxScroll = Math.max(
+    1,
+    horizontal
+      ? resultGrid.scrollWidth - resultGrid.clientWidth
+      : resultGrid.scrollHeight - resultGrid.clientHeight,
+  );
+  const currentScroll = horizontal ? resultGrid.scrollLeft : resultGrid.scrollTop;
+  const percent = Math.max(0, Math.min(100, (currentScroll / maxScroll) * 100));
   readerProgressFill.style.transform = `scaleX(${percent / 100})`;
 
   const total = state.photos.length;
   if (total > 0) {
     const current = currentStreamIndex();
     if (current >= 0) {
-      readerProgress.title = `${current + 1} / ${total} · 点击跳转`;
+      const range = readerRangeLabel(current);
+      readerProgress.title = `${range} · 点击跳转`;
       if (current !== lastReportedStreamIndex) {
         lastReportedStreamIndex = current;
-        setSoftStatus(`正在阅读 ${current + 1} / ${total}`);
+        setSoftStatus(`正在阅读 ${range}`);
         queueOcrWindow(current);
         pruneTranslateOverlays(current);
       }
@@ -2013,6 +2127,7 @@ function updateReaderProgress() {
     readerProgress.removeAttribute("title");
     lastReportedStreamIndex = -1;
   }
+  syncReaderPageControls();
 }
 
 let lastReportedStreamIndex = -1;
@@ -2021,6 +2136,20 @@ let streamIndexHint = 0;
 function currentStreamIndex() {
   const photos = document.querySelectorAll<HTMLElement>(".stream-photo");
   if (photos.length === 0) return -1;
+  if (state.readerFit === "spread") {
+    const spreads = document.querySelectorAll<HTMLElement>(".reader-spread");
+    if (spreads.length === 0) return 0;
+    const probe = resultGrid.scrollLeft + resultGrid.clientWidth * 0.5;
+    let spreadIndex = Math.max(0, Math.min(spreads.length - 1, Math.floor(streamIndexHint / 2)));
+    while (
+      spreadIndex < spreads.length - 1
+      && spreads[spreadIndex].offsetLeft + spreads[spreadIndex].offsetWidth <= probe
+    ) spreadIndex++;
+    while (spreadIndex > 0 && spreads[spreadIndex].offsetLeft > probe) spreadIndex--;
+    const index = Number(spreads[spreadIndex].dataset.startIndex) || 0;
+    streamIndexHint = index;
+    return index;
+  }
   // Both resultGrid and the photos currently share .workspace as offsetParent.
   // Anchor to the scroller itself so a wrapping tag bar before the first page
   // cannot shift page detection.
@@ -2036,17 +2165,36 @@ function scrollToStreamIndex(index: number, behavior: ScrollBehavior = "smooth")
   const photos = document.querySelectorAll<HTMLElement>(".stream-photo");
   if (photos.length === 0) return;
   const clamped = Math.max(0, Math.min(photos.length - 1, index));
+  streamIndexHint = clamped;
+  if (state.readerFit === "spread") {
+    const start = Math.floor(clamped / 2) * 2;
+    const target = document.querySelector<HTMLElement>(`.reader-spread[data-start-index="${start}"]`);
+    if (!target) return;
+    streamIndexHint = start;
+    resultGrid.scrollTo({ left: target.offsetLeft, top: 0, behavior });
+    return;
+  }
   const target = photos[clamped];
   const offset = target.getBoundingClientRect().top - resultGrid.getBoundingClientRect().top;
   resultGrid.scrollTo({ top: resultGrid.scrollTop + offset - 8, behavior });
 }
 
 function setFullscreenState(value: boolean) {
+  const pagedIndex = state.view === "reader" && state.readerFit !== "width"
+    ? Math.max(0, streamIndexHint)
+    : -1;
   state.fullscreen = value;
   shell.classList.toggle("fullscreen-mode", value);
   fullscreenButton.classList.toggle("active", value);
   setIconWithLabel(fullscreenButton, value ? "minimize" : "maximize", value ? "退出全屏" : "全屏");
   fullscreenButton.title = value ? "退出全屏 (F11)" : "全屏 (F11)";
+  if (state.view === "reader") {
+    window.requestAnimationFrame(() => {
+      applyReaderZoomLayout();
+      if (pagedIndex >= 0) scrollToStreamIndex(pagedIndex, "auto");
+      redrawReaderOverlays();
+    });
+  }
 }
 
 async function syncFullscreenState() {
@@ -2115,7 +2263,7 @@ function updateListControls() {
 }
 
 function updateJumpTopButton() {
-  jumpTopButton.hidden = state.lightboxIndex >= 0 || resultGrid.scrollTop < 520;
+  jumpTopButton.hidden = state.readerFit === "spread" || resultGrid.scrollTop < 520;
 }
 
 async function fetchAlbums(page: number, contextKey = listContextKey()) {
@@ -2269,27 +2417,6 @@ async function resolvePhotoImageUrlWithRetry(index: number, retries = 2) {
   }
 
   throw lastError;
-}
-
-async function resolvePhotoImageUrlUntilSuccess(
-  index: number,
-  shouldContinue: () => boolean,
-  onRetry?: (attempt: number, error: unknown, delayMs: number) => void,
-) {
-  let attempt = 0;
-
-  while (shouldContinue()) {
-    try {
-      return await resolvePhotoImageUrl(index);
-    } catch (error) {
-      attempt++;
-      const delayMs = Math.min(30_000, 2000 * attempt);
-      onRetry?.(attempt, error, delayMs);
-      await sleep(delayMs);
-    }
-  }
-
-  throw new Error("图片加载已取消");
 }
 
 async function preloadFullImage(index: number, readerToken = state.readerToken): Promise<PreloadResult> {
@@ -2566,6 +2693,7 @@ function syncToolbar() {
     pagerControls.hidden = false;
     refreshButton.hidden = true;
     fullscreenButton.hidden = false;
+    readerZoomControls.hidden = state.readerFit !== "width";
     readerSettings.hidden = false;
     const albumTitle = state.currentAlbum?.title;
     viewTitle.textContent = (albumTitle && titleTranslationCache.get(albumTitle)) || albumTitle || "阅读";
@@ -2578,6 +2706,8 @@ function syncToolbar() {
     pagerControls.hidden = false;
     refreshButton.hidden = false;
     fullscreenButton.hidden = true;
+    readerPageControls.hidden = true;
+    readerZoomControls.hidden = true;
     readerSettings.hidden = false;
     viewTitle.textContent =
       state.mode === "tag" ? `标签：${state.query}` :
@@ -2588,7 +2718,9 @@ function syncToolbar() {
   syncReaderControls();
   syncPagerBar();
   updateReaderProgress();
+  syncReaderPageControls();
   updateListControls();
+  if (state.view === "reader") window.requestAnimationFrame(applyReaderZoomLayout);
 }
 
 // ---- category sidebar ----
@@ -2709,15 +2841,13 @@ function refreshTranslateStatus() {
   }
   let label = "翻译开";
   let className = "on";
-  const index = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
-  if (index >= 0 && index < state.photos.length) {
-    if (state.translateFailed[index]) {
-      label = "翻译失败 · 点击重试";
-      className = "failed";
-    } else if (translateBusy(index)) {
-      label = "翻译中…";
-      className = "working";
-    }
+  const visible = visibleReaderIndices();
+  if (visible.some((index) => state.translateFailed[index])) {
+    label = "翻译失败 · 点击重试";
+    className = "failed";
+  } else if (visible.some(translateBusy)) {
+    label = "翻译中…";
+    className = "working";
   }
   status.textContent = label;
   status.className = `translate-status ${className}`;
@@ -3078,7 +3208,6 @@ function teardownReaderObserver() {
   readerObserver?.disconnect();
   readerObserver = null;
   streamQueue = [];
-  streamWorkers = 0;
 }
 
 function renderReaderGrid(tags = state.tags) {
@@ -3087,6 +3216,7 @@ function renderReaderGrid(tags = state.tags) {
   lastReportedStreamIndex = -1;
   resultGrid.className = "reader-stream";
   resultGrid.scrollTop = 0;
+  resultGrid.scrollLeft = 0;
 
   const frag = document.createDocumentFragment();
 
@@ -3106,24 +3236,33 @@ function renderReaderGrid(tags = state.tags) {
     frag.append(tagBar);
   }
 
-  for (let i = 0; i < state.photos.length; i++) {
-    const idx = i;
+  for (let start = 0; start < state.photos.length; start += 2) {
+    const spread = document.createElement("section");
+    spread.className = start + 1 < state.photos.length ? "reader-spread" : "reader-spread is-single";
+    spread.dataset.startIndex = String(start);
 
-    const container = document.createElement("div");
-    container.className = "stream-photo";
-    container.dataset.index = String(i);
-    container.dataset.state = "";
-    container.addEventListener("click", () => openLightbox(idx));
-    frag.append(container);
+    for (let index = start; index < Math.min(start + 2, state.photos.length); index++) {
+      const page = document.createElement("div");
+      page.className = "reader-page";
 
-    const label = document.createElement("div");
-    label.className = "stream-label";
-    label.textContent = `${i + 1} / ${state.photos.length}`;
-    frag.append(label);
+      const container = document.createElement("div");
+      container.className = "stream-photo";
+      container.dataset.index = String(index);
+      container.dataset.state = "";
+
+      const label = document.createElement("div");
+      label.className = "stream-label";
+      label.textContent = `${index + 1} / ${state.photos.length}`;
+
+      page.append(container, label);
+      spread.append(page);
+    }
+    frag.append(spread);
   }
 
   resultGrid.replaceChildren(frag);
 
+  applyReaderZoomLayout();
   setupStreamObserver();
   updateReaderProgress();
 }
@@ -3135,7 +3274,9 @@ const STREAM_CONCURRENCY = 2;
 function setupStreamObserver() {
   teardownReaderObserver();
   streamQueue = [];
-  streamWorkers = 0;
+  const rootMargin = state.readerFit === "spread"
+    ? (state.conserveImages ? "0px 110%" : "0px 220%")
+    : (state.conserveImages ? "120px 0px" : "400px 0px");
   readerObserver = new IntersectionObserver(
     (entries) => {
       for (const entry of entries) {
@@ -3148,7 +3289,7 @@ function setupStreamObserver() {
       }
       pumpStreamQueue();
     },
-    { root: resultGrid, rootMargin: state.conserveImages ? "120px 0px" : "400px 0px" },
+    { root: resultGrid, rootMargin },
   );
 
   document.querySelectorAll<HTMLElement>(".stream-photo").forEach((el) => {
@@ -3156,8 +3297,13 @@ function setupStreamObserver() {
   });
   // kick off first few visible
   if (streamQueue.length === 0) {
-    const first = document.querySelector<HTMLElement>('.stream-photo[data-state=""]');
-    if (first) streamQueue.push(first);
+    const current = Math.max(0, currentStreamIndex());
+    const currentPage = document.querySelector<HTMLElement>(
+      `.stream-photo[data-index="${current}"][data-state=""]`,
+    );
+    const fallback = currentPage
+      ?? document.querySelector<HTMLElement>('.stream-photo[data-state=""]');
+    if (fallback) streamQueue.push(fallback);
   }
   pumpStreamQueue();
 }
@@ -3167,12 +3313,9 @@ function pumpStreamQueue() {
     const container = streamQueue.shift()!;
     if (container.dataset.state !== "") continue;
     streamWorkers++;
-    const token = state.readerToken;
     loadStreamImage(container).finally(() => {
-      streamWorkers--;
-      if (token === state.readerToken && state.view === "reader") {
-        pumpStreamQueue();
-      }
+      streamWorkers = Math.max(0, streamWorkers - 1);
+      if (state.view === "reader") pumpStreamQueue();
     });
   }
 }
@@ -3228,8 +3371,8 @@ async function loadStreamImage(container: HTMLElement) {
         }
       })();
       // Register the visible fallback in the same map. Scheduled retries,
-      // lightbox opens and OCR prefetches now await this download instead of
-      // starting a second one on slow connections.
+      // OCR prefetches now await this download instead of starting a second one
+      // on slow connections.
       preloadInFlight.set(index, foregroundTask);
       await foregroundTask;
       if (loadError) throw loadError;
@@ -3319,7 +3462,6 @@ async function loadAlbumReader(aid: string, title: string) {
   state.currentAlbum = { aid, title: placeholderTitle };
   state.photos = [];
   state.tags = [];
-  state.lightboxIndex = -1;
   state.preloadedUrls = {};
   state.preloadFailures = {};
   state.ocrRegions = {};
@@ -3368,20 +3510,11 @@ function backToList(options: { restore?: boolean } = {}) {
   const restore = options.restore ?? true;
   state.readerToken++;
   resetReaderPipelines(true);
-  state.lightboxToken++;
   state.view = "list";
   state.currentAlbum = null;
   resetWindowTitle();
   state.photos = [];
   state.tags = [];
-  state.lightboxIndex = -1;
-  state.lightboxImageUrl = null;
-  state.lightboxZoom = 1;
-  state.lightboxPanX = 0;
-  state.lightboxPanY = 0;
-  state.lightboxPanning = false;
-  state.retryNotice = "";
-  state.lightboxProgress = null;
   state.preloadedUrls = {};
   state.preloadFailures = {};
   state.ocrRegions = {};
@@ -3389,7 +3522,6 @@ function backToList(options: { restore?: boolean } = {}) {
   state.translateTexts = {};
   state.translateFailed = {};
   state.imageUrls = {};
-  document.querySelector(".lightbox")?.remove();
   teardownReaderObserver();
   resultGrid.className = "result-grid";
   syncToolbar();
@@ -3397,7 +3529,7 @@ function backToList(options: { restore?: boolean } = {}) {
   loadAlbums();
 }
 
-// ---- lightbox ----
+// ---- image decode preload ----
 
 const preloadPool = document.createElement("div");
 preloadPool.className = "preload-pool";
@@ -3414,649 +3546,6 @@ function preloadImage(url: string) {
   preloadPool.append(img);
 }
 
-function clampZoom(value: number) {
-  return Math.min(5, Math.max(0.1, value));
-}
-
-function setLightboxZoom(value: number, originX?: number, originY?: number) {
-  const oldZoom = state.lightboxZoom;
-  state.lightboxZoom = clampZoom(value);
-  if (Math.abs(state.lightboxZoom - 1) < 0.02) {
-    state.lightboxPanX = 0;
-    state.lightboxPanY = 0;
-  } else if (originX !== undefined && originY !== undefined) {
-    const scale = state.lightboxZoom / oldZoom;
-    state.lightboxPanX = originX - scale * (originX - state.lightboxPanX);
-    state.lightboxPanY = originY - scale * (originY - state.lightboxPanY);
-  }
-  applyLightboxZoomAndPan();
-}
-
-function resetLightboxZoom() {
-  state.lightboxPanX = 0;
-  state.lightboxPanY = 0;
-  setLightboxZoom(1);
-}
-
-function moveLightboxPan(deltaX: number, deltaY: number) {
-  if (Math.abs(state.lightboxZoom - 1) < 0.02) return;
-  state.lightboxPanX += deltaX;
-  state.lightboxPanY += deltaY;
-  applyLightboxZoomAndPan();
-}
-
-function clampPan(viewW: number, viewH: number, imgW: number, imgH: number) {
-  const maxX = Math.max(0, (imgW * state.lightboxZoom - viewW) / 2);
-  const maxY = Math.max(0, (imgH * state.lightboxZoom - viewH) / 2);
-  state.lightboxPanX = Math.max(-maxX, Math.min(maxX, state.lightboxPanX));
-  state.lightboxPanY = Math.max(-maxY, Math.min(maxY, state.lightboxPanY));
-}
-
-function applyLightboxZoomAndPan() {
-  const wrap = document.querySelector<HTMLElement>(".lightbox-image-wrap");
-  const img = document.querySelector<HTMLImageElement>(".lightbox-image");
-  const zoomLabel = document.querySelector<HTMLElement>(".lightbox-zoom");
-  if (!wrap || !img) {
-    if (zoomLabel) zoomLabel.textContent = "";
-    return;
-  }
-
-  const zoomed = Math.abs(state.lightboxZoom - 1) > 0.01;
-  wrap.classList.toggle("zoomed", zoomed);
-
-  if (zoomed) {
-    if (state.lightboxPanning) wrap.classList.add("no-transition");
-    else wrap.classList.remove("no-transition");
-    const vw = wrap.clientWidth;
-    const vh = wrap.clientHeight;
-    const nw = img.naturalWidth || img.width || vw || 100;
-    const nh = img.naturalHeight || img.height || vh || 100;
-    clampPan(vw, vh, nw, nh);
-    wrap.style.transform = `translate3d(${state.lightboxPanX}px, ${state.lightboxPanY}px, 0) scale(${state.lightboxZoom})`;
-    wrap.style.cursor = state.lightboxZoom < 1 ? "zoom-in" : "grab";
-  } else {
-    wrap.classList.remove("no-transition");
-    wrap.style.transform = "";
-    wrap.style.cursor = "zoom-in";
-  }
-  if (zoomLabel) zoomLabel.textContent = zoomed ? `${Math.round(state.lightboxZoom * 100)}%` : "";
-}
-
-function bindLightboxZoomEvents(overlay: HTMLElement) {
-  let lastPointerTime = 0;
-  let tapMoved = false;
-  let swipeNavCooldown = 0;
-  overlay.addEventListener("click", (event) => {
-    if (Math.abs(state.lightboxZoom - 1) > 0.01) return; // don't close while zoomed
-    const target = event.target as HTMLElement;
-    if (target.classList.contains("lightbox-image")) return;
-    if (target.closest(".lightbox-toolbar") || target.closest(".lightbox-nav")) return;
-    closeLightbox();
-  });
-
-  overlay.addEventListener("dblclick", (event) => {
-    const target = event.target as HTMLElement;
-    if (!target.classList.contains("lightbox-image")) return;
-    event.preventDefault();
-    if (Math.abs(state.lightboxZoom - 1) < 0.02) setLightboxZoom(2.4);
-    else resetLightboxZoom();
-  });
-
-  overlay.addEventListener(
-    "wheel",
-    (event) => {
-      if (!state.lightboxImageUrl || state.lightboxImageUrl === "__error__") return;
-      const now = Date.now();
-
-      // ctrl/meta+wheel → zoom (macOS trackpad pinch gesture)
-      if (event.ctrlKey || event.metaKey) {
-        event.preventDefault();
-        const factor = Math.exp(-event.deltaY * 0.005);
-        const rect = overlay.getBoundingClientRect();
-        const ox = event.clientX - rect.left - rect.width / 2;
-        const oy = event.clientY - rect.top - rect.height / 2;
-        setLightboxZoom(state.lightboxZoom * factor, ox, oy);
-        return;
-      }
-
-      // When zoomed → pan
-      if (Math.abs(state.lightboxZoom - 1) > 0.01) {
-        event.preventDefault();
-        moveLightboxPan(-event.deltaX, -event.deltaY);
-        return;
-      }
-
-      // Normal zoom → navigate on horizontal swipe
-      // Only trigger if clearly horizontal (trackpad two-finger swipe)
-      const absX = Math.abs(event.deltaX);
-      const absY = Math.abs(event.deltaY);
-      if (absX > absY * 1.5 && absX > 20 && now > swipeNavCooldown) {
-        event.preventDefault();
-        navigateLightbox(event.deltaX > 0 ? 1 : -1);
-        swipeNavCooldown = now + 600;
-      }
-    },
-    { passive: false },
-  );
-
-  overlay.addEventListener("gesturestart", (event) => {
-    if (!state.lightboxImageUrl || state.lightboxImageUrl === "__error__") return;
-    event.preventDefault();
-    state.gestureStartZoom = state.lightboxZoom;
-  });
-
-  overlay.addEventListener("gesturechange", (event) => {
-    if (!state.lightboxImageUrl || state.lightboxImageUrl === "__error__") return;
-    event.preventDefault();
-    const scale = (event as GestureEventLike).scale ?? 1;
-    setLightboxZoom(state.gestureStartZoom * scale);
-  });
-
-  overlay.addEventListener("pointerdown", (event) => {
-    if (!state.lightboxImageUrl || state.lightboxImageUrl === "__error__") return;
-    tapMoved = false;
-
-    if (Math.abs(state.lightboxZoom - 1) > 0.01) {
-      const target = event.target as HTMLElement;
-      if (!target.classList.contains("lightbox-image")) return;
-
-      event.preventDefault();
-      state.lightboxPanning = true;
-      state.lightboxPanStartX = event.clientX;
-      state.lightboxPanStartY = event.clientY;
-      state.lightboxPanBaseX = state.lightboxPanX;
-      state.lightboxPanBaseY = state.lightboxPanY;
-      overlay.setPointerCapture(event.pointerId);
-      overlay.classList.add("panning");
-      return;
-    }
-
-    // Track tap for zoom-toggle on the image
-    state.lightboxPanStartX = event.clientX;
-    state.lightboxPanStartY = event.clientY;
-    lastPointerTime = Date.now();
-  });
-
-  overlay.addEventListener("pointermove", (event) => {
-    if (state.lightboxPanning) {
-      event.preventDefault();
-      state.lightboxPanX = state.lightboxPanBaseX + event.clientX - state.lightboxPanStartX;
-      state.lightboxPanY = state.lightboxPanBaseY + event.clientY - state.lightboxPanStartY;
-      applyLightboxZoomAndPan();
-      return;
-    }
-    const dx = Math.abs(event.clientX - state.lightboxPanStartX);
-    const dy = Math.abs(event.clientY - state.lightboxPanStartY);
-    if (dx > 8 || dy > 8) tapMoved = true;
-  });
-
-  const handlePointerUp = (event: PointerEvent) => {
-    if (state.lightboxPanning) {
-      state.lightboxPanning = false;
-      if (overlay.hasPointerCapture(event.pointerId)) overlay.releasePointerCapture(event.pointerId);
-      overlay.classList.remove("panning");
-      return;
-    }
-
-    // Tap on image at normal zoom → toggle zoom to 2x
-    if (!tapMoved && Date.now() - lastPointerTime < 300) {
-      const target = event.target as HTMLElement;
-      if (target.classList.contains("lightbox-image")) {
-        if (Math.abs(state.lightboxZoom - 1) < 0.02) {
-          setLightboxZoom(2);
-        } else {
-          resetLightboxZoom();
-        }
-      }
-    }
-  };
-  overlay.addEventListener("pointerup", handlePointerUp);
-  overlay.addEventListener("pointercancel", handlePointerUp);
-}
-
-async function openLightbox(index: number) {
-  if (index < 0 || index >= state.photos.length) return;
-  const token = ++state.lightboxToken;
-  state.lightboxIndex = index;
-  state.lightboxImageUrl = null;
-  state.lightboxProgress = null;
-  state.retryNotice = "";
-  renderLightbox();
-  queueOcrWindow(index);
-  updateTranslateBadges();
-
-  const pendingPreload = preloadInFlight.get(index);
-  if (!state.preloadedUrls[index] && pendingPreload) await pendingPreload;
-  if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
-  // use preloaded URL if available
-  if (state.preloadedUrls[index]) {
-    state.lightboxImageUrl = state.preloadedUrls[index];
-    state.lightboxProgress = null;
-    renderLightbox();
-    preloadNeighbors(index);
-    return;
-  }
-
-  await loadCurrentPhoto(index, token);
-}
-
-async function loadCurrentPhoto(index: number, token = ++state.lightboxToken) {
-  state.lightboxImageUrl = null;
-  state.lightboxProgress = null;
-  state.retryNotice = "";
-  renderLightbox();
-
-  // A stream fallback may have claimed the shared slot immediately after the
-  // original preload failed. Await it before creating a lightbox fallback.
-  while (!state.preloadedUrls[index]) {
-    const competingLoad = preloadInFlight.get(index);
-    if (!competingLoad) break;
-    await competingLoad;
-    if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
-  }
-  const sharedUrl = state.preloadedUrls[index];
-  if (sharedUrl) {
-    state.lightboxImageUrl = sharedUrl;
-    state.lightboxProgress = null;
-    state.retryNotice = "";
-    renderLightbox();
-    preloadNeighbors(index);
-    return;
-  }
-
-  let imageUrl: string | null = null;
-  let loadFailed = false;
-  let lightboxTask!: Promise<PreloadResult>;
-  lightboxTask = (async () => {
-    try {
-      const rawImageUrl = await resolvePhotoImageUrlUntilSuccess(
-        index,
-        () => token === state.lightboxToken && state.lightboxIndex === index,
-        (attempt, error, delayMs) => {
-          if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
-          const message = error instanceof Error ? error.message : String(error);
-          state.retryNotice = `加载失败，自动重试第 ${attempt} 次，${Math.ceil(delayMs / 1000)} 秒后继续`;
-          renderLightbox();
-          setStatus(`${state.retryNotice}: ${message}`);
-        },
-      );
-      state.imageUrls[index] = rawImageUrl;
-      if (token !== state.lightboxToken || state.lightboxIndex !== index) return "failed";
-      const requestId = `lightbox-${token}-${index}-${Date.now()}`;
-      try {
-        imageUrl = await fetchImageDataUrlWithProgress(
-          rawImageUrl,
-          state.photos[index]?.url,
-          requestId,
-          (progress) => {
-            if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
-            state.lightboxProgress = progress;
-            renderLightbox();
-          },
-        );
-        ocrByteCacheUrls.add(rawImageUrl);
-      } catch (error) {
-        console.warn("Image proxy failed, falling back to direct URL", error);
-        setSoftStatus("图片线路较慢，正在尝试备用显示");
-        imageUrl = rawImageUrl;
-      }
-      if (token !== state.lightboxToken || state.lightboxIndex !== index || !imageUrl) return "failed";
-      state.preloadedUrls[index] = imageUrl;
-      delete state.preloadFailures[index];
-      return "loaded";
-    } catch {
-      loadFailed = true;
-      return "failed";
-    } finally {
-      if (preloadInFlight.get(index) === lightboxTask) preloadInFlight.delete(index);
-    }
-  })();
-  // The lightbox is a full-image consumer too. Register it so background
-  // retries and the stream reader share this exact request on slow networks.
-  preloadInFlight.set(index, lightboxTask);
-  await lightboxTask;
-
-  if (loadFailed || !imageUrl) {
-    if (token === state.lightboxToken && state.lightboxIndex === index) {
-      state.lightboxProgress = null;
-      state.lightboxImageUrl = "__error__";
-      renderLightbox();
-      setStatus("图片加载失败");
-    }
-    return;
-  }
-
-  if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
-  state.lightboxImageUrl = imageUrl;
-  state.retryNotice = "";
-  state.lightboxProgress = null;
-  if (!state.conserveImages) preloadImage(imageUrl);
-  renderLightbox();
-  preloadNeighbors(index);
-  setStatus("");
-}
-
-function preloadNeighbors(index: number) {
-  if (state.conserveImages) return;
-  for (const offset of [-1, 1]) {
-    const ni = index + offset;
-    if (ni >= 0 && ni < state.photos.length && !state.preloadedUrls[ni]) {
-      preloadFullImage(ni);
-    }
-  }
-}
-
-function closeLightbox() {
-  if (lightboxIdleTimer !== null) {
-    window.clearTimeout(lightboxIdleTimer);
-    lightboxIdleTimer = null;
-  }
-  lightboxChromeForced = false;
-  const overlay = document.querySelector(".lightbox");
-  if (overlay) {
-    overlay.classList.add("closing");
-    // Immediately mark as closed so keyboard/other handlers don't act
-    state.lightboxToken++;
-    state.lightboxIndex = -1;
-    state.lightboxImageUrl = null;
-    state.lightboxZoom = 1;
-    state.lightboxPanX = 0;
-    state.lightboxPanY = 0;
-    state.retryNotice = "";
-    state.lightboxProgress = null;
-    // Wait for close animation to finish, then remove from DOM
-    overlay.addEventListener("animationend", (e: Event) => {
-      if ((e as AnimationEvent).animationName === "lightboxClose") renderLightbox();
-    }, { once: true });
-    return;
-  }
-  state.lightboxToken++;
-  state.lightboxIndex = -1;
-  state.lightboxImageUrl = null;
-  state.lightboxZoom = 1;
-  state.lightboxPanX = 0;
-  state.lightboxPanY = 0;
-  state.retryNotice = "";
-  state.lightboxProgress = null;
-  renderLightbox();
-}
-
-function navigateLightbox(delta: number) {
-  const newIndex = state.lightboxIndex + delta;
-  if (newIndex >= 0 && newIndex < state.photos.length) {
-    openLightbox(newIndex);
-  }
-}
-
-function bindLightboxImageLoad(img: HTMLImageElement) {
-  img.addEventListener("load", () => {
-    const index = state.lightboxIndex;
-    applyLightboxZoomAndPan();
-    if (state.ocrEnabled) {
-      if (state.translateEnabled) queueOcrWindow(index);
-      else {
-        queueOcr(index);
-        queueOcr(index - 1);
-        queueOcr(index + 1);
-      }
-    }
-    if (state.translateEnabled) {
-      queueTranslate(index);
-    }
-    window.requestAnimationFrame(() => {
-      if (index !== state.lightboxIndex) return;
-      renderLightboxOcrOverlay();
-      if (state.translateEnabled && state.translateTexts[index]) renderLightboxTranslateOverlay();
-    });
-  }, { once: true });
-}
-
-function renderLightbox() {
-  const existing = document.querySelector(".lightbox");
-  if (state.lightboxIndex === -1) {
-    existing?.remove();
-    return;
-  }
-
-  const total = state.photos.length;
-  const photo = state.photos[state.lightboxIndex];
-  const label = photo?.title || `#${state.lightboxIndex + 1}`;
-  const thumb = photo?.thumbnail || "";
-  const isError = state.lightboxImageUrl === "__error__";
-  if (existing) {
-    const imgWrap = existing.querySelector(".lightbox-image-wrap")!;
-    imgWrap.scrollTop = 0;
-    const counter = existing.querySelector(".lightbox-counter")!;
-    const titleEl = existing.querySelector(".lightbox-title")!;
-    const prevBtn = existing.querySelector<HTMLButtonElement>(".lightbox-nav.prev");
-    const nextBtn = existing.querySelector<HTMLButtonElement>(".lightbox-nav.next");
-    counter.textContent = `${state.lightboxIndex + 1} / ${total}`;
-    titleEl.textContent = label;
-    if (prevBtn) prevBtn.disabled = state.lightboxIndex <= 0;
-    if (nextBtn) nextBtn.disabled = state.lightboxIndex >= total - 1;
-
-    if (isError) {
-      imgWrap.innerHTML = `<div class="lightbox-error">
-        <p>图片加载失败</p>
-        <button class="lightbox-retry" type="button">重试</button>
-      </div>`;
-      imgWrap.querySelector(".lightbox-retry")!.addEventListener("click", () => loadCurrentPhoto(state.lightboxIndex));
-    } else if (state.lightboxImageUrl) {
-      const img = document.createElement("img");
-      img.className = "lightbox-image";
-      img.alt = label;
-      img.src = state.lightboxImageUrl;
-      img.draggable = false;
-      bindLightboxImageLoad(img);
-      img.addEventListener("error", () => {
-        state.lightboxImageUrl = "__error__";
-        renderLightbox();
-      }, { once: true });
-      imgWrap.replaceChildren(img);
-    } else {
-      // Show thumbnail as blur background while loading
-      const loading = document.createElement("div");
-      loading.className = "lightbox-loading";
-      if (thumb) {
-        const bg = document.createElement("img");
-        bg.className = "lightbox-bg";
-        bg.alt = "";
-        bg.src = thumb;
-        bg.draggable = false;
-        loading.append(bg);
-      }
-      const spinner = document.createElement("div");
-      spinner.className = "lightbox-spinner";
-      loading.append(spinner);
-      loading.append(createProgressIndicator(state.lightboxProgress));
-      const text = document.createElement("p");
-      text.textContent = state.retryNotice || "加载中";
-      loading.append(text);
-      imgWrap.replaceChildren(loading);
-    }
-    applyLightboxZoomAndPan();
-    return;
-  }
-
-  const overlay = document.createElement("div");
-  overlay.className = "lightbox";
-
-  const imgWrap = document.createElement("div");
-  imgWrap.className = "lightbox-image-wrap";
-  if (isError) {
-    imgWrap.innerHTML = `<div class="lightbox-error">
-      <p>图片加载失败</p>
-      <button class="lightbox-retry" type="button">重试</button>
-    </div>`;
-  } else if (state.lightboxImageUrl) {
-    const img = document.createElement("img");
-    img.className = "lightbox-image";
-    img.alt = label;
-    img.src = state.lightboxImageUrl;
-    img.draggable = false;
-    bindLightboxImageLoad(img);
-    img.addEventListener("error", () => {
-      state.lightboxImageUrl = "__error__";
-      renderLightbox();
-    }, { once: true });
-    imgWrap.replaceChildren(img);
-  } else {
-    const loading = document.createElement("div");
-    loading.className = "lightbox-loading";
-    if (thumb) {
-      const bg = document.createElement("img");
-      bg.className = "lightbox-bg";
-      bg.alt = "";
-      bg.src = thumb;
-      bg.draggable = false;
-      loading.append(bg);
-    }
-    const spinner = document.createElement("div");
-    spinner.className = "lightbox-spinner";
-    loading.append(spinner);
-    loading.append(createProgressIndicator(state.lightboxProgress));
-    const text = document.createElement("p");
-    text.textContent = state.retryNotice || "加载中";
-    loading.append(text);
-    imgWrap.replaceChildren(loading);
-  }
-
-  // bind retry button in initial render
-  if (isError) {
-    imgWrap.querySelector(".lightbox-retry")!.addEventListener("click", () => loadCurrentPhoto(state.lightboxIndex));
-  }
-
-  const toolbar = document.createElement("div");
-  toolbar.className = "lightbox-toolbar";
-
-  const titleEl = document.createElement("span");
-  titleEl.className = "lightbox-title";
-  titleEl.textContent = label;
-
-  const counter = document.createElement("span");
-  counter.className = "lightbox-counter";
-  counter.textContent = `${state.lightboxIndex + 1} / ${total}`;
-
-  const zoom = document.createElement("span");
-  zoom.className = "lightbox-zoom";
-  zoom.textContent = state.lightboxImageUrl && !isError ? `${Math.round(state.lightboxZoom * 100)}%` : "";
-
-  const controls = document.createElement("div");
-  controls.className = "lightbox-controls";
-  const zoomOut = document.createElement("button");
-  zoomOut.type = "button";
-  zoomOut.append(icon("minus", 16));
-  zoomOut.title = "缩小";
-  zoomOut.setAttribute("aria-label", "缩小");
-  zoomOut.addEventListener("click", (event) => {
-    event.stopPropagation();
-    setLightboxZoom(state.lightboxZoom / 1.2);
-  });
-  const zoomReset = document.createElement("button");
-  zoomReset.type = "button";
-  zoomReset.append(icon("resetZoom", 16));
-  zoomReset.title = "重置缩放 (0)";
-  zoomReset.setAttribute("aria-label", "重置缩放");
-  zoomReset.addEventListener("click", (event) => {
-    event.stopPropagation();
-    resetLightboxZoom();
-  });
-  const zoomIn = document.createElement("button");
-  zoomIn.type = "button";
-  zoomIn.append(icon("plus", 16));
-  zoomIn.title = "放大";
-  zoomIn.setAttribute("aria-label", "放大");
-  zoomIn.addEventListener("click", (event) => {
-    event.stopPropagation();
-    setLightboxZoom(state.lightboxZoom * 1.2);
-  });
-  controls.append(zoomOut, zoomReset, zoomIn);
-
-  toolbar.append(titleEl, counter, controls, zoom);
-
-  const closeBtn = document.createElement("button");
-  closeBtn.className = "lightbox-close";
-  closeBtn.append(icon("x", 18));
-  closeBtn.title = "关闭 (Esc)";
-  closeBtn.setAttribute("aria-label", "关闭");
-  closeBtn.addEventListener("click", closeLightbox);
-
-  const prevBtn = document.createElement("button");
-  prevBtn.className = "lightbox-nav prev";
-  prevBtn.append(icon("chevronLeft", 22));
-  prevBtn.title = "上一张";
-  prevBtn.setAttribute("aria-label", "上一张");
-  prevBtn.disabled = state.lightboxIndex <= 0;
-  prevBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    navigateLightbox(-1);
-  });
-
-  const nextBtn = document.createElement("button");
-  nextBtn.className = "lightbox-nav next";
-  nextBtn.append(icon("chevronRight", 22));
-  nextBtn.title = "下一张";
-  nextBtn.setAttribute("aria-label", "下一张");
-  nextBtn.disabled = state.lightboxIndex >= total - 1;
-  nextBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    navigateLightbox(1);
-  });
-
-  bindLightboxZoomEvents(overlay);
-
-  overlay.append(imgWrap, toolbar, closeBtn, prevBtn, nextBtn);
-  document.body.append(overlay);
-  applyLightboxZoomAndPan();
-  bindLightboxIdleAutoHide(overlay);
-  maybeShowLightboxHint(overlay);
-}
-
-let lightboxChromeForced = false;
-let lightboxIdleTimer: number | null = null;
-
-function wakeLightboxChrome() {
-  const overlay = document.querySelector<HTMLElement>(".lightbox");
-  if (!overlay) return;
-  overlay.classList.remove("chrome-hidden");
-  if (lightboxIdleTimer !== null) {
-    window.clearTimeout(lightboxIdleTimer);
-    lightboxIdleTimer = null;
-  }
-  if (lightboxChromeForced) return;
-  lightboxIdleTimer = window.setTimeout(() => {
-    overlay.classList.add("chrome-hidden");
-    lightboxIdleTimer = null;
-  }, 1800);
-}
-
-function bindLightboxIdleAutoHide(overlay: HTMLElement) {
-  overlay.addEventListener("pointermove", wakeLightboxChrome);
-  overlay.addEventListener("pointerdown", wakeLightboxChrome);
-  overlay.addEventListener("wheel", wakeLightboxChrome, { passive: true });
-  overlay.dataset.idleBound = "1";
-  wakeLightboxChrome();
-}
-
-const lightboxHintKey = "wnacg.lightboxHintShown.v1";
-
-function maybeShowLightboxHint(overlay: HTMLElement) {
-  try {
-    if (localStorage.getItem(lightboxHintKey)) return;
-    localStorage.setItem(lightboxHintKey, "1");
-  } catch {
-    return;
-  }
-  const hint = document.createElement("div");
-  hint.className = "lightbox-hint";
-  hint.innerHTML =
-    '<strong>快捷键</strong>' +
-    '<span>← / → 翻页 · Home / End 首末 · 双击或 +/− 缩放 · 0 复位 · F 锁定工具栏 · Esc 关闭</span>';
-  overlay.append(hint);
-  window.setTimeout(() => hint.classList.add("fade-out"), 4200);
-  window.setTimeout(() => hint.remove(), 4900);
-}
-
 // ---- keyboard ----
 
 document.addEventListener("keydown", (e) => {
@@ -4066,92 +3555,28 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
-  // 调试用隐藏快捷键:Cmd/Ctrl+Shift+O 实时开关 OCR 文字框,无需重启
-  if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") {
-    e.preventDefault();
-    setOcrBoxDebug(!ocrBoxDebug);
-    showToast(ocrBoxDebug ? "调试：显示 OCR 文字框" : "调试：隐藏 OCR 文字框", "info", 2200);
-    return;
-  }
-
-  if (e.key === " " && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
-    e.preventDefault();
-    if (state.lightboxIndex >= 0) {
-      if (e.shiftKey) navigateLightbox(-1);
-      else navigateLightbox(1);
-      return;
-    }
-    const scrollTarget = resultGrid;
-    const delta = scrollTarget.clientHeight * 0.85;
-    scrollTarget.scrollBy({ top: e.shiftKey ? -delta : delta, behavior: "smooth" });
-    return;
-  }
-
-  if (state.lightboxIndex >= 0) {
-    wakeLightboxChrome();
-    if (e.key.toLowerCase() === "f") {
-      e.preventDefault();
-      lightboxChromeForced = !lightboxChromeForced;
-      const overlay = document.querySelector(".lightbox");
-      if (lightboxChromeForced) {
-        overlay?.classList.remove("chrome-hidden");
-        if (lightboxIdleTimer !== null) {
-          window.clearTimeout(lightboxIdleTimer);
-          lightboxIdleTimer = null;
-        }
-      } else {
-        wakeLightboxChrome();
-      }
-      return;
-    }
-    if (ocrBoxDebug && e.key.toLowerCase() === "o") {
-      toggleReaderOcr();
-      return;
-    }
-    if (e.key.toLowerCase() === "r") {
-      toggleReaderTranslate();
-      return;
-    }
-    if (e.key === "Escape" || e.key.toLowerCase() === "x") {
-      closeLightbox();
-    } else if (e.key === "ArrowLeft") {
-      navigateLightbox(-1);
-    } else if (e.key === "ArrowRight") {
-      navigateLightbox(1);
-    } else if (e.key === "Home") {
-      e.preventDefault();
-      if (state.lightboxIndex !== 0) openLightbox(0);
-    } else if (e.key === "End") {
-      e.preventDefault();
-      const last = state.photos.length - 1;
-      if (last >= 0 && state.lightboxIndex !== last) openLightbox(last);
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      moveLightboxPan(0, 80);
-    } else if (e.key === "ArrowDown") {
-      e.preventDefault();
-      moveLightboxPan(0, -80);
-    } else if ((e.key === "+" || e.key === "=") && state.lightboxImageUrl && state.lightboxImageUrl !== "__error__") {
-      setLightboxZoom(state.lightboxZoom * 1.2);
-    } else if (e.key === "-" && state.lightboxImageUrl && state.lightboxImageUrl !== "__error__") {
-      setLightboxZoom(state.lightboxZoom / 1.2);
-    } else if (e.key === "0" && state.lightboxImageUrl && state.lightboxImageUrl !== "__error__") {
-      resetLightboxZoom();
-    }
-    return;
-  }
-
   if (state.view === "reader" && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
+    if (e.key === "+" || e.key === "=") {
+      e.preventDefault();
+      adjustReaderZoom(READER_ZOOM_STEP);
+      return;
+    }
+    if (e.key === "-") {
+      e.preventDefault();
+      adjustReaderZoom(-READER_ZOOM_STEP);
+      return;
+    }
+    if (e.key === "0") {
+      e.preventDefault();
+      setReaderZoom(1);
+      return;
+    }
     if (e.key.toLowerCase() === "w") {
       cycleReaderWidth();
       return;
     }
     if (e.key.toLowerCase() === "g") {
       toggleReaderGap();
-      return;
-    }
-    if (e.key.toLowerCase() === "t") {
-      toggleReaderTheme();
       return;
     }
     if (e.key.toLowerCase() === "v") {
@@ -4173,14 +3598,39 @@ document.addEventListener("keydown", (e) => {
     if (state.photos.length > 0) {
       const key = e.key;
       const lower = key.toLowerCase();
+      if (key === " ") {
+        e.preventDefault();
+        const direction = e.shiftKey ? -1 : 1;
+        if (state.readerFit === "width") {
+          resultGrid.scrollBy({
+            top: direction * Math.max(240, resultGrid.clientHeight * 0.85),
+            behavior: "smooth",
+          });
+        } else {
+          turnReaderPage(direction);
+        }
+        return;
+      }
+      if (state.readerFit !== "width" && key === "ArrowRight") {
+        e.preventDefault();
+        turnReaderPage(1);
+        return;
+      }
+      if (state.readerFit !== "width" && key === "ArrowLeft") {
+        e.preventDefault();
+        turnReaderPage(-1);
+        return;
+      }
       if (lower === "j" || key === "PageDown") {
         e.preventDefault();
-        scrollToStreamIndex(currentStreamIndex() + 1);
+        if (state.readerFit === "width") scrollToStreamIndex(currentStreamIndex() + 1);
+        else turnReaderPage(1);
         return;
       }
       if (lower === "k" || key === "PageUp") {
         e.preventDefault();
-        scrollToStreamIndex(currentStreamIndex() - 1);
+        if (state.readerFit === "width") scrollToStreamIndex(currentStreamIndex() - 1);
+        else turnReaderPage(-1);
         return;
       }
       if (key === "Home") {
@@ -4244,8 +3694,52 @@ backButton.setAttribute("aria-label", "返回列表");
 backButton.title = "返回 (Esc/X)";
 
 jumpTopButton.addEventListener("click", () => {
-  resultGrid.scrollTo({ top: 0, behavior: "smooth" });
+  if (state.readerFit === "spread") scrollToStreamIndex(0);
+  else resultGrid.scrollTo({ top: 0, behavior: "smooth" });
 });
+
+let readerNativeGestureActive = false;
+
+resultGrid.addEventListener(
+  "wheel",
+  (event) => {
+    if (state.view !== "reader" || readerNativeGestureActive) return;
+    if (!event.ctrlKey && !event.metaKey) return;
+    event.preventDefault();
+    const factor = Math.exp(-event.deltaY * 0.004);
+    setReaderZoom(state.readerZoom * factor, event.clientX, event.clientY);
+  },
+  { passive: false },
+);
+
+resultGrid.addEventListener("gesturestart", (event) => {
+  if (state.view !== "reader") return;
+  event.preventDefault();
+  readerNativeGestureActive = true;
+  state.readerGestureStartZoom = state.readerZoom;
+  resultGrid.classList.add("reader-zooming");
+});
+
+resultGrid.addEventListener("gesturechange", (event) => {
+  if (state.view !== "reader" || !readerNativeGestureActive) return;
+  event.preventDefault();
+  const gesture = event as GestureEventLike;
+  setReaderZoom(
+    state.readerGestureStartZoom * (gesture.scale ?? 1),
+    gesture.clientX,
+    gesture.clientY,
+  );
+});
+
+const finishReaderNativeGesture = (event: Event) => {
+  if (!readerNativeGestureActive) return;
+  event.preventDefault();
+  readerNativeGestureActive = false;
+  commitReaderZoom();
+};
+
+resultGrid.addEventListener("gestureend", finishReaderNativeGesture);
+resultGrid.addEventListener("gesturecancel", finishReaderNativeGesture);
 
 let resultScrollFrame = 0;
 resultGrid.addEventListener(
@@ -4312,18 +3806,36 @@ syncTitleTranslateToggle();
 document.querySelector<HTMLInputElement>("#title-translate-toggle")
   ?.addEventListener("change", toggleTitleTranslate);
 
-// 跨窗口同步阅读偏好(主题/版心等)
+// 跨窗口同步阅读偏好
 listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
   const payload = event.payload || {};
+  const incomingZoom = typeof payload.zoom === "number" ? normalizeReaderZoom(payload.zoom) : state.readerZoom;
+  const incomingFit = payload.fit === "page" || payload.fit === "spread" || payload.fit === "width"
+    ? payload.fit
+    : state.readerFit;
+  const fitWillChange = incomingFit !== state.readerFit;
+  const currentIndexBeforeLayout = state.view === "reader" ? currentStreamIndex() : -1;
+  const readerAnchor = state.view === "reader"
+    && !fitWillChange
+    && (
+      (payload.width !== undefined && payload.width !== state.readerWidth)
+      || incomingZoom !== state.readerZoom
+      || (payload.gap !== undefined && payload.gap !== state.readerGap)
+    )
+    ? captureReaderAnchor()
+    : null;
   let dirty = false;
+  let readerFitChanged = false;
+  let conserveImagesChanged = false;
   let ocrLangChanged = false;
   let ocrBoxesChanged = false;
-  if (payload.theme && payload.theme !== state.readerTheme) {
-    state.readerTheme = payload.theme;
-    dirty = true;
-  }
+  let translateModeChanged = false;
   if (payload.width && payload.width !== state.readerWidth) {
     state.readerWidth = payload.width;
+    dirty = true;
+  }
+  if (incomingZoom !== state.readerZoom) {
+    state.readerZoom = incomingZoom;
     dirty = true;
   }
   if (payload.gap && payload.gap !== state.readerGap) {
@@ -4332,6 +3844,7 @@ listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
   }
   if (typeof payload.conserveImages === "boolean" && payload.conserveImages !== state.conserveImages) {
     state.conserveImages = payload.conserveImages;
+    conserveImagesChanged = true;
     dirty = true;
   }
   if (typeof payload.ocrBoxes === "boolean" && payload.ocrBoxes !== state.ocrEnabled) {
@@ -4340,8 +3853,9 @@ listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
     ocrBoxesChanged = true;
     dirty = true;
   }
-  if ((payload.fit === "page" || payload.fit === "width") && payload.fit !== state.readerFit) {
-    state.readerFit = payload.fit;
+  if (fitWillChange) {
+    state.readerFit = incomingFit;
+    readerFitChanged = true;
     dirty = true;
   }
   if ((payload.ocrLang === "zh" || payload.ocrLang === "ja") && payload.ocrLang !== state.ocrLang) {
@@ -4349,11 +3863,38 @@ listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
     ocrLangChanged = true;
     dirty = true;
   }
+  if (typeof payload.translateMode === "boolean" && payload.translateMode !== state.translateEnabled) {
+    state.translateEnabled = payload.translateMode;
+    translateModeChanged = true;
+    dirty = true;
+  }
+  if (state.translateEnabled && (!state.ocrEnabled || state.ocrLang !== "ja")) {
+    state.translateEnabled = false;
+    translateModeChanged = true;
+    dirty = true;
+  }
   if (dirty) {
-    if (ocrBoxesChanged || ocrLangChanged) resetReaderPipelines();
+    if (ocrBoxesChanged || ocrLangChanged || translateModeChanged) resetReaderPipelines();
+    saveReaderPrefs();
     applyReaderPrefs();
     syncReaderControls();
-    redrawReaderOverlays();
+    syncReaderPageControls();
+    if (readerFitChanged) {
+      if (state.view === "reader") {
+        window.requestAnimationFrame(() => {
+          scrollToStreamIndex(Math.max(0, currentIndexBeforeLayout), "auto");
+          setupStreamObserver();
+          updateReaderProgress();
+          redrawReaderOverlays();
+        });
+      }
+    } else {
+      restoreReaderAnchor(readerAnchor);
+      window.requestAnimationFrame(redrawReaderOverlays);
+    }
+    if (state.view === "reader" && conserveImagesChanged && !readerFitChanged) {
+      setupStreamObserver();
+    }
     if (state.ocrEnabled) {
       if (ocrLangChanged) {
         // 识别语言变了,清掉旧结果重新识别
@@ -4371,14 +3912,29 @@ listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
       removeAllOcrOverlays();
       removeAllTranslateOverlays();
     }
+    if (translateModeChanged) {
+      if (state.translateEnabled && state.ocrEnabled && state.ocrLang === "ja") {
+        removeAllOcrOverlays();
+        queueOcrWindow(currentStreamIndex());
+      } else {
+        removeAllTranslateOverlays();
+        translatePending.clear();
+        if (state.ocrEnabled) renderStreamOcrOverlay(currentStreamIndex());
+      }
+      updateTranslateBadges();
+    }
   }
 }).catch((err) => console.error("listen(reader-prefs-changed) failed:", err));
 
 window.addEventListener("resize", () => {
-  if (state.ocrEnabled && state.lightboxIndex >= 0) {
-    renderLightboxOcrOverlay();
-  }
-  redrawReaderOverlays();
+  const pagedIndex = state.view === "reader" && state.readerFit !== "width"
+    ? Math.max(0, streamIndexHint)
+    : -1;
+  applyReaderZoomLayout();
+  window.requestAnimationFrame(() => {
+    if (pagedIndex >= 0) scrollToStreamIndex(pagedIndex, "auto");
+    redrawReaderOverlays();
+  });
 });
 
 const initialAid = getInitialAlbumFromHash();

@@ -14,14 +14,19 @@ wnacg 的品牌方向参考 mimi 的资产组织方式：固定角色母图、�
 ## 文件
 
 - `kiri-master.png`：角色徽章母图，后续角色生成的唯一视觉参考。
-- `kiri-app-icon-source.png`：桌面应用图标源图。
-- `kiri-fullbody.png`：完整阅读姿势展示图。
-- `kiri-translating.png`：翻译中状态展示图。
-- `kiri-companion.png`：透明底的黑兔漫画伙伴，可用于加载、完成和空状态。
+- `kiri-app-icon-source.png`：带圆形透明边缘的桌面应用图标源图。
 - `../../../public/brand/kiri-icon-128.png`：界面和 favicon 使用的小图。
 - `../../../public/brand/kiri-icon-256.png`：README 使用的中图。
-- `../../../src-tauri/icons/kiri/`：Tauri、macOS、Windows、iOS 和 Android 的平台派生图标。
+- `../../../src-tauri/icons/kiri/`：Tauri 桌面版所需的 PNG、macOS ICNS 与 Windows ICO 派生图标。
 
 ## 生成方法
 
-母图使用 OpenAI ImageGen 的生成模式建立；其余角色图使用母图作为图像参考，再通过生成或编辑模式派生。核心提示词固定角色特征、黑白中性调、淡紫色小面积点缀、漫画阅读动作、无文字、无渐变；每次只改变构图或状态。产品字标由界面排版完成，不让图像模型生成文字。
+母图使用 OpenAI ImageGen 的生成模式建立；应用图标使用母图作为图像参考派生。核心提示词固定角色特征、黑白中性调、淡紫色小面积点缀、漫画阅读动作、无文字、无渐变。产品字标由界面排版完成，不让图像模型生成文字。
+
+从仓库根目录重新生成桌面图标：
+
+```bash
+npm run tauri -- icon docs/brand/kiri/kiri-app-icon-source.png --output src-tauri/icons/kiri
+```
+
+命令会同时生成移动端和商店占位图；本项目只保留 `tauri.conf.json` 引用的桌面 PNG、ICNS 与 ICO 文件。

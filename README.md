@@ -8,20 +8,10 @@
 
 > 18+。仓库仅提供源码，不包含第三方内容或安装包。
 
-## 截图
-
-![作品列表](docs/images/wnacg-library-masked.jpg)
-
-![连续阅读](docs/images/wnacg-reader-masked.jpg)
-
-![翻译前](docs/images/wnacg-translate-before.jpg)
-
-![翻译后](docs/images/wnacg-translate-after.jpg)
-
 ## 功能
 
 - 分类、关键词、标签搜索，封面默认模糊
-- 连续阅读、全屏、缩放、多窗口，自动保存阅读位置
+- 连续、单页与双页阅读，支持左右翻页、全屏、缩放和多窗口
 - 本地 OCR：Apple Vision + `comic-text-detector` + `manga-ocr`
 - DeepSeek 漫画翻译：支持竖排日文、气泡内排版与预翻译
 
