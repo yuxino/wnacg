@@ -73,6 +73,12 @@ type ListSnapshot = {
   status: string;
 };
 
+type PersistentListEntry = {
+  page: number;
+  albums: Album[];
+  savedAt: number;
+};
+
 type ReaderWidth = "comfort" | "wide" | "edge";
 type ReaderGap = "relaxed" | "compact";
 type ReaderTheme = "warm" | "dark";
@@ -91,6 +97,37 @@ type ReaderPrefs = {
 };
 
 const readerPrefKey = "wnacg.readerPrefs.v1";
+const persistentListCacheKey = "wnacg.listCache.v1";
+const persistentListMaxAge = 24 * 60 * 60 * 1000;
+
+function readPersistentList(contextKey: string, page: number): Album[] | null {
+  try {
+    const raw = localStorage.getItem(persistentListCacheKey);
+    if (!raw) return null;
+    const entries = JSON.parse(raw) as Record<string, PersistentListEntry>;
+    const entry = entries[contextKey];
+    if (!entry || entry.page !== page || Date.now() - entry.savedAt > persistentListMaxAge) return null;
+    return Array.isArray(entry.albums) && entry.albums.length > 0 ? entry.albums : null;
+  } catch {
+    return null;
+  }
+}
+
+function writePersistentList(contextKey: string, page: number, albums: Album[]) {
+  if (albums.length === 0) return;
+  try {
+    const raw = localStorage.getItem(persistentListCacheKey);
+    const entries = raw ? JSON.parse(raw) as Record<string, PersistentListEntry> : {};
+    entries[contextKey] = { page, albums: albums.slice(0, 60), savedAt: Date.now() };
+    const newest = Object.entries(entries)
+      .sort((a, b) => b[1].savedAt - a[1].savedAt)
+      .slice(0, 8);
+    localStorage.setItem(persistentListCacheKey, JSON.stringify(Object.fromEntries(newest)));
+  } catch {
+    // A stale-while-revalidate cache is opportunistic; storage limits must not
+    // interfere with browsing.
+  }
+}
 
 const defaultReaderPrefs: ReaderPrefs = {
   width: "comfort",
@@ -193,7 +230,11 @@ const state = {
   imageUrls: {} as Record<number, string>,
 };
 
-const preloadInFlight = new Set<number>();
+// Every consumer shares the same full-image request for a page. This avoids the
+// reader, lightbox and translation prefetch downloading the same image in
+// parallel.
+const preloadInFlight = new Map<number, Promise<PreloadResult>>();
+const ocrByteCacheUrls = new Set<string>();
 
 type OcrRegion = {
   text: string;
@@ -707,28 +748,25 @@ function updateReaderPrefs(next: Partial<ReaderPrefs>) {
   }
   if (previousOcr !== state.ocrEnabled) {
     ocrEnableToken++; // OCR 开关变了,作废还在初始化中的“开启”请求
+    resetReaderPipelines();
     if (state.ocrEnabled) {
       ocrPrefetchLoadedPages();
     } else {
       removeAllOcrOverlays();
       removeAllTranslateOverlays();
-      ocrPendingIndices.clear();
-      ocrTextPending.clear();
       state.translateTexts = {};
+      state.translateFailed = {};
     }
   }
   if (previousOcrLang !== state.ocrLang) {
     // 识别语言变了,清掉旧结果重新识别
+    resetReaderPipelines();
     state.ocrRegions = {};
     state.ocrFailed = {};
-    ocrPendingIndices.clear();
-    ocrTextPending.clear();
-    ocrTextDone.clear();
     removeAllOcrOverlays();
     removeAllTranslateOverlays();
     state.translateTexts = {};
-    translatePending.clear();
-    translateDone.clear();
+    state.translateFailed = {};
     if (state.ocrEnabled) ocrPrefetchLoadedPages();
   }
   if (previousTranslate !== state.translateEnabled) {
@@ -784,6 +822,7 @@ function toggleReaderPreload() {
 const OCR_BATCH = 4;
 const ocrPendingIndices = new Set<number>();
 let ocrBatchRunning = false;
+let readerPipelineEpoch = 0;
 // OCR 开关竞态令牌:引擎初始化期间开关被再次切换时,用来取消过期的“开启”请求
 let ocrEnableToken = 0;
 // 文字框红框仅调试用:默认不画,正常用户无感知;调试时实时开关并记忆
@@ -810,8 +849,10 @@ function setOcrBoxDebug(value: boolean) {
   }
 }
 const ocrTextPending = new Set<number>();
+const ocrTextInFlight = new Set<number>();
 const ocrTextDone = new Set<number>();
-let ocrTextBatchRunning = false;
+let ocrTextWorkers = 0;
+const OCR_TEXT_CONCURRENCY = 2;
 let ocrMangaInitTried = false;
 
 function ocrLanguages(): string[] {
@@ -840,10 +881,18 @@ function isNearPage(index: number): boolean {
   return index >= current - 1 && index <= current + 3;
 }
 
+function ocrWindowOrder(index: number): number[] {
+  // Perceived speed matters most: current page first, then what the reader is
+  // about to see. The previous page is only a low-priority safety net.
+  return [index, index + 1, index + 2, index + 3, index - 1]
+    .filter((page, offset, pages) => (
+      page >= 0 && page < state.photos.length && pages.indexOf(page) === offset
+    ));
+}
+
 function queueOcrWindow(index: number) {
   // 翻译开启:当前页前后窗口全部预识别+预翻译;关闭:只补当前页文字
-  for (let i = index - 1; i <= index + 3; i++) {
-    if (i < 0 || i >= state.photos.length) continue;
+  for (const i of ocrWindowOrder(index)) {
     if (state.translateEnabled) {
       queueOcrText(i);
       queueTranslate(i);
@@ -923,6 +972,12 @@ function getOcrSources(index: number): { imageUrl: string | null; dataUrl: strin
 function queueOcr(index: number) {
   if (!state.ocrEnabled) return;
   if (index < 0 || index >= state.photos.length) return;
+  if (state.translateEnabled && state.ocrLang === "ja") {
+    // Translation needs recognized text, so a detection-only pass would be
+    // thrown away immediately. Go straight to the full single pass.
+    queueOcrText(index);
+    return;
+  }
   if (state.ocrRegions[index] !== undefined || state.ocrFailed[index]) return;
   if (ocrPendingIndices.has(index)) return;
   if (!getOcrSources(index)) return; // 图片还没就绪,等加载后再触发
@@ -947,22 +1002,31 @@ async function pumpOcrQueue() {
 
   ocrBatchRunning = true;
   const token = state.readerToken;
+  const aid = state.currentAlbum?.aid;
+  const epoch = readerPipelineEpoch;
   try {
     const results = await invokeTauri<OcrPageResult[]>("ocr_pages", {
       pages: items.map((item) => ({
         index: item.index,
         imageUrl: item.imageUrl,
-        dataUrl: item.dataUrl,
+        dataUrl: item.imageUrl && ocrByteCacheUrls.has(item.imageUrl) ? null : item.dataUrl,
         languages: ocrLanguages(),
         engine: ocrEngine(),
         withText: false,
       })),
     });
+    if (token !== state.readerToken || aid !== state.currentAlbum?.aid || epoch !== readerPipelineEpoch || state.view !== "reader") return;
     for (const result of results) {
       ocrPendingIndices.delete(result.index);
       if (result.error) {
-        // 图片尚未就绪导致的失败是暂时的,等图片加载后会自动重新入队
-        if (!result.error.includes("等待")) {
+        if (result.error.includes("等待")) {
+          // Rust's byte cache is bounded and may evict a page while the reader
+          // still owns its data URL. Forget the optimistic marker and retry
+          // once through IPC with the bytes we already have locally.
+          const item = items.find((candidate) => candidate.index === result.index);
+          if (item?.imageUrl) ocrByteCacheUrls.delete(item.imageUrl);
+          if (item?.dataUrl) ocrPendingIndices.add(result.index);
+        } else {
           state.ocrFailed[result.index] = result.error;
         }
       } else {
@@ -989,6 +1053,7 @@ async function pumpOcrQueue() {
       }
     }
   } catch (error) {
+    if (token !== state.readerToken || aid !== state.currentAlbum?.aid || epoch !== readerPipelineEpoch || state.view !== "reader") return;
     const message = error instanceof Error ? error.message : String(error);
     for (const item of items) {
       ocrPendingIndices.delete(item.index);
@@ -996,8 +1061,9 @@ async function pumpOcrQueue() {
     }
     showToast(`OCR 失败：${message}`, "error", 4200);
   } finally {
+    if (token !== state.readerToken || aid !== state.currentAlbum?.aid || epoch !== readerPipelineEpoch) return;
     ocrBatchRunning = false;
-    if (state.ocrEnabled && token === state.readerToken && state.view === "reader") {
+    if (state.ocrEnabled && state.view === "reader") {
       window.setTimeout(() => pumpOcrQueue(), 0);
     }
   }
@@ -1007,89 +1073,117 @@ async function pumpOcrQueue() {
 function queueOcrText(index: number) {
   if (!state.ocrEnabled || state.ocrLang !== "ja") return;
   if (index < 0 || index >= state.photos.length) return;
-  if (state.ocrRegions[index] === undefined || state.ocrFailed[index]) return;
-  if (ocrTextDone.has(index) || ocrTextPending.has(index)) return;
+  if (!state.translateEnabled && state.ocrRegions[index] === undefined) return;
+  if (state.ocrFailed[index]) return;
+  if (ocrTextDone.has(index) || ocrTextPending.has(index) || ocrTextInFlight.has(index)) return;
+  if (!getOcrSources(index)) return;
   ocrTextPending.add(index);
   pumpOcrTextQueue();
 }
 
-async function pumpOcrTextQueue() {
-  if (ocrTextBatchRunning || !state.ocrEnabled || state.ocrLang !== "ja") return;
-
-  const items: Array<{ index: number; imageUrl: string | null; dataUrl: string | null }> = [];
+function nextOcrTextIndex(): number | null {
+  const center = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+  const preferred = center >= 0 ? ocrWindowOrder(center) : [];
+  for (const index of preferred) {
+    if (ocrTextPending.has(index) && getOcrSources(index)) return index;
+  }
   for (const index of ocrTextPending) {
-    const sources = getOcrSources(index);
-    if (!sources) continue;
-    items.push({ index, imageUrl: sources.imageUrl, dataUrl: sources.dataUrl });
-    if (items.length >= 4) break;
+    if (getOcrSources(index)) return index;
   }
-  if (items.length === 0) {
-    ocrTextPending.clear();
-    return;
-  }
+  return null;
+}
 
-  ocrTextBatchRunning = true;
-  const token = state.readerToken;
-  try {
-    const results = await invokeTauri<OcrPageResult[]>("ocr_pages", {
-      pages: items.map((item) => ({
-        index: item.index,
-        imageUrl: item.imageUrl,
-        dataUrl: item.dataUrl,
+function pumpOcrTextQueue() {
+  if (!state.ocrEnabled || state.ocrLang !== "ja") return;
+  while (ocrTextWorkers < OCR_TEXT_CONCURRENCY) {
+    const index = nextOcrTextIndex();
+    if (index === null) return;
+    const sources = getOcrSources(index);
+    if (!sources) {
+      ocrTextPending.delete(index);
+      continue;
+    }
+    ocrTextPending.delete(index);
+    ocrTextInFlight.add(index);
+    ocrTextWorkers++;
+    const token = state.readerToken;
+    const aid = state.currentAlbum?.aid;
+    const epoch = readerPipelineEpoch;
+    void invokeTauri<OcrPageResult[]>("ocr_pages", {
+      pages: [{
+        index,
+        imageUrl: sources.imageUrl,
+        // Rust uses its byte cache whenever imageUrl is present. Avoid sending
+        // the multi-megabyte data URL through IPC in that common path.
+        dataUrl: sources.imageUrl && ocrByteCacheUrls.has(sources.imageUrl) ? null : sources.dataUrl,
         languages: ocrLanguages(),
         engine: "manga",
         withText: true,
-      })),
-    });
-    for (const result of results) {
-      ocrTextPending.delete(result.index);
+      }],
+    }).then((results) => {
+      if (token !== state.readerToken || aid !== state.currentAlbum?.aid || epoch !== readerPipelineEpoch || state.view !== "reader") return;
+      const result = results[0];
+      if (!result) throw new Error("OCR 返回为空");
       if (result.error) {
-        if (!result.error.includes("等待")) {
-          ocrTextDone.add(result.index);
+        if (result.error.includes("等待")) {
+          if (sources.imageUrl) ocrByteCacheUrls.delete(sources.imageUrl);
+          if (sources.dataUrl) ocrTextPending.add(index);
+        } else {
+          state.ocrFailed[index] = result.error;
         }
-      } else if (result.regions.length > 0) {
-        state.ocrRegions[result.index] = result.regions;
-        ocrTextDone.add(result.index);
-      } else {
-        ocrTextDone.add(result.index);
+        return;
       }
-    }
-    if (token === state.readerToken && state.view === "reader") {
-      for (const result of results) {
-        renderStreamOcrOverlay(result.index);
-        if (state.translateEnabled) {
-          renderTranslateBadge(result.index);
-          if (result.index === state.lightboxIndex) renderLightboxTranslateBadge();
-        }
-        if (state.translateEnabled && isNearPage(result.index)) {
-          queueTranslate(result.index);
+      state.ocrRegions[index] = result.regions;
+      ocrTextDone.add(index);
+      renderStreamOcrOverlay(index);
+      if (state.translateEnabled) {
+        renderTranslateBadge(index);
+        queueTranslate(index);
+        if (index === state.lightboxIndex) {
+          renderLightboxOcrOverlay();
+          renderLightboxTranslateBadge();
         }
       }
-      if (results.some((result) => result.index === state.lightboxIndex)) {
-        renderLightboxOcrOverlay();
-        if (state.translateEnabled) queueTranslate(state.lightboxIndex);
+    }).catch((error) => {
+      if (token !== state.readerToken || aid !== state.currentAlbum?.aid || epoch !== readerPipelineEpoch || state.view !== "reader") return;
+      const message = error instanceof Error ? error.message : String(error);
+      state.ocrFailed[index] = message;
+      showToast(`文字识别失败：${message}`, "error", 4200);
+    }).finally(() => {
+      if (token === state.readerToken && aid === state.currentAlbum?.aid && epoch === readerPipelineEpoch) {
+        ocrTextInFlight.delete(index);
+        ocrTextWorkers = Math.max(0, ocrTextWorkers - 1);
+        if (state.ocrEnabled && state.ocrLang === "ja") pumpOcrTextQueue();
       }
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    for (const item of items) {
-      ocrTextPending.delete(item.index);
-      ocrTextDone.add(item.index);
-    }
-    showToast(`文字识别失败：${message}`, "error", 4200);
-  } finally {
-    ocrTextBatchRunning = false;
-    if (state.ocrEnabled && state.ocrLang === "ja") {
-      window.setTimeout(() => pumpOcrTextQueue(), 0);
-    }
+    });
   }
 }
 
 // ---- 翻译字幕:遮住原文 + DeepSeek 翻译 ----
 
 const translatePending = new Set<number>();
+const translateInFlight = new Set<number>();
 const translateDone = new Set<number>();
-let translateBatchRunning = false;
+let translateWorkers = 0;
+const TRANSLATE_CONCURRENCY = 3;
+
+function resetReaderPipelines(clearPreloads = false) {
+  readerPipelineEpoch++;
+  ocrPendingIndices.clear();
+  ocrBatchRunning = false;
+  ocrTextPending.clear();
+  ocrTextInFlight.clear();
+  ocrTextDone.clear();
+  ocrTextWorkers = 0;
+  translatePending.clear();
+  translateInFlight.clear();
+  translateDone.clear();
+  translateWorkers = 0;
+  if (clearPreloads) {
+    preloadInFlight.clear();
+    ocrByteCacheUrls.clear();
+  }
+}
 
 async function toggleReaderTranslate(force?: boolean) {
   const next = force ?? !state.translateEnabled;
@@ -1102,9 +1196,6 @@ async function toggleReaderTranslate(force?: boolean) {
     updateReaderPrefs({ ocrLang: "ja" });
   }
   updateReaderPrefs({ translateMode: true });
-  if (!state.ocrEnabled) {
-    void toggleReaderOcr(true);
-  }
   const target = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
   queueOcrWindow(target);
 }
@@ -1120,7 +1211,7 @@ function queueTranslate(index: number) {
     renderTranslateOverlay(index);
     return;
   }
-  if (translateDone.has(index) || translatePending.has(index)) return;
+  if (translateDone.has(index) || translatePending.has(index) || translateInFlight.has(index)) return;
   if (!ocrTextDone.has(index)) {
     // 文字识别还没补跑完,先补文字,完成后会再次触发翻译
     queueOcrText(index);
@@ -1138,71 +1229,55 @@ function queueTranslate(index: number) {
   pumpTranslateQueue();
 }
 
-async function pumpTranslateQueue() {
-  if (translateBatchRunning || !state.translateEnabled || state.ocrLang !== "ja") return;
+function nextTranslateIndex(): number | null {
+  const center = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+  const preferred = center >= 0 ? ocrWindowOrder(center) : [];
+  for (const index of preferred) {
+    if (translatePending.has(index)) return index;
+  }
+  return translatePending.values().next().value ?? null;
+}
 
-  const items: number[] = [];
-  for (const index of translatePending) {
-    if (state.ocrFailed[index]) continue;
+function pumpTranslateQueue() {
+  if (!state.translateEnabled || state.ocrLang !== "ja") return;
+  while (translateWorkers < TRANSLATE_CONCURRENCY) {
+    const index = nextTranslateIndex();
+    if (index === null) return;
+    translatePending.delete(index);
     const regions = state.ocrRegions[index];
-    if (!regions || regions.length === 0) continue;
+    if (state.ocrFailed[index] || !regions || regions.length === 0) continue;
     if (!ocrTextDone.has(index)) {
-      translatePending.delete(index);
       queueOcrText(index);
       continue;
     }
-    items.push(index);
-    if (items.length >= 3) break;
-  }
-  if (items.length === 0) {
-    translatePending.clear();
-    return;
-  }
-
-  translateBatchRunning = true;
-  const token = state.readerToken;
-  try {
-    // 多页并行翻译,哪页先返回先画哪页,不等最慢的一页
-    const jobs = items.map(async (index) => {
-      try {
-        const regions = state.ocrRegions[index] ?? [];
-        const texts = regions.map((r) => r.text);
-        const translated = await invokeTauri<string[]>("translate_dialogue", { texts });
-        translatePending.delete(index);
-        translateDone.add(index);
-        if (translated.length === texts.length) {
-          state.translateTexts[index] = translated;
-        }
-        if (token === state.readerToken) {
-          renderTranslateOverlay(index);
-          if (index === state.lightboxIndex) renderLightboxTranslateOverlay();
-        }
-        renderTranslateBadge(index);
-        if (index === state.lightboxIndex) renderLightboxTranslateBadge();
-        return { ok: true as const, message: "" };
-      } catch (error) {
-        translatePending.delete(index);
-        const message = error instanceof Error ? error.message : String(error);
-        state.translateFailed[index] = message;
-        renderTranslateBadge(index);
-        if (index === state.lightboxIndex) renderLightboxTranslateBadge();
-        return { ok: false as const, message };
+    const texts = regions.map((region) => region.text);
+    const token = state.readerToken;
+    const aid = state.currentAlbum?.aid;
+    const epoch = readerPipelineEpoch;
+    translateInFlight.add(index);
+    translateWorkers++;
+    void invokeTauri<string[]>("translate_dialogue", { texts }).then((translated) => {
+      if (token !== state.readerToken || aid !== state.currentAlbum?.aid || epoch !== readerPipelineEpoch || state.view !== "reader") return;
+      translateDone.add(index);
+      if (translated.length === texts.length) state.translateTexts[index] = translated;
+      renderTranslateOverlay(index);
+      if (index === state.lightboxIndex) renderLightboxTranslateOverlay();
+      renderTranslateBadge(index);
+      if (index === state.lightboxIndex) renderLightboxTranslateBadge();
+    }).catch((error) => {
+      if (token !== state.readerToken || aid !== state.currentAlbum?.aid || epoch !== readerPipelineEpoch || state.view !== "reader") return;
+      const message = error instanceof Error ? error.message : String(error);
+      state.translateFailed[index] = message;
+      renderTranslateBadge(index);
+      if (index === state.lightboxIndex) renderLightboxTranslateBadge();
+      showToast(`翻译失败：${message}`, "error", 4800);
+    }).finally(() => {
+      if (token === state.readerToken && aid === state.currentAlbum?.aid && epoch === readerPipelineEpoch) {
+        translateInFlight.delete(index);
+        translateWorkers = Math.max(0, translateWorkers - 1);
+        pumpTranslateQueue();
       }
     });
-    const settled = await Promise.all(jobs);
-    for (const outcome of settled) {
-      if (!outcome.ok) {
-        showToast(`翻译失败：${outcome.message}`, "error", 4800);
-      }
-    }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    showToast(`翻译失败：${message}`, "error", 4800);
-  } finally {
-    translateBatchRunning = false;
-    if (state.translateEnabled && state.ocrLang === "ja") {
-      window.setTimeout(() => pumpTranslateQueue(), 0);
-    }
   }
 }
 
@@ -1220,7 +1295,9 @@ function renderTranslateOverlay(index: number) {
 
   const canvas = document.createElement("canvas");
   canvas.className = "stream-translate-overlay";
-  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  // Stream pages can keep several overlays alive; 1.5x is crisp on Retina
+  // while using 44% less canvas memory than 2x.
+  const dpr = Math.min(1.5, window.devicePixelRatio || 1);
   const w = img.offsetWidth;
   const h = img.offsetHeight;
   if (w < 4 || h < 4) return;
@@ -1232,8 +1309,8 @@ function renderTranslateOverlay(index: number) {
   canvas.style.height = `${h}px`;
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
+  const sampler = ensureSampleCanvas(img);
   ctx.scale(dpr, dpr);
-  ctx.drawImage(img, 0, 0, w, h);
   for (let i = 0; i < regions.length; i++) {
     const region = regions[i];
     const translated = texts[i]?.trim();
@@ -1243,7 +1320,7 @@ function renderTranslateOverlay(index: number) {
     const rw = region.w * w;
     const rh = region.h * h;
     if (rw < 4 || rh < 4) continue;
-    drawCoverAndText(ctx, img, x, y, rw, rh, translated);
+    drawCoverAndText(ctx, sampler, x, y, rw, rh, translated);
   }
   container.append(canvas);
   attachTranslateTooltip(canvas, regions);
@@ -1272,8 +1349,8 @@ function renderLightboxTranslateOverlay() {
   canvas.style.height = `${img.offsetHeight}px`;
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
+  const sampler = ensureSampleCanvas(img);
   ctx.scale(dpr, dpr);
-  ctx.drawImage(img, 0, 0, img.offsetWidth, img.offsetHeight);
   for (let i = 0; i < regions.length; i++) {
     const region = regions[i];
     const translated = texts[i]?.trim();
@@ -1283,7 +1360,7 @@ function renderLightboxTranslateOverlay() {
     const w = region.w * img.offsetWidth;
     const h = region.h * img.offsetHeight;
     if (w < 4 || h < 4) continue;
-    drawCoverAndText(ctx, img, x, y, w, h, translated);
+    drawCoverAndText(ctx, sampler, x, y, w, h, translated);
   }
   wrap.append(canvas);
   attachTranslateTooltip(canvas, regions);
@@ -1292,7 +1369,7 @@ function renderLightboxTranslateOverlay() {
 
 function drawCoverAndText(
   ctx: CanvasRenderingContext2D,
-  img: HTMLImageElement,
+  sampler: ImageSampler,
   x: number,
   y: number,
   w: number,
@@ -1300,10 +1377,10 @@ function drawCoverAndText(
   text: string,
 ) {
   text = normalizeCjkText(text);
-  const fill = sampleBoxColor(img, x, y, w, h);
+  const fill = sampleBoxColor(sampler, x, y, w, h);
   const [fr, fg, fb] = parseRgb(fill);
   const fillLuminance = 0.299 * fr + 0.587 * fg + 0.114 * fb;
-  const textColor = resolveTextColor(img, x, y, w, h, fillLuminance);
+  const textColor = resolveTextColor(sampler, x, y, w, h, fillLuminance);
   ctx.save();
   ctx.fillStyle = fill;
   ctx.beginPath();
@@ -1340,14 +1417,14 @@ function drawCoverAndText(
 }
 
 function resolveTextColor(
-  img: HTMLImageElement,
+  sampler: ImageSampler,
   x: number,
   y: number,
   w: number,
   h: number,
   fillLuminance: number,
 ): { color: string; luminance: number } {
-  const sampled = sampleTextColor(img, x, y, w, h, fillLuminance);
+  const sampled = sampleTextColor(sampler, x, y, w, h, fillLuminance);
   const base = sampled ?? (fillLuminance > 150 ? "#1c1c1c" : "#ffffff");
   const [tr, tg, tb] = parseRgb(base);
   let luminance = 0.299 * tr + 0.587 * tg + 0.114 * tb;
@@ -1383,8 +1460,15 @@ const MANGA_FONT_FAMILY =
 const SAMPLE_MAX_DIM = 1200;
 let sampleCanvas: HTMLCanvasElement | null = null;
 
-function sampleBoxColor(img: HTMLImageElement, x: number, y: number, w: number, h: number): string {
-  const { sample, ctx, scaleX, scaleY } = ensureSampleCanvas(img);
+type ImageSampler = {
+  sample: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D | null;
+  scaleX: number;
+  scaleY: number;
+};
+
+function sampleBoxColor(sampler: ImageSampler, x: number, y: number, w: number, h: number): string {
+  const { sample, ctx, scaleX, scaleY } = sampler;
   if (!ctx) return "#ffffff";
   // 采样点放在框外一圈:取最亮(色值最大)的采样点,白色气泡就得到纯白
   const pad = Math.max(3, Math.min(10, w * 0.08, h * 0.08));
@@ -1413,14 +1497,14 @@ function sampleBoxColor(img: HTMLImageElement, x: number, y: number, w: number, 
 
 // 在原图区域内统计"笔墨"颜色(与底色差异大的像素),取多数一方的平均色
 function sampleTextColor(
-  img: HTMLImageElement,
+  sampler: ImageSampler,
   x: number,
   y: number,
   w: number,
   h: number,
   fillLuminance: number,
 ): string | null {
-  const { sample, ctx, scaleX, scaleY } = ensureSampleCanvas(img);
+  const { sample, ctx, scaleX, scaleY } = sampler;
   if (!ctx) return null;
   const sx0 = Math.max(0, Math.round(x * scaleX));
   const sy0 = Math.max(0, Math.round(y * scaleY));
@@ -1433,43 +1517,61 @@ function sampleTextColor(
   } catch {
     return null;
   }
-  const darkPixels: Array<{ lum: number; r: number; g: number; b: number }> = [];
-  const lightPixels: Array<{ lum: number; r: number; g: number; b: number }> = [];
-  for (let i = 0; i < data.length; i += 4) {
-    const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-    if (Math.abs(lum - fillLuminance) < 30) continue; // 背景像素跳过
-    if (lum < fillLuminance) {
-      darkPixels.push({ lum, r: data[i], g: data[i + 1], b: data[i + 2] });
-    } else {
-      lightPixels.push({ lum, r: data[i], g: data[i + 1], b: data[i + 2] });
+  type ColorBin = { count: number; r: number; g: number; b: number };
+  const bins: ColorBin[] = Array.from({ length: 16 }, () => ({ count: 0, r: 0, g: 0, b: 0 }));
+  const regionWidth = Math.min(sw, sample.width - sx0);
+  const regionHeight = Math.min(sh, sample.height - sy0);
+  // Cap work per region. Manga balloons have broad flat areas, so a sparse
+  // regular sample is both faster and more stable than sorting every pixel.
+  const step = Math.max(1, Math.floor(Math.sqrt((regionWidth * regionHeight) / 2400)));
+  let darkCount = 0;
+  let lightCount = 0;
+  for (let py = 0; py < regionHeight; py += step) {
+    for (let px = 0; px < regionWidth; px += step) {
+      const i = (py * regionWidth + px) * 4;
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+      const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+      if (Math.abs(lum - fillLuminance) < 30) continue;
+      const bin = bins[Math.min(15, Math.floor(lum / 16))];
+      bin.count++;
+      bin.r += r;
+      bin.g += g;
+      bin.b += b;
+      if (lum < fillLuminance) darkCount++;
+      else lightCount++;
     }
   }
-  const total = darkPixels.length + lightPixels.length;
-  if (total < 30) return null; // 区域内基本没有文字像素
-  const average = (pixels: Array<{ lum: number; r: number; g: number; b: number }>, takeDarkest: boolean) => {
-    pixels.sort((a, b) => (takeDarkest ? a.lum - b.lum : b.lum - a.lum));
-    const take = Math.max(8, Math.floor(pixels.length * 0.1));
-    const picked = pixels.slice(0, take);
-    const r = picked.reduce((s, p) => s + p.r, 0) / picked.length;
-    const g = picked.reduce((s, p) => s + p.g, 0) / picked.length;
-    const b = picked.reduce((s, p) => s + p.b, 0) / picked.length;
-    return `rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`;
+  const total = darkCount + lightCount;
+  if (total < 12) return null;
+  const averageExtreme = (takeDarkest: boolean, population: number) => {
+    const target = Math.max(4, Math.ceil(population * 0.12));
+    let count = 0;
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    for (let offset = 0; offset < bins.length && count < target; offset++) {
+      const bin = bins[takeDarkest ? offset : bins.length - 1 - offset];
+      if (bin.count === 0) continue;
+      count += bin.count;
+      r += bin.r;
+      g += bin.g;
+      b += bin.b;
+    }
+    if (count === 0) return null;
+    return `rgb(${Math.round(r / count)},${Math.round(g / count)},${Math.round(b / count)})`;
   };
-  if (darkPixels.length >= lightPixels.length && darkPixels.length >= total * 0.3) {
-    return average(darkPixels, true); // 取最暗一簇,贴近真实墨色
+  if (darkCount >= lightCount && darkCount >= total * 0.3) {
+    return averageExtreme(true, darkCount); // 取最暗一簇,贴近真实墨色
   }
-  if (lightPixels.length > darkPixels.length && lightPixels.length >= total * 0.3) {
-    return average(lightPixels, false); // 取最亮一簇(白字/亮字)
+  if (lightCount > darkCount && lightCount >= total * 0.3) {
+    return averageExtreme(false, lightCount); // 取最亮一簇(白字/亮字)
   }
   return null;
 }
 
-function ensureSampleCanvas(img: HTMLImageElement): {
-  sample: HTMLCanvasElement;
-  ctx: CanvasRenderingContext2D | null;
-  scaleX: number;
-  scaleY: number;
-} {
+function ensureSampleCanvas(img: HTMLImageElement): ImageSampler {
   if (!sampleCanvas) {
     sampleCanvas = document.createElement("canvas");
   }
@@ -1477,8 +1579,8 @@ function ensureSampleCanvas(img: HTMLImageElement): {
   const scale = Math.min(1, SAMPLE_MAX_DIM / Math.max(img.naturalWidth, img.naturalHeight));
   sample.width = Math.max(1, Math.round(img.naturalWidth * scale));
   sample.height = Math.max(1, Math.round(img.naturalHeight * scale));
-  sample.getContext("2d")?.drawImage(img, 0, 0, sample.width, sample.height);
   const ctx = sample.getContext("2d", { willReadFrequently: true });
+  ctx?.drawImage(img, 0, 0, sample.width, sample.height);
   const scaleX = sample.width / (img.offsetWidth || img.naturalWidth);
   const scaleY = sample.height / (img.offsetHeight || img.naturalHeight);
   return { sample, ctx, scaleX, scaleY };
@@ -1628,10 +1730,24 @@ const VERT_ROTATE = new Set([
 ]);
 
 function removeAllTranslateOverlays() {
-  document.querySelectorAll<HTMLElement>(
+  document.querySelectorAll<HTMLCanvasElement>(
     ".stream-translate-overlay, .lightbox-translate-overlay",
-  ).forEach((el) => el.remove());
+  ).forEach((canvas) => {
+    canvas.width = 0;
+    canvas.height = 0;
+    canvas.remove();
+  });
   hideTranslateTooltip();
+}
+
+function pruneTranslateOverlays(center: number) {
+  document.querySelectorAll<HTMLCanvasElement>(".stream-translate-overlay").forEach((canvas) => {
+    const page = Number(canvas.closest<HTMLElement>(".stream-photo")?.dataset.index);
+    if (Number.isFinite(page) && Math.abs(page - center) <= 2) return;
+    canvas.width = 0;
+    canvas.height = 0;
+    canvas.remove();
+  });
 }
 
 // ---- 翻译状态徽标:让用户感知"正在翻译" ----
@@ -1761,6 +1877,11 @@ function attachTranslateTooltip(
 
 function ocrPrefetchLoadedPages() {
   if (!state.ocrEnabled) return;
+  if (state.translateEnabled && state.ocrLang === "ja") {
+    const current = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
+    if (current >= 0) queueOcrWindow(current);
+    return;
+  }
   document.querySelectorAll<HTMLElement>(".stream-photo[data-state='loaded']").forEach((el) => {
     const index = parseInt(el.dataset.index || "", 10);
     if (!Number.isNaN(index)) queueOcr(index);
@@ -1837,9 +1958,19 @@ function removeAllOcrOverlays() {
 
 // 重画当前已加载页面的译文/调试红框(整页模式切换、窗口尺寸变化时对齐会变)
 function redrawReaderOverlays() {
+  const center = state.lightboxIndex >= 0 ? state.lightboxIndex : currentStreamIndex();
   document.querySelectorAll<HTMLElement>(".stream-photo[data-state='loaded']").forEach((el) => {
     const index = parseInt(el.dataset.index || "", 10);
     if (Number.isNaN(index)) return;
+    if (center >= 0 && Math.abs(index - center) > 2) {
+      const canvas = el.querySelector<HTMLCanvasElement>(".stream-translate-overlay");
+      if (canvas) {
+        canvas.width = 0;
+        canvas.height = 0;
+        canvas.remove();
+      }
+      return;
+    }
     if (state.translateEnabled && state.translateTexts[index]) {
       renderTranslateOverlay(index);
     }
@@ -1857,14 +1988,14 @@ function updateReaderProgress() {
   const active = state.view === "reader" && state.lightboxIndex < 0;
   readerProgress.hidden = !active;
   if (!active) {
-    readerProgressFill.style.width = "0%";
+    readerProgressFill.style.transform = "scaleX(0)";
     readerProgress.removeAttribute("title");
     lastReportedStreamIndex = -1;
     return;
   }
   const maxScroll = Math.max(1, resultGrid.scrollHeight - resultGrid.clientHeight);
   const percent = Math.max(0, Math.min(100, (resultGrid.scrollTop / maxScroll) * 100));
-  readerProgressFill.style.width = `${percent}%`;
+  readerProgressFill.style.transform = `scaleX(${percent / 100})`;
 
   const total = state.photos.length;
   if (total > 0) {
@@ -1875,6 +2006,7 @@ function updateReaderProgress() {
         lastReportedStreamIndex = current;
         setSoftStatus(`正在阅读 ${current + 1} / ${total}`);
         queueOcrWindow(current);
+        pruneTranslateOverlays(current);
       }
     }
   } else {
@@ -1884,16 +2016,20 @@ function updateReaderProgress() {
 }
 
 let lastReportedStreamIndex = -1;
+let streamIndexHint = 0;
 
 function currentStreamIndex() {
   const photos = document.querySelectorAll<HTMLElement>(".stream-photo");
   if (photos.length === 0) return -1;
-  const probe = resultGrid.getBoundingClientRect().top + resultGrid.clientHeight * 0.35;
-  for (let i = 0; i < photos.length; i++) {
-    const rect = photos[i].getBoundingClientRect();
-    if (rect.bottom >= probe) return i;
-  }
-  return photos.length - 1;
+  // Both resultGrid and the photos currently share .workspace as offsetParent.
+  // Anchor to the scroller itself so a wrapping tag bar before the first page
+  // cannot shift page detection.
+  const probe = resultGrid.offsetTop + resultGrid.scrollTop + resultGrid.clientHeight * 0.35;
+  let index = Math.max(0, Math.min(photos.length - 1, streamIndexHint));
+  while (index < photos.length - 1 && photos[index].offsetTop + photos[index].offsetHeight < probe) index++;
+  while (index > 0 && photos[index - 1].offsetTop + photos[index - 1].offsetHeight >= probe) index--;
+  streamIndexHint = index;
+  return index;
 }
 
 function scrollToStreamIndex(index: number, behavior: ScrollBehavior = "smooth") {
@@ -2105,7 +2241,10 @@ async function loadDisplayImageDataUrl(
   const referer = state.photos[index]?.url;
   try {
     return {
-      url: await fetchImageDataUrlWithProgress(imageUrl, referer, requestId, onProgress),
+      url: await fetchImageDataUrlWithProgress(imageUrl, referer, requestId, onProgress).then((dataUrl) => {
+        ocrByteCacheUrls.add(imageUrl);
+        return dataUrl;
+      }),
       viaFallback: false,
       imageUrl,
     };
@@ -2156,45 +2295,45 @@ async function resolvePhotoImageUrlUntilSuccess(
 async function preloadFullImage(index: number, readerToken = state.readerToken): Promise<PreloadResult> {
   if (index < 0 || index >= state.photos.length) return "failed";
   if (state.preloadedUrls[index]) return "cached";
-  if (preloadInFlight.has(index)) return "failed";
-  preloadInFlight.add(index);
+  const existing = preloadInFlight.get(index);
+  if (existing) return existing;
 
-  try {
-    const imageUrl = await resolvePhotoImageUrlWithRetry(index, 2);
-    state.imageUrls[index] = imageUrl;
-    if (readerToken !== state.readerToken || state.view !== "reader") {
-      preloadInFlight.delete(index);
-      return "failed";
-    }
-    const image = await invokeTauri<ImageData>("fetch_image_data_url", {
-      url: imageUrl,
-      referer: state.photos[index]?.url ?? null,
-    });
-    if (readerToken !== state.readerToken || state.view !== "reader") {
-      preloadInFlight.delete(index);
-      return "failed";
-    }
-    state.preloadedUrls[index] = image.dataUrl;
-    delete state.preloadFailures[index];
-    preloadImage(image.dataUrl);
-    if (state.translateEnabled && isNearPage(index)) {
-      queueOcr(index); // 预取的图就绪后立即开识别
-    }
-    preloadInFlight.delete(index);
-    return "loaded";
-  } catch {
-    preloadInFlight.delete(index);
-    if (readerToken !== state.readerToken || state.view !== "reader") return "failed";
-    state.preloadFailures[index] = (state.preloadFailures[index] ?? 0) + 1;
-    if (state.preloadFailures[index] > 3) return "failed";
-    const nextDelay = Math.min(30_000, state.preloadFailures[index] * 5_000);
-    window.setTimeout(() => {
-      if (readerToken === state.readerToken && state.view === "reader" && !state.preloadedUrls[index]) {
-        preloadFullImage(index, readerToken);
+  let task!: Promise<PreloadResult>;
+  task = (async () => {
+    try {
+      const imageUrl = state.imageUrls[index] ?? await resolvePhotoImageUrlWithRetry(index, 2);
+      if (readerToken !== state.readerToken || state.view !== "reader") return "failed";
+      state.imageUrls[index] = imageUrl;
+      const image = await invokeTauri<ImageData>("fetch_image_data_url", {
+        url: imageUrl,
+        referer: state.photos[index]?.url ?? null,
+      });
+      if (readerToken !== state.readerToken || state.view !== "reader") return "failed";
+      ocrByteCacheUrls.add(imageUrl);
+      state.preloadedUrls[index] = image.dataUrl;
+      delete state.preloadFailures[index];
+      preloadImage(image.dataUrl);
+      if (state.translateEnabled && isNearPage(index)) {
+        queueOcrText(index); // 直接做带文字的单遍 OCR，避免先找框再重复检测
       }
-    }, nextDelay);
-    return "failed";
-  }
+      return "loaded";
+    } catch {
+      if (readerToken !== state.readerToken || state.view !== "reader") return "failed";
+      state.preloadFailures[index] = (state.preloadFailures[index] ?? 0) + 1;
+      if (state.preloadFailures[index] > 3) return "failed";
+      const nextDelay = Math.min(30_000, state.preloadFailures[index] * 5_000);
+      window.setTimeout(() => {
+        if (readerToken === state.readerToken && state.view === "reader" && !state.preloadedUrls[index]) {
+          void preloadFullImage(index, readerToken);
+        }
+      }, nextDelay);
+      return "failed";
+    } finally {
+      if (preloadInFlight.get(index) === task) preloadInFlight.delete(index);
+    }
+  })();
+  preloadInFlight.set(index, task);
+  return task;
 }
 
 function albumSubtitle(album: Album) {
@@ -2615,8 +2754,9 @@ function renderAlbumCard(album: Album): HTMLElement {
   if (album.cover) {
     const img = document.createElement("img");
     img.alt = "";
-    hydrateImage(img, album.cover, album.url);
     img.loading = "lazy";
+    img.decoding = "async";
+    hydrateImage(img, album.cover, album.url);
     cover.append(img);
   } else {
     cover.textContent = "No Cover";
@@ -2808,6 +2948,13 @@ async function loadAlbums() {
   renderCategories();
   syncToolbar();
   showListLoading();
+  const cachedAlbums = readPersistentList(contextKey, page);
+  const showingCache = Boolean(cachedAlbums?.length);
+  if (cachedAlbums) {
+    state.albums = cachedAlbums;
+    renderAlbums(cachedAlbums);
+    setStatus(`已立即显示 ${cachedAlbums.length} 项 · 正在刷新`);
+  }
 
   try {
     const albums = await fetchAlbums(page, contextKey);
@@ -2824,11 +2971,17 @@ async function loadAlbums() {
       translateVisibleTitles();
       resultGrid.scrollTop = 0;
       saveListSnapshot();
+      writePersistentList(contextKey, page, albums);
     }
     setStatus(`第 ${state.page} 页 · 共 ${albums.length} 项`);
   } catch (error) {
     if (token !== state.listToken || state.view !== "list" || contextKey !== listContextKey()) return;
     const message = error instanceof Error ? error.message : String(error);
+    if (showingCache) {
+      setStatus(`已显示缓存 · 刷新失败`);
+      showToast(`后台刷新失败：${message}`, "error", 3600);
+      return;
+    }
     showError(message, () => loadAlbums());
     setStatus("载入失败");
     showToast(`加载失败：${message}`, "error", 3600);
@@ -2930,6 +3083,8 @@ function teardownReaderObserver() {
 
 function renderReaderGrid(tags = state.tags) {
   teardownReaderObserver();
+  streamIndexHint = 0;
+  lastReportedStreamIndex = -1;
   resultGrid.className = "reader-stream";
   resultGrid.scrollTop = 0;
 
@@ -3030,44 +3185,86 @@ async function loadStreamImage(container: HTMLElement) {
   container.replaceChildren(createProgressIndicator(null, true));
 
   try {
-    const requestId = `stream-${token}-${index}-${Date.now()}`;
-    const image = await loadDisplayImageDataUrl(index, requestId, (progress) => {
-      if (token !== state.readerToken || container.dataset.state !== "loading") return;
-      container.replaceChildren(createProgressIndicator(progress, true));
-    });
+    // Enter the same shared preload path used by translation/OCR. Whichever
+    // consumer arrives first owns the single download; the rest await it.
+    if (!state.preloadedUrls[index]) await preloadFullImage(index, token);
+    // Multiple consumers can wake from the same failed preload. Re-check the
+    // shared slot before creating a foreground fallback so only the first
+    // continuation becomes the new owner.
+    while (!state.preloadedUrls[index]) {
+      const competingLoad = preloadInFlight.get(index);
+      if (!competingLoad) break;
+      await competingLoad;
+      if (token !== state.readerToken || state.view !== "reader") return;
+    }
+    let image: DisplayImageResult;
+    if (state.preloadedUrls[index]) {
+      image = {
+        url: state.preloadedUrls[index],
+        viaFallback: !state.preloadedUrls[index].startsWith("data:"),
+        imageUrl: state.imageUrls[index] ?? "",
+      };
+    } else {
+      const requestId = `stream-${token}-${index}-${Date.now()}`;
+      let loadedImage: DisplayImageResult | null = null;
+      let loadError: unknown = null;
+      let foregroundTask!: Promise<PreloadResult>;
+      foregroundTask = (async () => {
+        try {
+          loadedImage = await loadDisplayImageDataUrl(index, requestId, (progress) => {
+            if (token !== state.readerToken || container.dataset.state !== "loading") return;
+            container.replaceChildren(createProgressIndicator(progress, true));
+          });
+          if (token !== state.readerToken || state.view !== "reader") return "failed";
+          state.preloadedUrls[index] = loadedImage.url;
+          if (loadedImage.imageUrl) state.imageUrls[index] = loadedImage.imageUrl;
+          delete state.preloadFailures[index];
+          return "loaded";
+        } catch (error) {
+          loadError = error;
+          return "failed";
+        } finally {
+          if (preloadInFlight.get(index) === foregroundTask) preloadInFlight.delete(index);
+        }
+      })();
+      // Register the visible fallback in the same map. Scheduled retries,
+      // lightbox opens and OCR prefetches now await this download instead of
+      // starting a second one on slow connections.
+      preloadInFlight.set(index, foregroundTask);
+      await foregroundTask;
+      if (loadError) throw loadError;
+      if (!loadedImage) throw new Error("图片加载已取消");
+      image = loadedImage;
+    }
     if (token !== state.readerToken || container.dataset.state !== "loading") return;
+    state.preloadedUrls[index] = image.url;
+    if (image.imageUrl) state.imageUrls[index] = image.imageUrl;
 
     const img = document.createElement("img");
     img.className = "stream-img";
     img.alt = state.photos[index]?.title || `#${index + 1}`;
+    img.decoding = "async";
     img.addEventListener("load", () => {
       if (token !== state.readerToken) return;
       container.dataset.state = "loaded";
       container.replaceChildren(img);
       setSoftStatus(`已加载 ${index + 1} / ${state.photos.length}`);
       if (state.ocrEnabled) {
-        queueOcr(index);
-        queueOcr(index - 1);
-        queueOcr(index + 1);
+        if (state.translateEnabled) queueOcrWindow(index);
+        else {
+          queueOcr(index);
+          queueOcr(index - 1);
+          queueOcr(index + 1);
+        }
       }
-      // OCR 结果可能已缓存(比如预载阶段就识别完了),等淡入动画结束再画框,避免错位
-      if (state.ocrRegions[index] !== undefined) {
-        window.setTimeout(() => {
-          if (token === state.readerToken && container.dataset.state === "loaded") {
-            renderStreamOcrOverlay(index);
-          }
-        }, 450);
-      }
-      if (state.translateEnabled && state.translateTexts[index] !== undefined) {
-        window.setTimeout(() => {
-          if (token === state.readerToken && container.dataset.state === "loaded") {
-            renderTranslateOverlay(index);
-          }
-        }, 450);
-      }
-      if (state.translateEnabled) {
-        window.setTimeout(() => renderTranslateBadge(index), 450);
-      }
+      // Dimensions are stable on the next paint; fixed 450ms waits made cached
+      // translations feel slow for no correctness benefit.
+      window.requestAnimationFrame(() => {
+        if (token !== state.readerToken || container.dataset.state !== "loaded") return;
+        if (state.ocrRegions[index] !== undefined) renderStreamOcrOverlay(index);
+        if (state.translateEnabled && state.translateTexts[index] !== undefined) renderTranslateOverlay(index);
+        if (state.translateEnabled) renderTranslateBadge(index);
+      });
     }, { once: true });
     img.addEventListener("error", () => {
       if (token !== state.readerToken) return;
@@ -3114,6 +3311,7 @@ function renderStreamError(container: HTMLElement, index: number, message: strin
 async function loadAlbumReader(aid: string, title: string) {
   if (state.view === "list") saveListSnapshot();
   const token = ++state.readerToken;
+  resetReaderPipelines(true);
   state.listToken++;
   state.view = "reader";
   const standalone = shell.classList.contains("standalone-album");
@@ -3126,8 +3324,9 @@ async function loadAlbumReader(aid: string, title: string) {
   state.preloadFailures = {};
   state.ocrRegions = {};
   state.ocrFailed = {};
+  state.translateTexts = {};
+  state.translateFailed = {};
   state.imageUrls = {};
-  ocrPendingIndices.clear();
   syncToolbar();
   if (standalone) {
     showStandaloneSkeleton(aid);
@@ -3168,6 +3367,7 @@ function backToList(options: { restore?: boolean } = {}) {
   }
   const restore = options.restore ?? true;
   state.readerToken++;
+  resetReaderPipelines(true);
   state.lightboxToken++;
   state.view = "list";
   state.currentAlbum = null;
@@ -3182,11 +3382,13 @@ function backToList(options: { restore?: boolean } = {}) {
   state.lightboxPanning = false;
   state.retryNotice = "";
   state.lightboxProgress = null;
+  state.preloadedUrls = {};
   state.preloadFailures = {};
   state.ocrRegions = {};
   state.ocrFailed = {};
+  state.translateTexts = {};
+  state.translateFailed = {};
   state.imageUrls = {};
-  ocrPendingIndices.clear();
   document.querySelector(".lightbox")?.remove();
   teardownReaderObserver();
   resultGrid.className = "result-grid";
@@ -3423,6 +3625,9 @@ async function openLightbox(index: number) {
   queueOcrWindow(index);
   updateTranslateBadges();
 
+  const pendingPreload = preloadInFlight.get(index);
+  if (!state.preloadedUrls[index] && pendingPreload) await pendingPreload;
+  if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
   // use preloaded URL if available
   if (state.preloadedUrls[index]) {
     state.lightboxImageUrl = state.preloadedUrls[index];
@@ -3441,39 +3646,77 @@ async function loadCurrentPhoto(index: number, token = ++state.lightboxToken) {
   state.retryNotice = "";
   renderLightbox();
 
-  let imageUrl: string;
-  try {
-    const rawImageUrl = await resolvePhotoImageUrlUntilSuccess(
-      index,
-      () => token === state.lightboxToken && state.lightboxIndex === index,
-      (attempt, error, delayMs) => {
-        if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
-        const message = error instanceof Error ? error.message : String(error);
-        state.retryNotice = `加载失败，自动重试第 ${attempt} 次，${Math.ceil(delayMs / 1000)} 秒后继续`;
-        renderLightbox();
-        setStatus(`${state.retryNotice}: ${message}`);
-      },
-    );
-    state.imageUrls[index] = rawImageUrl;
+  // A stream fallback may have claimed the shared slot immediately after the
+  // original preload failed. Await it before creating a lightbox fallback.
+  while (!state.preloadedUrls[index]) {
+    const competingLoad = preloadInFlight.get(index);
+    if (!competingLoad) break;
+    await competingLoad;
     if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
-    const requestId = `lightbox-${token}-${index}-${Date.now()}`;
+  }
+  const sharedUrl = state.preloadedUrls[index];
+  if (sharedUrl) {
+    state.lightboxImageUrl = sharedUrl;
+    state.lightboxProgress = null;
+    state.retryNotice = "";
+    renderLightbox();
+    preloadNeighbors(index);
+    return;
+  }
+
+  let imageUrl: string | null = null;
+  let loadFailed = false;
+  let lightboxTask!: Promise<PreloadResult>;
+  lightboxTask = (async () => {
     try {
-      imageUrl = await fetchImageDataUrlWithProgress(
-        rawImageUrl,
-        state.photos[index]?.url,
-        requestId,
-        (progress) => {
+      const rawImageUrl = await resolvePhotoImageUrlUntilSuccess(
+        index,
+        () => token === state.lightboxToken && state.lightboxIndex === index,
+        (attempt, error, delayMs) => {
           if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
-          state.lightboxProgress = progress;
+          const message = error instanceof Error ? error.message : String(error);
+          state.retryNotice = `加载失败，自动重试第 ${attempt} 次，${Math.ceil(delayMs / 1000)} 秒后继续`;
           renderLightbox();
+          setStatus(`${state.retryNotice}: ${message}`);
         },
       );
-    } catch (error) {
-      console.warn("Image proxy failed, falling back to direct URL", error);
-      setSoftStatus("图片线路较慢，正在尝试备用显示");
-      imageUrl = rawImageUrl;
+      state.imageUrls[index] = rawImageUrl;
+      if (token !== state.lightboxToken || state.lightboxIndex !== index) return "failed";
+      const requestId = `lightbox-${token}-${index}-${Date.now()}`;
+      try {
+        imageUrl = await fetchImageDataUrlWithProgress(
+          rawImageUrl,
+          state.photos[index]?.url,
+          requestId,
+          (progress) => {
+            if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
+            state.lightboxProgress = progress;
+            renderLightbox();
+          },
+        );
+        ocrByteCacheUrls.add(rawImageUrl);
+      } catch (error) {
+        console.warn("Image proxy failed, falling back to direct URL", error);
+        setSoftStatus("图片线路较慢，正在尝试备用显示");
+        imageUrl = rawImageUrl;
+      }
+      if (token !== state.lightboxToken || state.lightboxIndex !== index || !imageUrl) return "failed";
+      state.preloadedUrls[index] = imageUrl;
+      delete state.preloadFailures[index];
+      return "loaded";
+    } catch {
+      loadFailed = true;
+      return "failed";
+    } finally {
+      if (preloadInFlight.get(index) === lightboxTask) preloadInFlight.delete(index);
     }
-  } catch {
+  })();
+  // The lightbox is a full-image consumer too. Register it so background
+  // retries and the stream reader share this exact request on slow networks.
+  preloadInFlight.set(index, lightboxTask);
+  await lightboxTask;
+
+  if (loadFailed || !imageUrl) {
     if (token === state.lightboxToken && state.lightboxIndex === index) {
       state.lightboxProgress = null;
       state.lightboxImageUrl = "__error__";
@@ -3485,8 +3728,6 @@ async function loadCurrentPhoto(index: number, token = ++state.lightboxToken) {
 
   if (token !== state.lightboxToken || state.lightboxIndex !== index) return;
   state.lightboxImageUrl = imageUrl;
-  state.preloadedUrls[index] = imageUrl;
-  delete state.preloadFailures[index];
   state.retryNotice = "";
   state.lightboxProgress = null;
   if (!state.conserveImages) preloadImage(imageUrl);
@@ -3549,24 +3790,24 @@ function navigateLightbox(delta: number) {
 
 function bindLightboxImageLoad(img: HTMLImageElement) {
   img.addEventListener("load", () => {
+    const index = state.lightboxIndex;
     applyLightboxZoomAndPan();
     if (state.ocrEnabled) {
-      queueOcr(state.lightboxIndex);
-      queueOcr(state.lightboxIndex - 1);
-      queueOcr(state.lightboxIndex + 1);
-      if (state.ocrRegions[state.lightboxIndex] !== undefined) {
-        // 结果已缓存时等淡入动画结束再画,避免短暂错位
-        window.setTimeout(renderLightboxOcrOverlay, 650);
-      } else {
-        renderLightboxOcrOverlay();
+      if (state.translateEnabled) queueOcrWindow(index);
+      else {
+        queueOcr(index);
+        queueOcr(index - 1);
+        queueOcr(index + 1);
       }
     }
     if (state.translateEnabled) {
-      queueTranslate(state.lightboxIndex);
-      if (state.translateTexts[state.lightboxIndex]) {
-        window.setTimeout(renderLightboxTranslateOverlay, 650);
-      }
+      queueTranslate(index);
     }
+    window.requestAnimationFrame(() => {
+      if (index !== state.lightboxIndex) return;
+      renderLightboxOcrOverlay();
+      if (state.translateEnabled && state.translateTexts[index]) renderLightboxTranslateOverlay();
+    });
   }, { once: true });
 }
 
@@ -4006,15 +4247,20 @@ jumpTopButton.addEventListener("click", () => {
   resultGrid.scrollTo({ top: 0, behavior: "smooth" });
 });
 
+let resultScrollFrame = 0;
 resultGrid.addEventListener(
   "scroll",
   () => {
-    updateJumpTopButton();
-    updateReaderProgress();
     const snapshot = state.listSnapshots[listContextKey()];
     if (state.view === "list" && snapshot) {
       snapshot.scrollTop = resultGrid.scrollTop;
     }
+    if (resultScrollFrame) return;
+    resultScrollFrame = window.requestAnimationFrame(() => {
+      resultScrollFrame = 0;
+      updateJumpTopButton();
+      updateReaderProgress();
+    });
   },
   { passive: true },
 );
@@ -4104,6 +4350,7 @@ listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
     dirty = true;
   }
   if (dirty) {
+    if (ocrBoxesChanged || ocrLangChanged) resetReaderPipelines();
     applyReaderPrefs();
     syncReaderControls();
     redrawReaderOverlays();
@@ -4112,15 +4359,17 @@ listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
         // 识别语言变了,清掉旧结果重新识别
         state.ocrRegions = {};
         state.ocrFailed = {};
-        ocrPendingIndices.clear();
+        state.translateTexts = {};
+        state.translateFailed = {};
         removeAllOcrOverlays();
+        removeAllTranslateOverlays();
       }
       if (ocrBoxesChanged || ocrLangChanged) {
         ocrPrefetchLoadedPages();
       }
     } else {
       removeAllOcrOverlays();
-      ocrPendingIndices.clear();
+      removeAllTranslateOverlays();
     }
   }
 }).catch((err) => console.error("listen(reader-prefs-changed) failed:", err));

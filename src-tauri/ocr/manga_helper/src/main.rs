@@ -12,7 +12,7 @@
 use base64::Engine;
 use image::imageops::FilterType;
 use ort::session::Session;
-use ort::value::Tensor as OrtTensor;
+use ort::value::{Tensor as OrtTensor, TensorRef};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -108,7 +108,11 @@ impl Detector {
         })
     }
 
-    fn detect(&mut self, img: &image::DynamicImage, confidence: f32) -> Result<Vec<DetBox>, String> {
+    fn infer_candidates(
+        &mut self,
+        img: &image::DynamicImage,
+        min_confidence: f32,
+    ) -> Result<Vec<DetBox>, String> {
         let (orig_w, orig_h) = (img.width() as f32, img.height() as f32);
         let w_ratio = orig_w / DET_SIZE as f32;
         let h_ratio = orig_h / DET_SIZE as f32;
@@ -127,10 +131,9 @@ impl Detector {
             }
         }
 
-        let tensor = OrtTensor::<f32>::from_array(
-            ([1usize, 3, DET_SIZE as usize, DET_SIZE as usize], data),
-        )
-        .map_err(|e| format!("detector input: {e}"))?;
+        let tensor =
+            OrtTensor::<f32>::from_array(([1usize, 3, DET_SIZE as usize, DET_SIZE as usize], data))
+                .map_err(|e| format!("detector input: {e}"))?;
         let outputs = self
             .session
             .run(ort::inputs!["images" => tensor])
@@ -145,7 +148,7 @@ impl Detector {
         for i in 0..n_rows {
             let off = i * stride;
             let conf = blk[off + 4];
-            if conf < confidence {
+            if conf < min_confidence {
                 continue;
             }
             let class = if blk[off + 6] > blk[off + 5] { 1 } else { 0 };
@@ -159,11 +162,22 @@ impl Detector {
             });
         }
 
+        Ok(raw)
+    }
+
+    fn postprocess(candidates: &[DetBox], confidence: f32) -> Vec<DetBox> {
         let mut kept = Vec::new();
         for class in 0..=1 {
-            let mut class_boxes: Vec<DetBox> =
-                raw.iter().filter(|b| b.class == class).cloned().collect();
-            class_boxes.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+            let mut class_boxes: Vec<DetBox> = candidates
+                .iter()
+                .filter(|box_| box_.class == class && box_.confidence >= confidence)
+                .cloned()
+                .collect();
+            class_boxes.sort_by(|a, b| {
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             for box_ in class_boxes {
                 if kept.iter().any(|k| iou(k, &box_) >= NMS_THRESHOLD) {
                     continue;
@@ -173,13 +187,12 @@ impl Detector {
         }
 
         kept.sort_by(|a, b| {
-            a.cy
-                .partial_cmp(&b.cy)
+            a.cy.partial_cmp(&b.cy)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.cx.partial_cmp(&b.cx).unwrap_or(std::cmp::Ordering::Equal))
         });
         kept.truncate(MAX_BOXES);
-        Ok(kept)
+        kept
     }
 }
 
@@ -213,8 +226,8 @@ struct MangaOcr {
 
 impl MangaOcr {
     fn new(models: &Path) -> Result<Self, String> {
-        let encoder = load_session(&models.join("encoder_model.onnx"), false)?;
-        let decoder = load_session(&models.join("decoder_model.onnx"), false)?;
+        let encoder = load_session(&models.join("encoder_model.onnx"), true)?;
+        let decoder = load_session(&models.join("decoder_model.onnx"), true)?;
         let vocab = std::fs::read_to_string(models.join("vocab.txt"))
             .map_err(|e| format!("无法读取词表: {e}"))?;
         Ok(Self {
@@ -234,17 +247,17 @@ impl MangaOcr {
             for y in 0..OCR_SIZE as usize {
                 for x in 0..OCR_SIZE as usize {
                     let p = gray.get_pixel(x as u32, y as u32);
-                    data[y * OCR_SIZE as usize + x] =
-                        (p[0] as f32 / 255.0 - 0.5) / 0.5;
+                    data[y * OCR_SIZE as usize + x] = (p[0] as f32 / 255.0 - 0.5) / 0.5;
                     data[(OCR_SIZE * OCR_SIZE) as usize + y * OCR_SIZE as usize + x] =
                         (p[1] as f32 / 255.0 - 0.5) / 0.5;
                     data[2 * (OCR_SIZE * OCR_SIZE) as usize + y * OCR_SIZE as usize + x] =
                         (p[2] as f32 / 255.0 - 0.5) / 0.5;
                 }
             }
-            let tensor = OrtTensor::<f32>::from_array(
-                ([1usize, 3, OCR_SIZE as usize, OCR_SIZE as usize], data),
-            )
+            let tensor = OrtTensor::<f32>::from_array((
+                [1usize, 3, OCR_SIZE as usize, OCR_SIZE as usize],
+                data,
+            ))
             .map_err(|e| format!("encoder input: {e}"))?;
             let mut enc = self
                 .encoder
@@ -269,11 +282,11 @@ impl MangaOcr {
             let out = dec
                 .run(ort::inputs![
                     "input_ids" =>
-                        OrtTensor::<i64>::from_array(([1usize, seq_len], ids.clone()))
+                        TensorRef::<i64>::from_array_view(([1usize, seq_len], ids.as_slice()))
                             .map_err(|e| format!("decoder input: {e}"))?,
                     "encoder_hidden_states" =>
-                        OrtTensor::<f32>::from_array(
-                            ([1usize, enc_seq_len, hidden_dim], enc_hidden.clone()),
+                        TensorRef::<f32>::from_array_view(
+                            ([1usize, enc_seq_len, hidden_dim], enc_hidden.as_slice()),
                         )
                         .map_err(|e| format!("decoder hidden: {e}"))?
                 ])
@@ -284,9 +297,10 @@ impl MangaOcr {
             let vocab_size = shape[2] as usize;
             let last_start = (seq_len - 1) * vocab_size;
             let last = &logits[last_start..last_start + vocab_size];
-            let lp = log_softmax(last);
-            let lp = apply_no_repeat_ngram(&ids, lp);
-            let token = argmax(&lp) as i64;
+            // Softmax is monotonic and cannot change argmax. Apply the
+            // no-repeat mask directly to logits and avoid exp/ln per token.
+            let masked_logits = apply_no_repeat_ngram(&ids, last.to_vec());
+            let token = argmax(&masked_logits) as i64;
             if token == EOS_TOKEN_ID {
                 break;
             }
@@ -311,28 +325,21 @@ impl MangaOcr {
     }
 }
 
-fn log_softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f32 = logits.iter().map(|&x| (x - max).exp()).sum();
-    let log_z = sum.ln() + max;
-    logits.iter().map(|&x| x - log_z).collect()
-}
-
-fn apply_no_repeat_ngram(ids: &[i64], mut log_probs: Vec<f32>) -> Vec<f32> {
+fn apply_no_repeat_ngram(ids: &[i64], mut scores: Vec<f32>) -> Vec<f32> {
     const N: usize = 3;
     if ids.len() < N - 1 || N < 2 {
-        return log_probs;
+        return scores;
     }
     let prefix = &ids[ids.len() - (N - 1)..];
     for i in 0..ids.len().saturating_sub(N - 1) {
         if &ids[i..i + N - 1] == prefix {
             let token = ids[i + N - 1] as usize;
-            if token < log_probs.len() {
-                log_probs[token] = f32::NEG_INFINITY;
+            if token < scores.len() {
+                scores[token] = f32::NEG_INFINITY;
             }
         }
     }
-    log_probs
+    scores
 }
 
 fn argmax(values: &[f32]) -> usize {
@@ -346,11 +353,7 @@ fn argmax(values: &[f32]) -> usize {
 
 // ── 主流程 ────────────────────────────────────────────────────────────────
 
-fn process(
-    detector: &mut Detector,
-    ocr: &Option<MangaOcr>,
-    req: &Request,
-) -> Response {
+fn process(detector: &mut Detector, ocr: &Option<MangaOcr>, req: &Request) -> Response {
     let bytes = match base64::engine::general_purpose::STANDARD.decode(&req.data) {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -373,9 +376,13 @@ fn process(
     };
     let (orig_w, orig_h) = (img.width() as f32, img.height() as f32);
 
-    let mut confidence = req.threshold.unwrap_or(DEFAULT_CONFIDENCE);
-    let mut boxes = match detector.detect(&img, confidence) {
-        Ok(boxes) => boxes,
+    let confidence = req.threshold.unwrap_or(DEFAULT_CONFIDENCE);
+    // Run the expensive detector once at the fallback threshold, then decide
+    // between the normal and low-confidence sets in memory. Previously sparse
+    // pages performed the full 1024px model inference twice.
+    let low_threshold = confidence.min(LOW_CONFIDENCE);
+    let candidates = match detector.infer_candidates(&img, low_threshold) {
+        Ok(candidates) => candidates,
         Err(err) => {
             return Response {
                 id: req.id,
@@ -384,12 +391,14 @@ fn process(
             }
         }
     };
-    if boxes.len() < 3 && confidence > LOW_CONFIDENCE {
-        confidence = LOW_CONFIDENCE;
-        if let Ok(retry) = detector.detect(&img, confidence) {
-            boxes = retry;
-        }
-    }
+    // Each threshold gets the exact same filtering, NMS, spatial ordering and
+    // truncation it had before; only the model inference is shared.
+    let normal_boxes = Detector::postprocess(&candidates, confidence);
+    let boxes = if normal_boxes.len() >= 3 || confidence <= LOW_CONFIDENCE {
+        normal_boxes
+    } else {
+        Detector::postprocess(&candidates, low_threshold)
+    };
 
     let mut regions: Vec<Region> = Vec::with_capacity(boxes.len());
     let text_count = if req.with_text {
@@ -408,12 +417,7 @@ fn process(
         let mut text = String::new();
         if i < text_count {
             if let Some(ocr) = ocr {
-                let crop = img.crop(
-                    x0 as u32,
-                    y0 as u32,
-                    (x1 - x0) as u32,
-                    (y1 - y0) as u32,
-                );
+                let crop = img.crop(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
                 if let Ok(recognized) = ocr.recognize(&crop) {
                     text = recognized.trim().to_string();
                 }

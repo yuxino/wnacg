@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use tauri::image::Image;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -102,6 +103,44 @@ struct ImageDownloadProgress {
     loaded: u64,
     total: Option<u64>,
     percent: Option<u8>,
+}
+
+const IMAGE_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(90);
+
+struct ImageProgressThrottle {
+    last_emitted_at: Instant,
+    last_loaded: u64,
+    last_percent: Option<u8>,
+}
+
+impl ImageProgressThrottle {
+    fn new(now: Instant, loaded: u64, percent: Option<u8>) -> Self {
+        Self {
+            last_emitted_at: now,
+            last_loaded: loaded,
+            last_percent: percent,
+        }
+    }
+
+    fn should_emit(&mut self, now: Instant, loaded: u64, percent: Option<u8>) -> bool {
+        // Completion is emitted exactly once after the stream finishes.
+        if percent == Some(100) || loaded == self.last_loaded {
+            return false;
+        }
+        if now.saturating_duration_since(self.last_emitted_at) < IMAGE_PROGRESS_EMIT_INTERVAL {
+            return false;
+        }
+        // With a known total, only repaint when the displayed integer percent changes.
+        // Without a total, elapsed bytes are the only useful progress signal.
+        if percent.is_some() && percent == self.last_percent {
+            return false;
+        }
+
+        self.last_emitted_at = now;
+        self.last_loaded = loaded;
+        self.last_percent = percent;
+        true
+    }
 }
 
 fn clean_url_value(value: &str) -> String {
@@ -724,12 +763,17 @@ async fn fetch_binary_with_progress(
     let mut loaded = 0_u64;
     let mut bytes = Vec::with_capacity(total.unwrap_or(0).min(30_000_000) as usize);
     let mut stream = response.bytes_stream();
-    let _ = app.emit("image-download-progress", ImageDownloadProgress {
-        request_id: request_id.clone(),
-        loaded,
-        total,
-        percent: total.map(|_| 0),
-    });
+    let initial_percent = total.filter(|total| *total > 0).map(|_| 0);
+    let _ = app.emit(
+        "image-download-progress",
+        ImageDownloadProgress {
+            request_id: request_id.clone(),
+            loaded,
+            total,
+            percent: initial_percent,
+        },
+    );
+    let mut progress_throttle = ImageProgressThrottle::new(Instant::now(), loaded, initial_percent);
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|err| format!("读取图片失败：{err}"))?;
@@ -738,24 +782,32 @@ async fn fetch_binary_with_progress(
         let percent = total
             .filter(|total| *total > 0)
             .map(|total| ((loaded.saturating_mul(100) / total).min(100)) as u8);
-        let _ = app.emit("image-download-progress", ImageDownloadProgress {
-            request_id: request_id.clone(),
-            loaded,
-            total,
-            percent,
-        });
+        if progress_throttle.should_emit(Instant::now(), loaded, percent) {
+            let _ = app.emit(
+                "image-download-progress",
+                ImageDownloadProgress {
+                    request_id: request_id.clone(),
+                    loaded,
+                    total,
+                    percent,
+                },
+            );
+        }
     }
 
     if bytes.is_empty() {
         return Err("图片内容为空".to_string());
     }
 
-    let _ = app.emit("image-download-progress", ImageDownloadProgress {
-        request_id,
-        loaded,
-        total,
-        percent: Some(100),
-    });
+    let _ = app.emit(
+        "image-download-progress",
+        ImageDownloadProgress {
+            request_id,
+            loaded,
+            total,
+            percent: Some(100),
+        },
+    );
 
     Ok((content_type, bytes))
 }
@@ -1193,4 +1245,39 @@ pub fn run() {
             }
             let _ = app;
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_progress_throttle_limits_fast_updates_and_duplicate_percentages() {
+        let start = Instant::now();
+        let mut throttle = ImageProgressThrottle::new(start, 0, Some(0));
+
+        assert!(!throttle.should_emit(start + Duration::from_millis(40), 100, Some(1)));
+        assert!(throttle.should_emit(start + Duration::from_millis(90), 200, Some(2)));
+        assert!(!throttle.should_emit(start + Duration::from_millis(180), 250, Some(2)));
+        assert!(throttle.should_emit(start + Duration::from_millis(180), 300, Some(3)));
+    }
+
+    #[test]
+    fn image_progress_throttle_updates_unknown_totals_on_the_interval() {
+        let start = Instant::now();
+        let mut throttle = ImageProgressThrottle::new(start, 0, None);
+
+        assert!(!throttle.should_emit(start + Duration::from_millis(89), 100, None));
+        assert!(throttle.should_emit(start + Duration::from_millis(90), 200, None));
+        assert!(!throttle.should_emit(start + Duration::from_millis(180), 200, None));
+        assert!(throttle.should_emit(start + Duration::from_millis(180), 300, None));
+    }
+
+    #[test]
+    fn image_progress_throttle_reserves_completion_for_the_final_event() {
+        let start = Instant::now();
+        let mut throttle = ImageProgressThrottle::new(start, 0, Some(0));
+
+        assert!(!throttle.should_emit(start + Duration::from_secs(1), 1_000, Some(100)));
+    }
 }

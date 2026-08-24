@@ -748,10 +748,12 @@ button:has(> .icon + span) {
 
 .reader-progress-fill {
   display: block;
-  width: 0%;
+  width: 100%;
   height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--accent-strong));
-  transition: width var(--motion-fast) ease;
+  background: var(--accent);
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform var(--motion-fast) ease;
 }
 
 .result-grid {
@@ -787,8 +789,7 @@ button:has(> .icon + span) {
   align-self: start;
   overflow: hidden;
   cursor: pointer;
-  animation: fadeSlideUp var(--motion-slow) var(--ease) both;
-  animation-delay: calc(var(--card-order, 0) * 30ms);
+  animation: fadeSlideUp 160ms var(--ease) both;
   transition:
     border-color var(--motion-fast) ease,
     transform var(--motion-fast) ease,
@@ -1456,7 +1457,7 @@ img:not(.image-loading):not(.image-error) {
 .stream-photo .stream-img {
   width: 100%;
   display: block;
-  animation: fadeSlideUp 0.4s var(--anim-easing);
+  animation: fadeSlideUp 120ms var(--anim-easing);
 }
 
 .stream-ocr-overlay {

@@ -1,6 +1,6 @@
 <div align="center">
   <br>
-  <img src="public/app-icon.png" width="112" alt="wnacg">
+  <img src="public/brand/kiri-icon-256.png" width="112" alt="wnacg">
   <h1>wnacg</h1>
   <p><a href="README.md">简体中文</a> · <strong>English</strong></p>
   <p>A cleaner desktop reader for wnacg, with local OCR and manga translation.</p>

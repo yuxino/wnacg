@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ const MANGA_HELPER_VERSION: &str = "v1";
 
 const MAX_VISION_POOL: usize = 3;
 const MAX_MANGA_POOL: usize = 2;
-const IMAGE_CACHE_CAP: usize = 120;
+const IMAGE_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
 
 // (文件名, 下载地址, 最小字节数, 用于校验下载是否完整)
 const MODEL_FILES: &[(&str, &str, u64)] = &[
@@ -111,34 +111,70 @@ struct Pool {
 
 static VISION_POOL: OnceLock<Mutex<Option<Pool>>> = OnceLock::new();
 static MANGA_POOL: OnceLock<Mutex<Option<Pool>>> = OnceLock::new();
-static IMAGE_CACHE: OnceLock<Mutex<HashMap<String, Arc<Vec<u8>>>>> = OnceLock::new();
+struct ImageByteCache {
+    entries: HashMap<String, Arc<Vec<u8>>>,
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
+impl ImageByteCache {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    fn insert(&mut self, url: String, bytes: Vec<u8>) {
+        if bytes.is_empty() || bytes.len() > IMAGE_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some(previous) = self.entries.remove(&url) {
+            self.bytes = self.bytes.saturating_sub(previous.len());
+            self.order.retain(|key| key != &url);
+        }
+        while self.bytes + bytes.len() > IMAGE_CACHE_MAX_BYTES {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some(removed) = self.entries.remove(&oldest) {
+                self.bytes = self.bytes.saturating_sub(removed.len());
+            }
+        }
+        self.bytes += bytes.len();
+        self.order.push_back(url.clone());
+        self.entries.insert(url, Arc::new(bytes));
+    }
+
+    fn get(&mut self, url: &str) -> Option<Arc<Vec<u8>>> {
+        let bytes = self.entries.get(url)?.clone();
+        self.order.retain(|key| key != url);
+        self.order.push_back(url.to_string());
+        Some(bytes)
+    }
+}
+
+static IMAGE_CACHE: OnceLock<Mutex<ImageByteCache>> = OnceLock::new();
 
 pub fn cache_image_bytes(url: &str, bytes: Vec<u8>) {
     if url.is_empty() || bytes.is_empty() {
         return;
     }
     let map = IMAGE_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
+        .get_or_init(|| Mutex::new(ImageByteCache::new()))
         .lock()
         .ok();
-    let Some(mut map) = map else {
+    let Some(mut cache) = map else {
         return;
     };
-    if !map.contains_key(url) && map.len() >= IMAGE_CACHE_CAP {
-        if let Some(key) = map.keys().next().cloned() {
-            map.remove(&key);
-        }
-    }
-    map.insert(url.to_string(), Arc::new(bytes));
+    cache.insert(url.to_string(), bytes);
 }
 
 fn cached_image_bytes(url: &str) -> Option<Arc<Vec<u8>>> {
     IMAGE_CACHE
-        .get_or_init(|| Mutex::new(HashMap::new()))
+        .get_or_init(|| Mutex::new(ImageByteCache::new()))
         .lock()
         .ok()?
         .get(url)
-        .cloned()
 }
 
 fn pool_for(engine: OcrEngine) -> &'static Mutex<Option<Pool>> {
