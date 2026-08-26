@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 type Album = {
   aid: string;
@@ -30,6 +32,15 @@ type ImageDownloadProgress = {
   total: number | null;
   percent: number | null;
 };
+
+type AppUpdateInfo = {
+  currentVersion: string;
+  latestVersion: string | null;
+  available: boolean;
+  releaseUrl: string;
+};
+
+type AppUpdateState = "idle" | "checking" | "current" | "available" | "error";
 
 type ProgressState = {
   loaded: number;
@@ -455,11 +466,165 @@ const readerSettingsPanel = document.createElement("div");
 readerSettingsPanel.className = "reader-settings-panel";
 readerSettingsPanel.hidden = true;
 readerSettingsPanel.setAttribute("role", "dialog");
+readerSettingsPanel.setAttribute("aria-label", "阅读设置");
 readerSettingsPanel.addEventListener("click", (event) => event.stopPropagation());
 
 readerSettings.append(readerSettingsButton, readerSettingsPanel);
 
 pagerControls.append(readerSettings);
+
+let currentAppVersion = "";
+let appUpdateInfo: AppUpdateInfo | null = null;
+let appUpdateState: AppUpdateState = "idle";
+let updateCheckInFlight: Promise<void> | null = null;
+
+function versionLabel(value: string) {
+  const normalized = value.trim().replace(/^[vV]/, "");
+  return normalized ? `v${normalized}` : "v—";
+}
+
+function applyAppUpdateInfo(info: AppUpdateInfo) {
+  appUpdateInfo = info;
+  currentAppVersion = info.currentVersion;
+  appUpdateState = info.available && info.latestVersion ? "available" : "current";
+  syncAppUpdateUi();
+}
+
+function isAppUpdateInfo(value: unknown): value is AppUpdateInfo {
+  if (!value || typeof value !== "object") return false;
+  const info = value as Partial<AppUpdateInfo>;
+  return typeof info.currentVersion === "string"
+    && (typeof info.latestVersion === "string" || info.latestVersion === null)
+    && typeof info.available === "boolean"
+    && typeof info.releaseUrl === "string";
+}
+
+function syncAppUpdateUi() {
+  const latestVersion = appUpdateInfo?.latestVersion;
+  const hasUpdate = appUpdateState === "available" && Boolean(latestVersion);
+  readerSettingsButton.classList.toggle("update-available", hasUpdate);
+  const settingsLabel = hasUpdate
+    ? `阅读设置，有新版本 ${versionLabel(latestVersion!)}`
+    : "阅读设置";
+  readerSettingsButton.title = settingsLabel;
+  readerSettingsButton.setAttribute("aria-label", settingsLabel);
+
+  const control = readerSettingsPanel.querySelector<HTMLElement>(".app-update-control");
+  if (!control) return;
+  const version = control.querySelector<HTMLElement>(".app-version");
+  const status = control.querySelector<HTMLElement>(".app-update-status");
+  const button = control.querySelector<HTMLButtonElement>(".app-update-button");
+  if (!version || !status || !button) return;
+
+  const displayedVersion = appUpdateInfo?.currentVersion || currentAppVersion;
+  version.textContent = versionLabel(displayedVersion);
+  button.disabled = appUpdateState === "checking";
+  button.classList.toggle("available", hasUpdate);
+  button.setAttribute("aria-busy", String(appUpdateState === "checking"));
+
+  switch (appUpdateState) {
+    case "checking":
+      status.textContent = "正在连接 GitHub";
+      button.textContent = "检查中…";
+      break;
+    case "current":
+      status.textContent = latestVersion ? "已是最新版" : "暂无可用更新";
+      button.textContent = "重新检查";
+      break;
+    case "available":
+      status.textContent = "发现新版本";
+      button.textContent = `查看 ${versionLabel(latestVersion || "")}`;
+      break;
+    case "error":
+      status.textContent = "检查失败";
+      button.textContent = "重新检查";
+      break;
+    default:
+      status.textContent = "可手动检查";
+      button.textContent = "检查更新";
+      break;
+  }
+  button.title = hasUpdate
+    ? `在浏览器查看 ${versionLabel(latestVersion || "")}`
+    : button.textContent || "检查更新";
+  button.setAttribute("aria-label", button.title);
+}
+
+function renderAppUpdateControl() {
+  const control = document.createElement("div");
+  control.className = "app-update-control";
+
+  const meta = document.createElement("div");
+  meta.className = "app-update-meta";
+  const version = document.createElement("span");
+  version.className = "app-version";
+  const status = document.createElement("span");
+  status.className = "app-update-status";
+  status.setAttribute("aria-live", "polite");
+  meta.append(version, status);
+
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "app-update-button";
+  button.addEventListener("click", () => {
+    if (appUpdateState === "available" && appUpdateInfo?.releaseUrl) {
+      openUrl(appUpdateInfo.releaseUrl).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        showToast(`无法打开下载页面：${message}`, "error", 4200);
+      });
+      return;
+    }
+    void checkForAppUpdate(true);
+  });
+
+  control.append(meta, button);
+  window.requestAnimationFrame(syncAppUpdateUi);
+  return control;
+}
+
+async function loadCurrentAppVersion() {
+  try {
+    currentAppVersion = await getVersion();
+    syncAppUpdateUi();
+  } catch {
+    // The version is also returned by the native update check. A failure here
+    // must not affect browsing when the page is opened outside Tauri.
+  }
+}
+
+function checkForAppUpdate(manual: boolean) {
+  if (updateCheckInFlight) return updateCheckInFlight;
+
+  appUpdateState = "checking";
+  syncAppUpdateUi();
+  updateCheckInFlight = (async () => {
+    try {
+      const info = await invokeTauri<AppUpdateInfo>("check_for_update");
+      applyAppUpdateInfo(info);
+      emit("app-update-checked", info).catch(() => {});
+
+      if (info.available && info.latestVersion) {
+        showToast(`发现新版本 ${versionLabel(info.latestVersion || "")}，可在设置中查看`, "info", 4200);
+      } else if (manual) {
+        const message = info.latestVersion
+          ? `当前 ${versionLabel(info.currentVersion)} 已是最新版`
+          : `当前 ${versionLabel(info.currentVersion)} 暂无可用更新`;
+        showToast(message, "success", 2800);
+      }
+    } catch (error) {
+      appUpdateState = "error";
+      syncAppUpdateUi();
+      if (manual) {
+        const message = error instanceof Error ? error.message : String(error);
+        showToast(`检查更新失败：${message}`, "error", 4800);
+      }
+    }
+  })().finally(() => {
+    updateCheckInFlight = null;
+  });
+
+  return updateCheckInFlight;
+}
 
 let deepseekKeyConfigured: boolean | null = null;
 
@@ -644,7 +809,7 @@ workspace.append(readerProgress);
 function buildReaderSettingsPanel() {
   type Segment<V> = { label: string; value: V; hint?: string };
 
-  const groups: Array<{ title: string; render: () => HTMLElement }> = [
+  const groups: Array<{ title: string; render: () => HTMLElement; className?: string }> = [
     {
       title: "阅读宽度",
       render: () => renderSegmented<ReaderWidth>(
@@ -738,6 +903,11 @@ function buildReaderSettingsPanel() {
       title: "DeepSeek",
       render: renderDeepseekKeyControl,
     },
+    {
+      title: "版本",
+      render: renderAppUpdateControl,
+      className: "settings-row-version",
+    },
   ];
 
   function renderSegmented<V>(
@@ -751,6 +921,7 @@ function buildReaderSettingsPanel() {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = seg.value === current ? "segmented-item active" : "segmented-item";
+      btn.setAttribute("aria-pressed", String(seg.value === current));
       btn.textContent = seg.label;
       if (seg.hint) {
         const hint = document.createElement("span");
@@ -770,6 +941,7 @@ function buildReaderSettingsPanel() {
     ...groups.map((group) => {
       const row = document.createElement("div");
       row.className = "settings-row";
+      if (group.className) row.classList.add(group.className);
       const label = document.createElement("span");
       label.className = "settings-label";
       label.textContent = group.title;
@@ -3778,6 +3950,20 @@ function preloadImage(url: string) {
 // ---- keyboard ----
 
 document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && readerSettingsOpen) {
+    e.preventDefault();
+    e.stopPropagation();
+    setReaderSettingsOpen(false);
+    readerSettingsButton.focus();
+    return;
+  }
+  if (e.key === "Escape" && readerInfoOpen) {
+    e.preventDefault();
+    e.stopPropagation();
+    setReaderInfoOpen(false);
+    readerInfoButton.focus();
+    return;
+  }
   if (e.key === "F11") {
     e.preventDefault();
     toggleFullscreen();
@@ -4169,12 +4355,22 @@ window.addEventListener("resize", () => {
 
 const initialAid = getInitialAlbumFromHash();
 void refreshDeepseekKeyStatus();
+void loadCurrentAppVersion();
+listen<AppUpdateInfo>("app-update-checked", (event) => {
+  if (isAppUpdateInfo(event.payload)) applyAppUpdateInfo(event.payload);
+}).then(() => {
+  if (initialAid) emit("request-app-update-info").catch(() => {});
+}).catch((err) => console.error("listen(app-update-checked) failed:", err));
 if (initialAid) {
   // 新窗口模式:隐藏 sidebar、跳过列表加载,直接进 reader
   shell.classList.add("standalone-album");
   loadAlbumReader(initialAid, "");
 } else {
   loadAlbums();
+  window.setTimeout(() => void checkForAppUpdate(false), 1400);
+  listen("request-app-update-info", () => {
+    if (appUpdateInfo) emit("app-update-checked", appUpdateInfo).catch(() => {});
+  }).catch((err) => console.error("listen(request-app-update-info) failed:", err));
   // 主窗口:监听子窗口发来的详情链接浏览请求
   listen<BrowseLinkRequest>("browse-link", (event) => {
     const request = event.payload;

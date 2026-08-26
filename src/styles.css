@@ -755,6 +755,83 @@ button:has(> .icon + span) {
   color: var(--text-secondary);
 }
 
+.settings-row-version {
+  margin-top: var(--space-1);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.app-update-control {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-width: 0;
+}
+
+.app-update-meta {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+  line-height: 1.25;
+}
+
+.app-version {
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.app-update-status {
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-update-button {
+  flex: 0 1 auto;
+  min-width: 0;
+  min-height: 30px;
+  height: 30px;
+  max-width: 132px;
+  padding: 0 var(--space-2);
+  overflow: hidden;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-raised);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-update-button.available,
+.app-update-button.available:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-weight: 700;
+}
+
+.reader-settings-trigger.update-available {
+  position: relative;
+}
+
+.reader-settings-trigger.update-available::after {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 6px;
+  height: 6px;
+  border: 1px solid var(--bg-overlay);
+  border-radius: 50%;
+  background: var(--accent);
+  content: "";
+}
+
 .reader-setting-button,
 .fullscreen-button,
 .back-button {
@@ -2001,6 +2078,17 @@ img:not(.image-loading):not(.image-error) {
     width: 100%;
     justify-content: flex-end;
     flex-wrap: wrap;
+  }
+
+  .reader-settings-panel {
+    position: fixed;
+    top: var(--space-3);
+    right: var(--space-3);
+    width: min(360px, calc(100vw - var(--space-5)));
+    min-width: 0;
+    max-height: calc(100vh - var(--space-5));
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
 
   .reader-setting-button {

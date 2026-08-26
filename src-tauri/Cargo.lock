@@ -5696,6 +5696,7 @@ dependencies = [
  "reqwest 0.12.28",
  "scraper",
  "security-framework",
+ "semver",
  "serde",
  "serde_json",
  "tauri",
