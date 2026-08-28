@@ -3,28 +3,28 @@
   <img src="src-tauri/icons/kiri/128x128@2x.png" width="112" alt="wnacg">
   <h1>wnacg</h1>
   <p><strong>简体中文</strong> · <a href="README.en.md">English</a></p>
-  <p>一个更舒服的 wnacg 桌面阅读器，带本地 OCR 与漫画翻译。</p>
+  <p>一个面向 WNACG 的桌面漫画阅读器，提供专注阅读、本地 OCR 与可选翻译；应用界面目前仅提供简体中文。</p>
 </div>
 
-> 18+。仓库和安装包不包含第三方漫画、图片内容或 OCR 模型权重。自动构建的安装包（如有）以 [Releases](https://github.com/yuxino/wnacg/releases) 为准；当前未做平台公证或商店签名。
+> 18+。仓库和安装包不包含第三方漫画、图片内容或 OCR 模型权重。请从 [Releases](https://github.com/yuxino/wnacg/releases) 下载 macOS Apple Silicon 或 Windows x64 安装包；暂未提供 Intel Mac 或 Linux 安装包。macOS 包只有 ad-hoc 签名且未经公证，Windows 包未做代码签名。
 
 ## 功能
 
-- 分类、关键词与标签搜索，封面加载完成后直接清晰展示
-- 连续、单页与双页阅读，支持左右翻页、全屏、缩放和多窗口
-- 本地 OCR：Apple Vision + `comic-text-detector` + `manga-ocr`
-- DeepSeek 漫画翻译：支持竖排日文、气泡内排版与预翻译
+- 按分类浏览和关键词搜索，并从作品信息继续浏览分类、作者（上传者）与标签
+- 连续、单页和双页阅读，支持键盘翻页、全屏、缩放和独立阅读窗口
+- 本地 OCR：中文优先使用 Apple Vision，日文优先使用 `comic-text-detector` 与 `manga-ocr`
+- 可选 DeepSeek 翻译：翻译识别出的日文对话与标题，并在图片上排版和预翻译
 
-基于 Tauri 2，界面使用 TypeScript，抓取与图片代理在 Rust 侧完成。
+基于 Tauri 2 构建。
 
 ## 本地运行
 
-需要 [Node.js](https://nodejs.org/)、[Rust](https://www.rust-lang.org/tools/install) 和 [Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/)。macOS 使用本地 OCR 时还需要 Xcode Command Line Tools。
+需要 [Node.js](https://nodejs.org/)、[Rust](https://www.rust-lang.org/tools/install) 和 [Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/)。
 
 ```bash
 git clone https://github.com/yuxino/wnacg.git
 cd wnacg
-npm install
+npm ci
 npm run tauri dev
 ```
 
@@ -34,12 +34,12 @@ npm run tauri dev
 npm run tauri build
 ```
 
-DeepSeek 密钥可在应用的阅读设置中配置，并安全保存在 macOS 钥匙串。旧版 `config.json` 只会在密钥成功写入并回读确认后清除明文字段；`DEEPSEEK_API_KEY` 仅作为兼容输入。Windows 版目前不能从界面安全保存密钥。
+DeepSeek 翻译是可选云端功能：启用后，待翻译的文字与标题会发送给 DeepSeek，图片不会发送；原文与译文缓存在本机。密钥在 macOS 保存到钥匙串，非 macOS 请使用 `DEEPSEEK_API_KEY`，因为界面暂不支持安全保存。
 
-漫画 OCR 模型不随安装包分发。首次启用会下载约 224 MiB 固定版本模型，并在本机用 Rust 编译辅助程序，因此安装版也需要 Rust 工具链；编译成功后会清理临时 Cargo 产物，只长期保留模型和精简后的辅助程序缓存。Apple Vision OCR 仅适用于 macOS，首次编译助手还需要 Xcode Command Line Tools。
+OCR 在本机运行。首次启用日文漫画 OCR 会从 Hugging Face 下载约 224 MiB 固定版本模型，并用 Rust 编译辅助程序；Apple Vision 仅适用于 macOS，首次使用还需要 Xcode Command Line Tools。
 
-当前仓库未附项目级开源许可证，OCR 模型及训练数据的许可也尚未完成正式分发审查。自动下载不等同于已取得再分发授权，正式发布前需要逐项确认。
+仓库暂未附项目级开源许可证；OCR 模型及训练数据也尚未完成正式分发许可审查。自动下载不等同于取得再分发授权。
 
 ## 说明
 
-项目依赖上游站点，页面改版后可能失效。请自行遵守所在地法律与站点规则，Issue、提交和截图中不要包含露骨内容。
+项目会连接 WNACG 及其图片域名，并依赖上游页面结构；站点改版后功能可能失效。请自行遵守所在地法律与站点规则，Issue、提交和截图中不要包含露骨内容。
