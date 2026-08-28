@@ -2688,19 +2688,16 @@ function hydrateImage(img: HTMLImageElement, url: string, _referer?: string | nu
     img.classList.remove("image-loading");
     img.classList.add("image-error");
     img.alt = "封面地址不受信任";
-    img.closest(".cover")?.classList.remove("has-image");
     return;
   }
   const onLoad = () => {
     if (img.dataset.imageToken !== token) return;
     img.classList.remove("image-loading");
-    img.closest(".cover")?.classList.add("has-image");
   };
   const onError = () => {
     if (img.dataset.imageToken !== token) return;
     img.classList.remove("image-loading");
     img.classList.add("image-error");
-    img.closest(".cover")?.classList.remove("has-image");
   };
   img.addEventListener("load", onLoad, { once: true });
   img.addEventListener("error", onError, { once: true });

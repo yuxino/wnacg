@@ -10,7 +10,7 @@
 
 ## Features
 
-- Category, keyword, and tag search, with covers blurred by default
+- Category, keyword, and tag search, with covers shown clearly after loading
 - Continuous, single-page, and two-page reading with page controls, fullscreen, zoom, and multiple windows
 - Local OCR with Apple Vision, `comic-text-detector`, and `manga-ocr`
 - DeepSeek manga translation with vertical Japanese layout, bubble typesetting, and pre-translation

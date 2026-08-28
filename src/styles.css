@@ -990,46 +990,6 @@ img:not(.image-loading):not(.image-error) {
   transition: opacity var(--motion-slow) ease, filter var(--motion-slow) ease, transform var(--motion-slow) ease;
 }
 
-.cover img:not(.image-loading):not(.image-error) {
-  filter: blur(16px) brightness(0.72);
-  transform: scale(1.08);
-}
-
-.cover.has-image::after {
-  content: "悬停查看封面";
-  position: absolute;
-  left: 50%;
-  bottom: var(--space-3);
-  z-index: 1;
-  padding: 4px 8px;
-  border: 1px solid rgba(255, 255, 255, 0.32);
-  border-radius: var(--radius-sm);
-  color: #fff;
-  background: rgba(18, 18, 18, 0.72);
-  font-size: var(--text-xs);
-  line-height: 1.2;
-  pointer-events: none;
-  transform: translateX(-50%);
-  transition: opacity var(--motion-fast) ease;
-}
-
-.album-card:hover .cover img:not(.image-loading):not(.image-error),
-.album-card:focus-visible .cover img:not(.image-loading):not(.image-error) {
-  filter: blur(0) brightness(1);
-  transform: scale(1.03);
-}
-
-.album-card:hover .cover.has-image::after,
-.album-card:focus-visible .cover.has-image::after {
-  opacity: 0;
-}
-
-@media (hover: none) {
-  .cover.has-image::after {
-    content: "封面已模糊";
-  }
-}
-
 .image-error {
   opacity: 0.25;
 }
