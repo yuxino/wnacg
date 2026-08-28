@@ -213,7 +213,6 @@ input:focus-visible {
 /* ---- button variants ---- */
 
 .primary-action,
-.state-action button,
 .empty-state-actions .primary-action,
 .stream-error button,
 .load-more-error button {
@@ -224,7 +223,6 @@ input:focus-visible {
 }
 
 .primary-action:hover:not(:disabled),
-.state-action button:hover:not(:disabled),
 .empty-state-actions .primary-action:hover:not(:disabled),
 .stream-error button:hover:not(:disabled),
 .load-more-error button:hover:not(:disabled) {
@@ -1073,16 +1071,6 @@ img:not(.image-loading):not(.image-error) {
   border-color: var(--danger);
   color: var(--danger);
   background: var(--danger-soft);
-}
-
-.state-action {
-  display: grid;
-  gap: var(--space-4);
-  justify-items: start;
-}
-
-.state-action button {
-  padding: 0 var(--space-5);
 }
 
 .loading-grid {

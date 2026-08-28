@@ -129,6 +129,26 @@ struct ImageData {
     data_url: String,
 }
 
+fn image_data_url_capacity(content_type: &str, bytes_len: usize) -> Result<usize, String> {
+    let encoded_len =
+        base64::encoded_len(bytes_len, true).ok_or_else(|| "图片编码长度溢出".to_string())?;
+    "data:"
+        .len()
+        .checked_add(content_type.len())
+        .and_then(|length| length.checked_add(";base64,".len()))
+        .and_then(|length| length.checked_add(encoded_len))
+        .ok_or_else(|| "图片 data URL 长度溢出".to_string())
+}
+
+fn encode_image_data_url(content_type: &str, bytes: &[u8]) -> Result<String, String> {
+    let mut data_url = String::with_capacity(image_data_url_capacity(content_type, bytes.len())?);
+    data_url.push_str("data:");
+    data_url.push_str(content_type);
+    data_url.push_str(";base64,");
+    base64::engine::general_purpose::STANDARD.encode_string(bytes, &mut data_url);
+    Ok(data_url)
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImageDownloadProgress {
@@ -1299,12 +1319,10 @@ async fn fetch_image_data_url(url: String, referer: Option<String>) -> Result<Im
     }
 
     let (content_type, bytes) = fetch_binary(url.clone(), referer).await?;
-    ocr::cache_image_bytes(&url, bytes.clone());
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let data_url = encode_image_data_url(&content_type, &bytes)?;
+    ocr::cache_image_bytes(&url, bytes);
 
-    Ok(ImageData {
-        data_url: format!("data:{content_type};base64,{encoded}"),
-    })
+    Ok(ImageData { data_url })
 }
 
 #[tauri::command]
@@ -1321,12 +1339,10 @@ async fn fetch_image_data_url_progress(
 
     let (content_type, bytes) =
         fetch_binary_with_progress(app, request_id, url.clone(), referer).await?;
-    ocr::cache_image_bytes(&url, bytes.clone());
-    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let data_url = encode_image_data_url(&content_type, &bytes)?;
+    ocr::cache_image_bytes(&url, bytes);
 
-    Ok(ImageData {
-        data_url: format!("data:{content_type};base64,{encoded}"),
-    })
+    Ok(ImageData { data_url })
 }
 
 #[tauri::command]
@@ -1740,6 +1756,38 @@ mod tests {
         ] {
             assert!(!is_allowed_image_url_value(value), "应拒绝 {value}");
         }
+    }
+
+    #[test]
+    fn image_data_url_encoding_matches_the_standard_base64_form() {
+        let bytes = b"\x00WNACG image bytes\xff";
+        let expected = format!(
+            "data:image/webp;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        let actual = encode_image_data_url("image/webp", bytes).unwrap();
+
+        assert_eq!(actual, expected);
+        assert_eq!(
+            actual.len(),
+            image_data_url_capacity("image/webp", bytes.len()).unwrap()
+        );
+    }
+
+    #[test]
+    fn image_data_url_capacity_handles_padding_and_rejects_overflow() {
+        let prefix_len = "data:image/png;base64,".len();
+        for (bytes_len, encoded_len) in [(0, 0), (1, 4), (2, 4), (3, 4), (4, 8)] {
+            assert_eq!(
+                image_data_url_capacity("image/png", bytes_len).unwrap(),
+                prefix_len + encoded_len
+            );
+        }
+        assert_eq!(
+            image_data_url_capacity("image/png", MAX_IMAGE_BYTES as usize).unwrap(),
+            prefix_len + base64::encoded_len(MAX_IMAGE_BYTES as usize, true).unwrap()
+        );
+        assert!(image_data_url_capacity("image/png", usize::MAX).is_err());
     }
 
     #[test]

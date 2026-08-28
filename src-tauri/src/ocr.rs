@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -374,6 +374,129 @@ fn cargo_bin() -> Command {
     }
 }
 
+fn manga_helper_binary_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "manga_ocr_helper.exe"
+    } else {
+        "manga_ocr_helper"
+    }
+}
+
+fn is_scoped_manga_cache_dir(temp_root: &Path, cache_dir: &Path) -> bool {
+    let Some(name) = cache_dir.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(hash) = name.strip_prefix("wnacg-ocr-manga-") else {
+        return false;
+    };
+    cache_dir.parent() == Some(temp_root)
+        && hash.len() == 16
+        && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_manga_cache_dir(temp_root: &Path, cache_dir: &Path) -> Result<(), String> {
+    if !is_scoped_manga_cache_dir(temp_root, cache_dir) {
+        return Err("OCR 助手缓存目录路径越界".to_string());
+    }
+    let metadata = std::fs::symlink_metadata(cache_dir)
+        .map_err(|error| format!("无法检查 OCR 助手缓存目录：{error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("OCR 助手缓存目录不是可信的普通目录".to_string());
+    }
+    Ok(())
+}
+
+fn cleanup_manga_build_target_in(
+    temp_root: &Path,
+    expected_cache_dir: &Path,
+    cache_dir: &Path,
+) -> Result<(), String> {
+    if cache_dir != expected_cache_dir || !is_scoped_manga_cache_dir(temp_root, cache_dir) {
+        return Err("拒绝清理 OCR 助手缓存目录之外的路径".to_string());
+    }
+    validate_manga_cache_dir(temp_root, cache_dir)?;
+
+    let target = cache_dir.join("target");
+    let target_metadata = match std::fs::symlink_metadata(&target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("无法检查 OCR 助手构建缓存：{error}")),
+    };
+    if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
+        return Err("OCR 助手 target 不是可信的普通目录".to_string());
+    }
+    std::fs::remove_dir_all(&target).map_err(|error| format!("无法清理 OCR 助手构建缓存：{error}"))
+}
+
+fn cleanup_manga_build_target(cache_dir: &Path) -> Result<(), String> {
+    cleanup_manga_build_target_in(&std::env::temp_dir(), &manga_helper_dir(), cache_dir)
+}
+
+fn install_manga_helper_artifact(
+    cache_dir: &Path,
+    built_binary: &Path,
+    installed_binary: &Path,
+) -> Result<(), String> {
+    let expected_built_binary = cache_dir
+        .join("target")
+        .join("release")
+        .join(manga_helper_binary_name());
+    let expected_installed_binary = cache_dir.join(manga_helper_binary_name());
+    if !is_scoped_manga_cache_dir(&std::env::temp_dir(), cache_dir)
+        || built_binary != expected_built_binary
+        || installed_binary != expected_installed_binary
+    {
+        return Err("漫画 OCR 引擎安装路径越界".to_string());
+    }
+    validate_manga_cache_dir(&std::env::temp_dir(), cache_dir)?;
+    for directory in [cache_dir.join("target"), cache_dir.join("target/release")] {
+        let metadata = std::fs::symlink_metadata(&directory)
+            .map_err(|error| format!("无法检查漫画 OCR 引擎构建目录：{error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("漫画 OCR 引擎构建目录不是可信的普通目录".to_string());
+        }
+    }
+    let built_metadata = std::fs::symlink_metadata(built_binary)
+        .map_err(|error| format!("漫画 OCR 引擎编译产物缺失：{error}"))?;
+    if built_metadata.file_type().is_symlink()
+        || !built_metadata.is_file()
+        || built_metadata.len() == 0
+    {
+        return Err("漫画 OCR 引擎编译产物无效".to_string());
+    }
+
+    let staging = cache_dir.join(format!(
+        ".{}.{}.tmp",
+        manga_helper_binary_name(),
+        std::process::id()
+    ));
+    let install_result = (|| {
+        let mut source = std::fs::File::open(built_binary)
+            .map_err(|error| format!("无法读取漫画 OCR 引擎编译产物：{error}"))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut destination = options
+            .open(&staging)
+            .map_err(|error| format!("无法创建漫画 OCR 引擎临时产物：{error}"))?;
+        let copied = std::io::copy(&mut source, &mut destination)
+            .map_err(|error| format!("无法复制漫画 OCR 引擎：{error}"))?;
+        if copied != built_metadata.len() {
+            return Err("漫画 OCR 引擎复制不完整".to_string());
+        }
+        destination
+            .sync_all()
+            .map_err(|error| format!("无法同步漫画 OCR 引擎：{error}"))?;
+        std::fs::set_permissions(&staging, built_metadata.permissions())
+            .map_err(|error| format!("无法设置漫画 OCR 引擎权限：{error}"))?;
+        std::fs::rename(&staging, installed_binary)
+            .map_err(|error| format!("无法安装漫画 OCR 引擎：{error}"))
+    })();
+    if install_result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    install_result
+}
+
 fn ensure_manga_helper() -> Result<PathBuf, String> {
     static COMPILING: Mutex<()> = Mutex::new(());
     let _guard = COMPILING.lock().map_err(|_| "OCR 初始化冲突".to_string())?;
@@ -381,13 +504,17 @@ fn ensure_manga_helper() -> Result<PathBuf, String> {
     let dir = manga_helper_dir();
     std::fs::create_dir_all(dir.join("src"))
         .map_err(|err| format!("无法创建 OCR 缓存目录：{err}"))?;
-    let binary_name = if cfg!(target_os = "windows") {
-        "manga_ocr_helper.exe"
-    } else {
-        "manga_ocr_helper"
-    };
-    let bin = dir.join("target").join("release").join(binary_name);
-    if bin.exists() {
+    let binary_name = manga_helper_binary_name();
+    let bin = dir.join(binary_name);
+    if std::fs::symlink_metadata(&bin)
+        .ok()
+        .is_some_and(|metadata| {
+            !metadata.file_type().is_symlink() && metadata.is_file() && metadata.len() > 0
+        })
+    {
+        if let Err(error) = cleanup_manga_build_target(&dir) {
+            eprintln!("{error}");
+        }
         return Ok(bin);
     }
 
@@ -407,8 +534,10 @@ fn ensure_manga_helper() -> Result<PathBuf, String> {
     if !status.success() {
         return Err("漫画 OCR 引擎编译失败，请确认已安装 Rust 工具链".to_string());
     }
-    if !bin.exists() {
-        return Err("漫画 OCR 引擎编译产物缺失".to_string());
+    let built_bin = dir.join("target").join("release").join(binary_name);
+    install_manga_helper_artifact(&dir, &built_bin, &bin)?;
+    if let Err(error) = cleanup_manga_build_target(&dir) {
+        eprintln!("{error}");
     }
     Ok(bin)
 }
@@ -749,6 +878,14 @@ pub async fn ocr_engine_status(engine: Option<String>) -> Result<String, String>
 mod tests {
     use super::*;
 
+    static CACHE_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+
+    fn test_manga_cache_dir() -> PathBuf {
+        let sequence = CACHE_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed) as u64;
+        let unique = ((std::process::id() as u64) << 32) | sequence;
+        std::env::temp_dir().join(format!("wnacg-ocr-manga-{unique:016x}"))
+    }
+
     #[test]
     fn model_validation_checks_exact_size_and_sha256() {
         let path =
@@ -764,6 +901,75 @@ mod tests {
         std::fs::write(&path, b"abcd").unwrap();
         assert!(!model_file_is_valid(&path, &model));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn manga_helper_install_keeps_only_the_fixed_binary() {
+        let cache_dir = test_manga_cache_dir();
+        let target_dir = cache_dir.join("target");
+        let release_dir = target_dir.join("release");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let built = release_dir.join(manga_helper_binary_name());
+        let installed = cache_dir.join(manga_helper_binary_name());
+        std::fs::write(&built, b"compiled helper fixture").unwrap();
+
+        install_manga_helper_artifact(&cache_dir, &built, &installed).unwrap();
+        cleanup_manga_build_target_in(&std::env::temp_dir(), &cache_dir, &cache_dir).unwrap();
+
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            b"compiled helper fixture"
+        );
+        assert!(!target_dir.exists(), "成功安装后应删除 Cargo target 缓存");
+        let files = std::fs::read_dir(&cache_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(files, vec![installed.file_name().unwrap()]);
+        std::fs::remove_dir_all(cache_dir).unwrap();
+    }
+
+    #[test]
+    fn failed_manga_helper_install_preserves_the_build_directory() {
+        let cache_dir = test_manga_cache_dir();
+        let target_dir = cache_dir.join("target");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let sentinel = target_dir.join("keep-on-failure");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        let missing = target_dir.join("release").join(manga_helper_binary_name());
+        let installed = cache_dir.join(manga_helper_binary_name());
+
+        assert!(install_manga_helper_artifact(&cache_dir, &missing, &installed).is_err());
+        assert!(sentinel.exists(), "安装失败时不得清理 target");
+        assert!(!installed.exists());
+        std::fs::remove_dir_all(cache_dir).unwrap();
+    }
+
+    #[test]
+    fn manga_helper_cleanup_rejects_paths_outside_the_hashed_cache() {
+        let temp_root = std::env::temp_dir();
+        let valid = test_manga_cache_dir();
+        assert!(is_scoped_manga_cache_dir(&temp_root, &valid));
+        assert!(!is_scoped_manga_cache_dir(
+            &temp_root,
+            &temp_root.join("wnacg-ocr-vision-0123456789abcdef")
+        ));
+        assert!(!is_scoped_manga_cache_dir(
+            &temp_root,
+            &temp_root.join("nested/wnacg-ocr-manga-0123456789abcdef")
+        ));
+        assert!(!is_scoped_manga_cache_dir(
+            &temp_root,
+            &temp_root.join("wnacg-ocr-manga-too-short")
+        ));
+
+        let rejected = temp_root.join("wnacg-ocr-vision-0123456789abcdef");
+        let sentinel = rejected.join("target/keep-outside-scope");
+        std::fs::create_dir_all(sentinel.parent().unwrap()).unwrap();
+        std::fs::write(&sentinel, b"keep").unwrap();
+        assert!(cleanup_manga_build_target_in(&temp_root, &valid, &rejected).is_err());
+        assert!(sentinel.exists(), "越界清理必须保持目标内容不变");
+        std::fs::remove_dir_all(rejected).unwrap();
     }
 
     #[test]

@@ -16,8 +16,8 @@ wnacg 的品牌方向参考 mimi 的资产组织方式：固定角色母图、�
 - `kiri-master.png`：角色徽章母图，后续角色生成的唯一视觉参考。
 - `kiri-app-icon-source.png`：带圆形透明边缘的桌面应用图标源图。
 - `../../../public/brand/kiri-icon-128.png`：界面和 favicon 使用的小图。
-- `../../../public/brand/kiri-icon-256.png`：README 使用的中图。
-- `../../../src-tauri/icons/kiri/`：Tauri 桌面版所需的 PNG、macOS ICNS 与 Windows ICO 派生图标。
+- `../../../src-tauri/icons/kiri/128x128@2x.png`：README 与 Tauri 共用的 256 像素图标。
+- `../../../src-tauri/icons/kiri/`：Tauri 桌面版其余 PNG、macOS ICNS 与 Windows ICO 派生图标。
 
 ## 生成方法
 

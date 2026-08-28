@@ -1,12 +1,12 @@
 <div align="center">
   <br>
-  <img src="public/brand/kiri-icon-256.png" width="112" alt="wnacg">
+  <img src="src-tauri/icons/kiri/128x128@2x.png" width="112" alt="wnacg">
   <h1>wnacg</h1>
   <p><a href="README.md">简体中文</a> · <strong>English</strong></p>
   <p>A cleaner desktop reader for wnacg, with local OCR and manga translation.</p>
 </div>
 
-> 18+. The repository contains no third-party content. Automated installers, when available, are published on [Releases](https://github.com/yuxino/wnacg/releases); they are not currently notarized or store-signed.
+> 18+. The repository and installers do not bundle third-party manga, image content, or OCR model weights. Automated installers, when available, are published on [Releases](https://github.com/yuxino/wnacg/releases); they are not currently notarized or store-signed.
 
 ## Features
 
@@ -36,7 +36,9 @@ npm run tauri build
 
 The reader settings store the DeepSeek key in macOS Keychain. A legacy `config.json` key is removed only after a verified Keychain migration; `DEEPSEEK_API_KEY` remains a compatibility input. The Windows build cannot yet save a key securely from the UI.
 
-The first manga OCR run downloads about 230 MB of models and compiles a Rust helper locally; models and build cache may use roughly 500 MB in total. Apple Vision OCR is available only on macOS.
+Manga OCR models are not shipped in the installer. The first run downloads about 224 MiB of pinned models and compiles a helper locally, so installed builds also require a Rust toolchain. After a successful build, temporary Cargo artifacts are removed and only the models and a compact helper cache remain. Apple Vision OCR is available only on macOS and requires Xcode Command Line Tools to compile its helper on first use.
+
+This repository does not currently include a project-level open-source license, and the OCR models and training data have not completed a formal distribution-license review. Automatic download does not imply redistribution permission; each source must be confirmed before a formal release.
 
 ## Notes
 

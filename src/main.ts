@@ -305,14 +305,7 @@ const ICON_PATHS: Record<string, string> = {
   chevronLeft: 'm15 18-6-6 6-6',
   chevronRight: 'm9 18 6-6-6-6',
   chevronUp: 'm6 15 6-6 6 6',
-  chevronDown: 'm6 9 6 6 6-6',
   chevronsLeft: 'm11 17-5-5 5-5 M18 17l-5-5 5-5',
-  chevronsRight: 'm13 17 5-5-5-5 M6 17l5-5-5-5',
-  grid: 'M3 3h7v7H3z M14 3h7v7h-7z M14 14h7v7h-7z M3 14h7v7H3z',
-  scroll:
-    'M8 21h12a2 2 0 0 0 2-2v-2H10v2a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v3h4 M19 17V5a2 2 0 0 0-2-2H4',
-  home: 'm3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z M9 22V12h6v10',
-  search: 'M11 11a7 7 0 1 0 7-7 7 7 0 0 0-7 7z M21 21l-4.35-4.35',
   plus: 'M12 5v14 M5 12h14',
   minus: 'M5 12h14',
 };
@@ -1726,6 +1719,7 @@ function resetReaderPipelines(clearPreloads = false) {
   if (clearPreloads) {
     preloadInFlight.clear();
     ocrByteCacheUrls.clear();
+    clearPreloadPool();
   }
 }
 
@@ -3993,9 +3987,14 @@ function backToList(options: { restore?: boolean } = {}) {
 
 // ---- image decode preload ----
 
+const PRELOAD_POOL_MAX_IMAGES = 4;
 const preloadPool = document.createElement("div");
 preloadPool.className = "preload-pool";
 document.body.append(preloadPool);
+
+function clearPreloadPool() {
+  preloadPool.replaceChildren();
+}
 
 function preloadImage(url: string) {
   const existing = Array.from(preloadPool.querySelectorAll<HTMLImageElement>("img")).some(
@@ -4006,6 +4005,9 @@ function preloadImage(url: string) {
   img.dataset.src = url;
   img.src = url;
   preloadPool.append(img);
+  while (preloadPool.childElementCount > PRELOAD_POOL_MAX_IMAGES) {
+    preloadPool.firstElementChild?.remove();
+  }
 }
 
 // ---- keyboard ----
