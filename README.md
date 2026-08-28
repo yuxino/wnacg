@@ -6,7 +6,7 @@
   <p>一个更舒服的 wnacg 桌面阅读器，带本地 OCR 与漫画翻译。</p>
 </div>
 
-> 18+。仓库仅提供源码，不包含第三方内容或安装包。
+> 18+。仓库不包含第三方内容。自动构建的安装包（如有）以 [Releases](https://github.com/yuxino/wnacg/releases) 为准；当前未做平台公证或商店签名。
 
 ## 功能
 
@@ -34,7 +34,9 @@ npm run tauri dev
 npm run tauri build
 ```
 
-DeepSeek 密钥可在应用的阅读设置中配置，并安全保存在 macOS 钥匙串。旧版的 `config.json` 或 `DEEPSEEK_API_KEY` 环境变量会在首次读取时自动迁移。
+DeepSeek 密钥可在应用的阅读设置中配置，并安全保存在 macOS 钥匙串。旧版 `config.json` 只会在密钥成功写入并回读确认后清除明文字段；`DEEPSEEK_API_KEY` 仅作为兼容输入。Windows 版目前不能从界面安全保存密钥。
+
+漫画 OCR 首次启用会下载约 230 MB 模型，并在本机用 Rust 编译辅助程序；模型与编译缓存合计可能占用约 500 MB。Apple Vision OCR 仅适用于 macOS。
 
 ## 说明
 

@@ -6,7 +6,7 @@
   <p>A cleaner desktop reader for wnacg, with local OCR and manga translation.</p>
 </div>
 
-> 18+. Source code only. No third-party content or installers are included.
+> 18+. The repository contains no third-party content. Automated installers, when available, are published on [Releases](https://github.com/yuxino/wnacg/releases); they are not currently notarized or store-signed.
 
 ## Features
 
@@ -34,7 +34,9 @@ Build:
 npm run tauri build
 ```
 
-Translation reads `deepseekApiKey` from `~/Library/Application Support/wnacg/config.json`, or from the `DEEPSEEK_API_KEY` environment variable.
+The reader settings store the DeepSeek key in macOS Keychain. A legacy `config.json` key is removed only after a verified Keychain migration; `DEEPSEEK_API_KEY` remains a compatibility input. The Windows build cannot yet save a key securely from the UI.
+
+The first manga OCR run downloads about 230 MB of models and compiles a Rust helper locally; models and build cache may use roughly 500 MB in total. Apple Vision OCR is available only on macOS.
 
 ## Notes
 

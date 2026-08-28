@@ -10,7 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "title": "wnacg",
@@ -21,7 +21,8 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data: https://wnacg.com https://*.wnacg.com https://wnacg.org https://*.wnacg.org https://wn03.cfd https://*.wn03.cfd https://wn09.shop https://*.wn09.shop https://wnacgimg.date https://*.wnacgimg.date https://wnimg1.ru https://*.wnimg1.ru https://qy0.ru https://*.qy0.ru; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-src 'none'",
+      "devCsp": "default-src 'self'; connect-src ipc: http://ipc.localhost ws:; img-src 'self' data: https://wnacg.com https://*.wnacg.com https://wnacg.org https://*.wnacg.org https://wn03.cfd https://*.wn03.cfd https://wn09.shop https://*.wn09.shop https://wnacgimg.date https://*.wnacgimg.date https://wnimg1.ru https://*.wnimg1.ru https://qy0.ru https://*.qy0.ru; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-src 'none'"
     }
   },
   "bundle": {

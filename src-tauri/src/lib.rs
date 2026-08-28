@@ -1,6 +1,6 @@
 use base64::Engine;
 use futures_util::StreamExt;
-use scraper::{Element, Html, Selector};
+use scraper::{Html, Selector};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -16,9 +16,12 @@ use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 mod ocr;
 mod translate;
 
-const BASE_URLS: [&str; 1] = ["https://www.wn03.cfd"];
+const BASE_URLS: [&str; 2] = ["https://www.wn09.shop", "https://www.wn03.cfd"];
 const RELEASES_API: &str = "https://api.github.com/repos/yuxino/wnacg/releases?per_page=100";
 const RELEASES_URL: &str = "https://github.com/yuxino/wnacg/releases";
+const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_ALBUM_INDEX_PAGES: usize = 256;
+const ALBUM_PAGE_FETCH_CONCURRENCY: usize = 6;
 static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
@@ -53,6 +56,22 @@ static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(||
         .referer(true)
         .cookie_store(true)
         .http1_only()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 8 {
+                return attempt.error(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "重定向次数过多",
+                ));
+            }
+            if is_allowed_remote_url(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.error(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "阻止重定向到未授权站点",
+                ))
+            }
+        }))
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(60))
         .build()
@@ -72,7 +91,6 @@ struct Album {
 struct PhotoEntry {
     id: String,
     url: String,
-    thumbnail: Option<String>,
     title: String,
 }
 
@@ -197,21 +215,62 @@ fn normalize_url(base_url: &str, value: &str) -> String {
     }
 }
 
+fn normalized_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn host_is_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
+}
+
 fn is_allowed_wnacg_host(host: &str) -> bool {
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    host == "wnacg.com"
-        || host.ends_with(".wnacg.com")
-        || host == "wnacg.org"
-        || host.ends_with(".wnacg.org")
-        || host == "wn03.cfd"
-        || host.ends_with(".wn03.cfd")
+    let host = normalized_host(host);
+    host_is_domain(&host, "wnacg.com")
+        || host_is_domain(&host, "wnacg.org")
+        || host_is_domain(&host, "wn03.cfd")
+        || host_is_domain(&host, "wn09.shop")
+}
+
+fn is_allowed_image_host(host: &str) -> bool {
+    let host = normalized_host(host);
+    is_allowed_wnacg_host(&host)
+        || host_is_domain(&host, "wnacgimg.date")
+        || host_is_domain(&host, "wnimg1.ru")
+        || host_is_domain(&host, "qy0.ru")
+}
+
+fn has_safe_remote_url_shape(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
+fn is_allowed_page_url(url: &reqwest::Url) -> bool {
+    has_safe_remote_url_shape(url) && url.host_str().is_some_and(is_allowed_wnacg_host)
+}
+
+fn is_allowed_image_url(url: &reqwest::Url) -> bool {
+    has_safe_remote_url_shape(url) && url.host_str().is_some_and(is_allowed_image_host)
+}
+
+fn is_allowed_remote_url(url: &reqwest::Url) -> bool {
+    is_allowed_page_url(url) || is_allowed_image_url(url)
+}
+
+fn is_allowed_image_url_value(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .ok()
+        .is_some_and(|url| is_allowed_image_url(&url))
 }
 
 fn is_allowed_absolute_url(value: &str) -> bool {
     reqwest::Url::parse(value)
         .ok()
-        .and_then(|url| url.host_str().map(is_allowed_wnacg_host))
-        .unwrap_or(false)
+        .is_some_and(|url| is_allowed_page_url(&url))
 }
 
 fn build_url(base_url: &str, path: &str) -> Result<String, String> {
@@ -451,37 +510,9 @@ fn parse_album_photos(html: &str, base_url: &str) -> Result<Vec<PhotoEntry>, Str
             title
         };
 
-        let thumbnail = link_ref
-            .select(&img_selector)
-            .find_map(|img| {
-                img.value()
-                    .attr("data-original")
-                    .or_else(|| img.value().attr("data-src"))
-                    .or_else(|| img.value().attr("data-url"))
-                    .or_else(|| img.value().attr("src"))
-            })
-            .map(|url| normalize_url(base_url, url));
-
-        // Also look for images in parent/ancestor elements
-        let thumbnail = thumbnail.or_else(|| {
-            link_ref
-                .parent_element()
-                .and_then(|p| {
-                    p.select(&img_selector).find_map(|img| {
-                        img.value()
-                            .attr("data-original")
-                            .or_else(|| img.value().attr("data-src"))
-                            .or_else(|| img.value().attr("data-url"))
-                            .or_else(|| img.value().attr("src"))
-                    })
-                })
-                .map(|url| normalize_url(base_url, url))
-        });
-
         photos.push(PhotoEntry {
             id,
             url: normalize_url(base_url, href),
-            thumbnail,
             title,
         });
     }
@@ -493,18 +524,25 @@ fn parse_album_photos(html: &str, base_url: &str) -> Result<Vec<PhotoEntry>, Str
     Ok(photos)
 }
 
-fn parse_album_max_page(html: &str) -> usize {
+fn parse_album_max_page(html: &str) -> Result<usize, String> {
     let Some(re) = regex_lite::Regex::new(
         r#"(?:photos-index-page-|[?&]page=|[?&]p=)(\d+)(?:-aid-\d+\.html|[&#"'])?"#,
     )
     .ok() else {
-        return 1;
+        return Ok(1);
     };
 
-    re.captures_iter(html)
+    let max_page = re
+        .captures_iter(html)
         .filter_map(|cap| cap.get(1)?.as_str().parse::<usize>().ok())
         .max()
-        .unwrap_or(1)
+        .unwrap_or(1);
+    if max_page > MAX_ALBUM_INDEX_PAGES {
+        return Err(format!(
+            "作品分页异常（{max_page} 页），已超过安全上限 {MAX_ALBUM_INDEX_PAGES}"
+        ));
+    }
+    Ok(max_page)
 }
 
 fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
@@ -719,6 +757,10 @@ async fn fetch_page(url: String, referer: Option<&str>) -> Result<String, String
             }
         };
 
+    if !is_allowed_page_url(response.url()) {
+        return Err("WNACG 页面重定向到了未授权站点".to_string());
+    }
+
     let status = response.status();
     if !response.status().is_success() {
         return fetch_page_via_curl(url, referer.to_string())
@@ -750,10 +792,15 @@ async fn fetch_page(url: String, referer: Option<&str>) -> Result<String, String
 }
 
 async fn fetch_page_via_curl(url: String, referer: String) -> Result<String, String> {
+    let parsed_url = reqwest::Url::parse(&url).map_err(|_| "WNACG 页面地址无效".to_string())?;
+    if !is_allowed_page_url(&parsed_url) {
+        return Err("只允许抓取受信任的 WNACG 页面".to_string());
+    }
+
     tauri::async_runtime::spawn_blocking(move || {
         let output = Command::new("curl")
             .arg("--http1.1")
-            .arg("-L")
+            .args(["--proto", "=https"])
             .arg("--compressed")
             .arg("--max-time")
             .arg("25")
@@ -803,6 +850,11 @@ async fn fetch_page_via_curl(url: String, referer: String) -> Result<String, Str
 }
 
 async fn fetch_binary(url: String, referer: Option<String>) -> Result<(String, Vec<u8>), String> {
+    let parsed_url = reqwest::Url::parse(&url).map_err(|_| "图片地址无效".to_string())?;
+    if !is_allowed_image_url(&parsed_url) {
+        return Err("不允许加载非 WNACG 图片域名".to_string());
+    }
+
     let mut request = client()?
         .get(&url)
         .header(
@@ -833,26 +885,41 @@ async fn fetch_binary(url: String, referer: Option<String>) -> Result<(String, V
         .await
         .map_err(|err| format!("图片请求失败：{err}"))?;
 
+    if !is_allowed_image_url(response.url()) {
+        return Err("图片请求重定向到了未授权站点".to_string());
+    }
+
     let status = response.status();
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or("image/jpeg")
+        .ok_or("图片响应缺少内容类型")?
         .split(';')
         .next()
-        .unwrap_or("image/jpeg")
+        .unwrap_or_default()
         .to_string();
+    let total = response.content_length();
 
     if !status.is_success() {
         return Err(format!("图片服务返回 HTTP {status}"));
     }
+    if !content_type.starts_with("image/") {
+        return Err(format!("图片服务返回了非图片内容：{content_type}"));
+    }
+    if total.is_some_and(|total| total > MAX_IMAGE_BYTES) {
+        return Err("图片超过 64 MiB 安全上限".to_string());
+    }
 
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| format!("读取图片失败：{err}"))?
-        .to_vec();
+    let mut bytes = Vec::with_capacity(total.unwrap_or(0).min(MAX_IMAGE_BYTES) as usize);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| format!("读取图片失败：{err}"))?;
+        if (bytes.len() as u64).saturating_add(chunk.len() as u64) > MAX_IMAGE_BYTES {
+            return Err("图片超过 64 MiB 安全上限".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
 
     if bytes.is_empty() {
         return Err("图片内容为空".to_string());
@@ -867,6 +934,11 @@ async fn fetch_binary_with_progress(
     url: String,
     referer: Option<String>,
 ) -> Result<(String, Vec<u8>), String> {
+    let parsed_url = reqwest::Url::parse(&url).map_err(|_| "图片地址无效".to_string())?;
+    if !is_allowed_image_url(&parsed_url) {
+        return Err("不允许加载非 WNACG 图片域名".to_string());
+    }
+
     let mut request = client()?
         .get(&url)
         .header(
@@ -897,20 +969,30 @@ async fn fetch_binary_with_progress(
         .await
         .map_err(|err| format!("图片请求失败：{err}"))?;
 
+    if !is_allowed_image_url(response.url()) {
+        return Err("图片请求重定向到了未授权站点".to_string());
+    }
+
     let status = response.status();
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .unwrap_or("image/jpeg")
+        .ok_or("图片响应缺少内容类型")?
         .split(';')
         .next()
-        .unwrap_or("image/jpeg")
+        .unwrap_or_default()
         .to_string();
     let total = response.content_length();
 
     if !status.is_success() {
         return Err(format!("图片服务返回 HTTP {status}"));
+    }
+    if !content_type.starts_with("image/") {
+        return Err(format!("图片服务返回了非图片内容：{content_type}"));
+    }
+    if total.is_some_and(|total| total > MAX_IMAGE_BYTES) {
+        return Err("图片超过 64 MiB 安全上限".to_string());
     }
 
     let mut loaded = 0_u64;
@@ -930,6 +1012,9 @@ async fn fetch_binary_with_progress(
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|err| format!("读取图片失败：{err}"))?;
+        if loaded.saturating_add(chunk.len() as u64) > MAX_IMAGE_BYTES {
+            return Err("图片超过 64 MiB 安全上限".to_string());
+        }
         loaded += chunk.len() as u64;
         bytes.extend_from_slice(&chunk);
         let percent = total
@@ -1102,28 +1187,54 @@ async fn fetch_album_photos(aid: String, _app: tauri::AppHandle) -> Result<Album
 
         match fetch_page(url, None).await {
             Ok(first_html) => {
-                let max_page = parse_album_max_page(&first_html);
-                let mut photos = parse_album_photos(&first_html, base_url)?;
+                let max_page = match parse_album_max_page(&first_html) {
+                    Ok(max_page) => max_page,
+                    Err(error) => {
+                        errors.push(format!("{base_url}: {error}"));
+                        continue;
+                    }
+                };
+                let mut photos = match parse_album_photos(&first_html, base_url) {
+                    Ok(photos) => photos,
+                    Err(error) => {
+                        errors.push(format!("{base_url}: {error}"));
+                        continue;
+                    }
+                };
 
                 if max_page > 1 {
-                    // Fetch remaining pages CONCURRENTLY
-                    let mut handles = Vec::new();
-                    for page in 2..=max_page {
-                        let bu = base_url.to_string();
-                        let a = aid.clone();
-                        handles.push(tauri::async_runtime::spawn(async move {
-                            let page_path = format!("/photos-index-page-{page}-aid-{a}.html");
-                            let page_url = build_url(&bu, &page_path)?;
-                            let html = fetch_page(page_url, None).await?;
-                            parse_album_photos(&html, &bu)
-                        }));
-                    }
-                    for handle in handles {
-                        match handle.await {
-                            Ok(Ok(mut page_photos)) => photos.append(&mut page_photos),
-                            Ok(Err(e)) => errors.push(e),
-                            Err(e) => errors.push(format!("并发任务失败: {e}")),
+                    let mut page_results = futures_util::stream::iter(2..=max_page)
+                        .map(|page| {
+                            let bu = base_url.to_string();
+                            let a = aid.clone();
+                            async move {
+                                let page_path = format!("/photos-index-page-{page}-aid-{a}.html");
+                                let page_url = build_url(&bu, &page_path)?;
+                                let html = fetch_page(page_url, None).await?;
+                                Ok::<_, String>((page, parse_album_photos(&html, &bu)?))
+                            }
+                        })
+                        .buffer_unordered(ALBUM_PAGE_FETCH_CONCURRENCY)
+                        .collect::<Vec<_>>()
+                        .await;
+                    page_results.sort_by_key(|result| match result {
+                        Ok((page, _)) => *page,
+                        Err(_) => usize::MAX,
+                    });
+
+                    let mut page_error = None;
+                    for result in page_results {
+                        match result {
+                            Ok((_, mut page_photos)) => photos.append(&mut page_photos),
+                            Err(error) => {
+                                page_error = Some(error);
+                                break;
+                            }
                         }
+                    }
+                    if let Some(error) = page_error {
+                        errors.push(format!("{base_url}: {error}"));
+                        continue;
                     }
                 }
 
@@ -1183,22 +1294,7 @@ async fn fetch_photo_image(
 #[tauri::command]
 async fn fetch_image_data_url(url: String, referer: Option<String>) -> Result<ImageData, String> {
     let url = clean_url_value(&url);
-    let host = reqwest::Url::parse(&url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .unwrap_or_default();
-    let allowed = is_allowed_wnacg_host(&host)
-        || host.starts_with("img")
-        || host.starts_with("t.")
-        || host.starts_with("cdn")
-        || host.starts_with("pic")
-        || host.starts_with("photo")
-        || host.starts_with("static")
-        || host == "qy0.ru"
-        || host.ends_with(".qy0.ru")
-        || BASE_URLS.iter().any(|base_url| url.starts_with(base_url));
-
-    if !allowed {
+    if !is_allowed_image_url_value(&url) {
         return Err("不允许加载非 WNACG 图片域名".to_string());
     }
 
@@ -1219,22 +1315,7 @@ async fn fetch_image_data_url_progress(
     app: tauri::AppHandle,
 ) -> Result<ImageData, String> {
     let url = clean_url_value(&url);
-    let host = reqwest::Url::parse(&url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .unwrap_or_default();
-    let allowed = is_allowed_wnacg_host(&host)
-        || host.starts_with("img")
-        || host.starts_with("t.")
-        || host.starts_with("cdn")
-        || host.starts_with("pic")
-        || host.starts_with("photo")
-        || host.starts_with("static")
-        || host == "qy0.ru"
-        || host.ends_with(".qy0.ru")
-        || BASE_URLS.iter().any(|base_url| url.starts_with(base_url));
-
-    if !allowed {
+    if !is_allowed_image_url_value(&url) {
         return Err("不允许加载非 WNACG 图片域名".to_string());
     }
 
@@ -1253,6 +1334,7 @@ async fn check_for_update(app: tauri::AppHandle) -> Result<AppUpdateInfo, String
     let current_version = app.package_info().version.to_string();
     let client = reqwest::Client::builder()
         .user_agent(format!("wnacg/{current_version}"))
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(8))
         .timeout(Duration::from_secs(12))
         .build()
@@ -1611,6 +1693,62 @@ mod tests {
             safe_release_url("https://github.com/yuxino/wnacg/releases.evil/tag/v0.1.6"),
             RELEASES_URL
         );
+    }
+
+    #[test]
+    fn only_allows_known_https_wnacg_pages() {
+        for value in [
+            "https://www.wn03.cfd/albums-index-page-1.html",
+            "https://www.wn09.shop/photos-index-aid-1.html",
+            "https://www.wnacg.com/",
+        ] {
+            let url = reqwest::Url::parse(value).unwrap();
+            assert!(is_allowed_page_url(&url), "应允许 {value}");
+        }
+
+        for value in [
+            "http://www.wn09.shop/albums-index-page-1.html",
+            "https://www.wn09.shop:444/albums-index-page-1.html",
+            "https://reader@www.wn09.shop/albums-index-page-1.html",
+            "https://www.wn09.shop.evil.example/albums-index-page-1.html",
+            "https://img5.wnimg1.ru/data/1.jpg",
+        ] {
+            let url = reqwest::Url::parse(value).unwrap();
+            assert!(!is_allowed_page_url(&url), "应拒绝 {value}");
+        }
+    }
+
+    #[test]
+    fn image_proxy_only_allows_known_cdn_domains() {
+        for value in [
+            "https://t4.wnacgimg.date/data/cover.webp",
+            "https://img5.wnimg1.ru/data/page.jpg",
+            "https://cdn.qy0.ru/data/page.jpg",
+            "https://www.wn09.shop/static/page.jpg",
+        ] {
+            assert!(is_allowed_image_url_value(value), "应允许 {value}");
+        }
+
+        for value in [
+            "https://img.evil.example/page.jpg",
+            "https://cdn-example.com/page.jpg",
+            "https://wnimg1.ru.evil.example/page.jpg",
+            "http://img5.wnimg1.ru/page.jpg",
+            "https://img5.wnimg1.ru:444/page.jpg",
+            "https://reader@img5.wnimg1.ru/page.jpg",
+            "file:///etc/passwd",
+        ] {
+            assert!(!is_allowed_image_url_value(value), "应拒绝 {value}");
+        }
+    }
+
+    #[test]
+    fn album_pagination_rejects_implausible_page_counts() {
+        let ordinary = r#"<a href="/photos-index-page-12-aid-42.html">12</a>"#;
+        assert_eq!(parse_album_max_page(ordinary).unwrap(), 12);
+
+        let malicious = r#"<a href="/photos-index-page-999999-aid-42.html">last</a>"#;
+        assert!(parse_album_max_page(malicious).is_err());
     }
 
     #[test]

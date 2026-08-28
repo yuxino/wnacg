@@ -2,24 +2,50 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 const API_URL: &str = "https://api.deepseek.com/chat/completions";
 const KEYCHAIN_SERVICE: &str = "com.yuxino.wnacg.translation";
 const KEYCHAIN_ACCOUNT: &str = "deepseek-api-key";
 const CHUNK_SIZE: usize = 30;
+const MAX_TRANSLATION_ITEMS: usize = 512;
+const MAX_TRANSLATION_ITEM_BYTES: usize = 16 * 1024;
+const MAX_TRANSLATION_TOTAL_BYTES: usize = 512 * 1024;
+const TRANSLATION_REQUEST_CONCURRENCY: usize = 3;
 const CACHE_VERSION: u32 = 1;
 const CACHE_FILE_NAME: &str = "translation-cache-v1.json";
 const CACHE_MAX_ENTRIES_PER_NAMESPACE: usize = 4_000;
 const CACHE_MAX_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 const CACHE_MAX_FILE_BYTES: u64 = 12 * 1024 * 1024;
+const LEGACY_CONFIG_MAX_FILE_BYTES: u64 = 1024 * 1024;
 const CACHE_MAX_SOURCE_BYTES: usize = 16 * 1024;
 const CACHE_MAX_TRANSLATION_BYTES: usize = 32 * 1024;
 
 static TRANSLATION_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
 static TRANSLATION_CACHE: OnceLock<Mutex<TranslationCache>> = OnceLock::new();
 static TRANSLATION_CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+static TRANSLATION_REQUEST_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(TRANSLATION_REQUEST_CONCURRENCY));
+
+#[derive(Clone, Copy)]
+enum ApiKeySource {
+    Keychain,
+    KeychainWithLegacy,
+    Environment,
+    LegacyConfig,
+}
+
+impl ApiKeySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Keychain => "keychain",
+            Self::KeychainWithLegacy => "keychain-with-legacy",
+            Self::Environment => "environment",
+            Self::LegacyConfig => "legacy-config",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CacheNamespace {
@@ -195,11 +221,10 @@ struct PendingText {
 }
 
 fn config_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("wnacg")
+    dirs::data_local_dir()
+        .map(|path| path.join("wnacg"))
+        .or_else(|| dirs::home_dir().map(|path| path.join(".wnacg")))
+        .unwrap_or_else(|| std::env::temp_dir().join("wnacg"))
 }
 
 fn cache_path() -> PathBuf {
@@ -214,10 +239,35 @@ fn cache_temp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.{}.tmp", std::process::id()))
 }
 
+fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|err| format!("无法创建翻译缓存目录：{err}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|err| format!("无法保护翻译缓存目录：{err}"))?;
+    }
+    Ok(())
+}
+
+fn ensure_private_file(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("无法保护本地数据文件：{err}"))?;
+    }
+    Ok(())
+}
+
 fn load_cache_from_path(path: &Path) -> TranslationCache {
     let Ok(metadata) = std::fs::metadata(path) else {
         return TranslationCache::default();
     };
+    if let Err(error) = ensure_private_file(path) {
+        eprintln!("{error}");
+        return TranslationCache::default();
+    }
     if metadata.len() > CACHE_MAX_FILE_BYTES {
         return TranslationCache::default();
     }
@@ -237,21 +287,116 @@ fn write_cache_to_path(cache: &TranslationCache, path: &Path) -> Result<(), Stri
         return Err("翻译缓存超过安全上限".to_string());
     }
     let parent = path.parent().ok_or("翻译缓存路径无效")?;
-    std::fs::create_dir_all(parent).map_err(|err| format!("无法创建翻译缓存目录：{err}"))?;
+    ensure_private_directory(parent)?;
     let temp_path = cache_temp_path(path);
     let result = (|| {
-        let mut file = std::fs::File::create(&temp_path)
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp_path)
             .map_err(|err| format!("无法创建翻译缓存临时文件：{err}"))?;
         file.write_all(&bytes)
             .map_err(|err| format!("无法写入翻译缓存：{err}"))?;
         file.sync_all()
             .map_err(|err| format!("无法同步翻译缓存：{err}"))?;
-        std::fs::rename(&temp_path, path).map_err(|err| format!("无法原子替换翻译缓存：{err}"))
+        std::fs::rename(&temp_path, path).map_err(|err| format!("无法原子替换翻译缓存：{err}"))?;
+        ensure_private_file(path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
     }
     result
+}
+
+fn remove_legacy_api_key(path: &Path, mut value: serde_json::Value) -> Result<(), String> {
+    let object = value
+        .as_object_mut()
+        .ok_or("旧版配置不是有效的 JSON 对象")?;
+    object.remove("deepseekApiKey");
+    let bytes =
+        serde_json::to_vec_pretty(&value).map_err(|err| format!("旧版配置序列化失败：{err}"))?;
+    if bytes.len() as u64 > LEGACY_CONFIG_MAX_FILE_BYTES {
+        return Err("旧版配置超过安全上限".to_string());
+    }
+
+    let parent = path.parent().ok_or("旧版配置路径无效")?;
+    ensure_private_directory(parent)?;
+    let temp_path = cache_temp_path(path);
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|err| format!("无法创建旧版配置临时文件：{err}"))?;
+        file.write_all(&bytes)
+            .map_err(|err| format!("无法清理旧版配置：{err}"))?;
+        file.sync_all()
+            .map_err(|err| format!("无法同步旧版配置：{err}"))?;
+        std::fs::rename(&temp_path, path).map_err(|err| format!("无法原子替换旧版配置：{err}"))?;
+        ensure_private_file(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn legacy_key_remains_after_cleanup(path: &Path, keychain_key: &str) -> Result<bool, String> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("无法检查旧版配置：{error}")),
+    };
+    if metadata.len() > LEGACY_CONFIG_MAX_FILE_BYTES {
+        return Err("旧版配置超过安全上限".to_string());
+    }
+    ensure_private_file(path)?;
+    let content =
+        std::fs::read_to_string(path).map_err(|error| format!("无法读取旧版配置：{error}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|error| format!("旧版配置 JSON 无效：{error}"))?;
+    let Some(legacy_key) = value.get("deepseekApiKey").and_then(|value| value.as_str()) else {
+        return Ok(false);
+    };
+    let legacy_key = legacy_key.trim();
+    if legacy_key.is_empty() {
+        return Ok(false);
+    }
+    if legacy_key != keychain_key {
+        return Ok(true);
+    }
+    remove_legacy_api_key(path, value)?;
+    Ok(false)
+}
+
+fn remove_legacy_api_key_if_present(path: &Path) -> Result<(), String> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("无法检查旧版配置：{error}")),
+    };
+    if metadata.len() > LEGACY_CONFIG_MAX_FILE_BYTES {
+        return Err("旧版配置超过安全上限".to_string());
+    }
+    ensure_private_file(path)?;
+    let content =
+        std::fs::read_to_string(path).map_err(|error| format!("无法读取旧版配置：{error}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|error| format!("旧版配置 JSON 无效：{error}"))?;
+    if value.get("deepseekApiKey").is_some() {
+        remove_legacy_api_key(path, value)?;
+    }
+    Ok(())
 }
 
 fn translation_cache() -> &'static Mutex<TranslationCache> {
@@ -272,6 +417,7 @@ fn persist_translation_cache() -> Result<(), String> {
 fn translation_client() -> Result<&'static reqwest::Client, String> {
     match TRANSLATION_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(90))
             .pool_idle_timeout(Duration::from_secs(120))
@@ -283,6 +429,32 @@ fn translation_client() -> Result<&'static reqwest::Client, String> {
         Ok(client) => Ok(client),
         Err(err) => Err(err.clone()),
     }
+}
+
+fn validate_translation_input(texts: &[String]) -> Result<(), String> {
+    if texts.len() > MAX_TRANSLATION_ITEMS {
+        return Err(format!("单次翻译最多支持 {MAX_TRANSLATION_ITEMS} 条文本"));
+    }
+    if texts
+        .iter()
+        .any(|text| text.len() > MAX_TRANSLATION_ITEM_BYTES)
+    {
+        return Err(format!(
+            "单条翻译文本不能超过 {} KiB",
+            MAX_TRANSLATION_ITEM_BYTES / 1024
+        ));
+    }
+    let total_bytes = texts
+        .iter()
+        .try_fold(0_usize, |total, text| total.checked_add(text.len()))
+        .ok_or("翻译文本总长度溢出")?;
+    if total_bytes > MAX_TRANSLATION_TOTAL_BYTES {
+        return Err(format!(
+            "单次翻译文本总量不能超过 {} KiB",
+            MAX_TRANSLATION_TOTAL_BYTES / 1024
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_batch(
@@ -379,33 +551,74 @@ fn save_api_key_to_keychain(_key: &str) -> Result<(), String> {
     Err("当前系统暂不支持安全保存 DeepSeek 密钥".to_string())
 }
 
-fn migrate_legacy_key(key: &str) -> String {
-    if let Err(error) = save_api_key_to_keychain(key) {
-        eprintln!("DeepSeek 密钥迁移失败：{error}");
-    }
-    key.to_string()
+fn keychain_contains(key: &str) -> bool {
+    keychain_api_key()
+        .ok()
+        .flatten()
+        .is_some_and(|stored| stored == key)
 }
 
-fn api_key() -> Result<String, String> {
+fn keychain_source_after_legacy_cleanup(key: &str) -> ApiKeySource {
+    let legacy_path = config_dir().join("config.json");
+    match legacy_key_remains_after_cleanup(&legacy_path, key) {
+        Ok(false) => ApiKeySource::Keychain,
+        Ok(true) => ApiKeySource::KeychainWithLegacy,
+        Err(error) => {
+            eprintln!("DeepSeek 旧版明文密钥清理失败：{error}");
+            ApiKeySource::KeychainWithLegacy
+        }
+    }
+}
+
+fn api_key_with_source() -> Result<(String, ApiKeySource), String> {
     if let Some(key) = keychain_api_key()? {
-        return Ok(key);
+        let source = keychain_source_after_legacy_cleanup(&key);
+        return Ok((key, source));
     }
     if let Ok(key) = std::env::var("DEEPSEEK_API_KEY") {
         if !key.trim().is_empty() {
-            return Ok(migrate_legacy_key(key.trim()));
+            let key = key.trim().to_string();
+            match save_api_key_to_keychain(&key) {
+                Ok(()) if keychain_contains(&key) => {
+                    let source = keychain_source_after_legacy_cleanup(&key);
+                    return Ok((key, source));
+                }
+                Ok(()) => {
+                    eprintln!("DeepSeek 环境变量密钥写入安全凭据存储后未能回读确认");
+                }
+                Err(error) => {
+                    eprintln!("DeepSeek 环境变量密钥迁移失败：{error}");
+                }
+            }
+            return Ok((key, ApiKeySource::Environment));
         }
     }
     let path = config_dir().join("config.json");
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(key) = value.get("deepseekApiKey").and_then(|v| v.as_str()) {
-                if !key.trim().is_empty() {
-                    return Ok(migrate_legacy_key(key.trim()));
+    if std::fs::metadata(&path)
+        .ok()
+        .is_some_and(|metadata| metadata.len() <= LEGACY_CONFIG_MAX_FILE_BYTES)
+    {
+        ensure_private_file(&path)?;
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(key) = value.get("deepseekApiKey").and_then(|v| v.as_str()) {
+                    if !key.trim().is_empty() {
+                        let key = key.trim().to_string();
+                        if save_api_key_to_keychain(&key).is_ok() && keychain_contains(&key) {
+                            remove_legacy_api_key(&path, value)?;
+                            return Ok((key, ApiKeySource::Keychain));
+                        }
+                        return Ok((key, ApiKeySource::LegacyConfig));
+                    }
                 }
             }
         }
     }
     Err("未找到 DeepSeek API 密钥，请在阅读设置中保存密钥".to_string())
+}
+
+fn api_key() -> Result<String, String> {
+    api_key_with_source().map(|(key, _)| key)
 }
 
 /// 将 DeepSeek 密钥保存到操作系统的安全凭据存储中。
@@ -415,7 +628,12 @@ pub fn set_deepseek_api_key(api_key: String) -> Result<(), String> {
     if key.is_empty() {
         return Err("DeepSeek API 密钥不能为空".to_string());
     }
-    save_api_key_to_keychain(key)
+    save_api_key_to_keychain(key)?;
+    if !keychain_contains(key) {
+        return Err("密钥写入钥匙串后未能回读确认".to_string());
+    }
+    remove_legacy_api_key_if_present(&config_dir().join("config.json"))
+        .map_err(|error| format!("密钥已保存到钥匙串，但旧版明文清理失败：{error}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -462,6 +680,10 @@ async fn translate_chunk(
         ]
     });
 
+    let _request_permit = TRANSLATION_REQUEST_SEMAPHORE
+        .acquire()
+        .await
+        .map_err(|_| "翻译请求队列已关闭".to_string())?;
     let response = client
         .post(API_URL)
         .bearer_auth(key)
@@ -533,6 +755,7 @@ async fn translate_batch(
     system_prompt: &str,
     namespace: CacheNamespace,
 ) -> Result<Vec<String>, String> {
+    validate_translation_input(&texts)?;
     let (mut results, pending) = {
         let cache = translation_cache()
             .lock()
@@ -544,23 +767,35 @@ async fn translate_batch(
     }
 
     let key = api_key()?;
+    let key_ref = key.as_str();
     let client = translation_client()?;
 
-    let mut pending_chunks = Vec::new();
-    let mut chunk_texts = Vec::<Vec<PendingText>>::new();
-    for chunk in pending.chunks(CHUNK_SIZE) {
-        let items: Vec<(usize, String)> = chunk
-            .iter()
-            .map(|item| (item.id, item.source.clone()))
-            .collect();
-        chunk_texts.push(chunk.to_vec());
-        pending_chunks.push(translate_chunk(client, &key, items, system_prompt));
-    }
+    use futures_util::StreamExt as _;
+    let pending_chunks = pending
+        .chunks(CHUNK_SIZE)
+        .map(<[PendingText]>::to_vec)
+        .collect::<Vec<_>>();
+    let mut chunk_results = futures_util::stream::iter(pending_chunks.into_iter().enumerate())
+        .map(|(chunk_index, chunk)| {
+            let items = chunk
+                .iter()
+                .map(|item| (item.id, item.source.clone()))
+                .collect();
+            async move {
+                (
+                    chunk_index,
+                    chunk,
+                    translate_chunk(client, key_ref, items, system_prompt).await,
+                )
+            }
+        })
+        .buffer_unordered(TRANSLATION_REQUEST_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    chunk_results.sort_by_key(|(chunk_index, _, _)| *chunk_index);
 
-    // 各分块并行请求,总延迟取最慢的一块而非逐块累加
-    let chunk_results = futures_util::future::join_all(pending_chunks).await;
     let mut cache_updates = Vec::<(String, String)>::new();
-    for (chunk_meta, chunk_result) in chunk_texts.into_iter().zip(chunk_results) {
+    for (_, chunk_meta, chunk_result) in chunk_results {
         match chunk_result {
             Ok(map) => {
                 for item in chunk_meta {
@@ -587,8 +822,8 @@ async fn translate_batch(
 /// 检查翻译密钥是否可用
 #[tauri::command]
 pub async fn translate_engine_status() -> Result<String, String> {
-    api_key()?;
-    Ok("ready".to_string())
+    let (_, source) = api_key_with_source()?;
+    Ok(source.as_str().to_string())
 }
 
 #[cfg(test)]
@@ -613,6 +848,18 @@ mod tests {
         let first = translation_client().expect("应创建翻译客户端") as *const reqwest::Client;
         let second = translation_client().expect("应复用翻译客户端") as *const reqwest::Client;
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn translation_input_limits_bound_paid_requests() {
+        let too_many = vec!["a".to_string(); MAX_TRANSLATION_ITEMS + 1];
+        assert!(validate_translation_input(&too_many).is_err());
+
+        let oversized_item = vec!["a".repeat(MAX_TRANSLATION_ITEM_BYTES + 1)];
+        assert!(validate_translation_input(&oversized_item).is_err());
+
+        let within_limits = vec!["短い台詞".to_string(); 30];
+        assert!(validate_translation_input(&within_limits).is_ok());
     }
 
     #[test]
@@ -752,10 +999,100 @@ mod tests {
             Some("漫画标题")
         );
         assert!(!temp_path.exists(), "成功写入后不应残留临时文件");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            let directory_mode = std::fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600);
+            assert_eq!(directory_mode, 0o700);
+        }
 
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    #[test]
+    fn legacy_config_cleanup_preserves_unrelated_fields() {
+        let path = test_cache_path("config.json");
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        let value = serde_json::json!({
+            "deepseekApiKey": "test-only-secret",
+            "readerMode": "spread"
+        });
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        remove_legacy_api_key(&path, value).expect("应清理旧版明文密钥");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(stored.get("deepseekApiKey").is_none());
+        assert_eq!(
+            stored.get("readerMode").and_then(|value| value.as_str()),
+            Some("spread")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn existing_keychain_value_cleans_only_the_matching_legacy_key() {
+        let path = test_cache_path("config.json");
+        let parent = path.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "deepseekApiKey": "same-key",
+                "readerMode": "spread"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(!legacy_key_remains_after_cleanup(&path, "same-key").unwrap());
+        let cleaned: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(cleaned.get("deepseekApiKey").is_none());
+        assert_eq!(
+            cleaned.get("readerMode").and_then(|value| value.as_str()),
+            Some("spread")
+        );
+
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({ "deepseekApiKey": "different-key" })).unwrap(),
+        )
+        .unwrap();
+        assert!(legacy_key_remains_after_cleanup(&path, "same-key").unwrap());
+        let preserved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            preserved
+                .get("deepseekApiKey")
+                .and_then(|value| value.as_str()),
+            Some("different-key")
+        );
+
+        remove_legacy_api_key_if_present(&path).unwrap();
+        let replaced: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(replaced.get("deepseekApiKey").is_none());
+
+        let _ = std::fs::remove_dir_all(parent);
     }
 
     #[test]

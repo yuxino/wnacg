@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "check": "npm run build && cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo clippy --manifest-path src-tauri/Cargo.toml --locked -- -D warnings && cargo test --manifest-path src-tauri/Cargo.toml --locked && cargo check --manifest-path src-tauri/ocr/manga_helper/Cargo.toml --locked",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -15,7 +16,7 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
-    "vite": "^6.0.3",
+    "vite": "^6.4.3",
     "typescript": "~5.6.2"
   }
 }

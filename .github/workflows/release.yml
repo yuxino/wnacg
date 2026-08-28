@@ -29,8 +29,49 @@ jobs:
             }
           '
 
-  build-windows:
+  quality:
     needs: verify-version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit JavaScript dependencies
+        run: npm audit --audit-level=high
+
+      - name: Check frontend
+        run: npm run build
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Lint Rust
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked -- -D warnings
+
+      - name: Test Rust
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+      - name: Check locked manga OCR helper
+        run: cargo check --manifest-path src-tauri/ocr/manga_helper/Cargo.toml --locked
+
+  build-windows:
+    needs: [verify-version, quality]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,7 +88,7 @@ jobs:
           workspaces: src-tauri -> target
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build Tauri (Windows)
         run: npm run tauri build
@@ -67,7 +108,7 @@ jobs:
           if-no-files-found: error
 
   build-macos:
-    needs: verify-version
+    needs: [verify-version, quality]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +125,7 @@ jobs:
           workspaces: src-tauri -> target
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build Tauri (macOS)
         run: npm run tauri build

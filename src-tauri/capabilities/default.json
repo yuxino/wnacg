@@ -5,6 +5,13 @@
   "windows": ["main", "album-*"],
   "permissions": [
     "core:default",
-    "opener:default"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://github.com/yuxino/wnacg/releases*"
+        }
+      ]
+    }
   ]
 }

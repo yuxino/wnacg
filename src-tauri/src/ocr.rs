@@ -2,7 +2,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,6 +15,7 @@ const VISION_HELPER_VERSION: &str = "v2";
 
 // 漫画引擎(日文竖排):Rust 助手 + ONNX 模型,首次使用由 cargo 编译并缓存
 const MANGA_CARGO_TOML: &str = include_str!("../ocr/manga_helper/Cargo.toml");
+const MANGA_CARGO_LOCK: &str = include_str!("../ocr/manga_helper/Cargo.lock");
 const MANGA_HELPER_SOURCE: &str = include_str!("../ocr/manga_helper/src/main.rs");
 const MANGA_HELPER_VERSION: &str = "v1";
 
@@ -22,28 +23,38 @@ const MAX_VISION_POOL: usize = 3;
 const MAX_MANGA_POOL: usize = 2;
 const IMAGE_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
 
-// (文件名, 下载地址, 最小字节数, 用于校验下载是否完整)
-const MODEL_FILES: &[(&str, &str, u64)] = &[
-    (
-        "comic-text-detector.onnx",
-        "https://huggingface.co/mayocream/comic-text-detector-onnx/resolve/main/comic-text-detector.onnx",
-        50_000_000,
-    ),
-    (
-        "encoder_model.onnx",
-        "https://huggingface.co/l0wgear/manga-ocr-2025-onnx/resolve/main/encoder_model.onnx",
-        10_000_000,
-    ),
-    (
-        "decoder_model.onnx",
-        "https://huggingface.co/l0wgear/manga-ocr-2025-onnx/resolve/main/decoder_model.onnx",
-        50_000_000,
-    ),
-    (
-        "vocab.txt",
-        "https://huggingface.co/l0wgear/manga-ocr-2025-onnx/resolve/main/vocab.txt",
-        10_000,
-    ),
+struct ModelFile {
+    name: &'static str,
+    url: &'static str,
+    bytes: u64,
+    sha256: &'static str,
+}
+
+const MODEL_FILES: &[ModelFile] = &[
+    ModelFile {
+        name: "comic-text-detector.onnx",
+        url: "https://huggingface.co/mayocream/comic-text-detector-onnx/resolve/a5d67ec772adef819ef5b0e7aa701fcf4c8bf74a/comic-text-detector.onnx",
+        bytes: 94_669_756,
+        sha256: "1a86ace74961413cbd650002e7bb4dcec4980ffa21b2f19b86933372071d718f",
+    },
+    ModelFile {
+        name: "encoder_model.onnx",
+        url: "https://huggingface.co/l0wgear/manga-ocr-2025-onnx/resolve/e8b27bbd3f424fe3877e0bda704d6a920e4f0a33/encoder_model.onnx",
+        bytes: 22_356_885,
+        sha256: "f87668ae0f62d6f032dac6b213e8c0fea84cd15895ac8cab624cc9a2f49d4a27",
+    },
+    ModelFile {
+        name: "decoder_model.onnx",
+        url: "https://huggingface.co/l0wgear/manga-ocr-2025-onnx/resolve/e8b27bbd3f424fe3877e0bda704d6a920e4f0a33/decoder_model.onnx",
+        bytes: 118_053_454,
+        sha256: "6b1fb216d542c4b2a4fa5b9d7ae3522081eb85fb959d2cecd28055af956a8a5e",
+    },
+    ModelFile {
+        name: "vocab.txt",
+        url: "https://huggingface.co/l0wgear/manga-ocr-2025-onnx/resolve/e8b27bbd3f424fe3877e0bda704d6a920e4f0a33/vocab.txt",
+        bytes: 24_072,
+        sha256: "344fbb6b8bf18c57839e924e2c9365434697e0227fac00b88bb4899b78aa594d",
+    },
 ];
 
 #[derive(Debug, Deserialize)]
@@ -208,16 +219,20 @@ fn vision_helper_dir() -> PathBuf {
 }
 
 fn manga_helper_dir() -> PathBuf {
-    let hash = hash_sources(&[MANGA_HELPER_VERSION, MANGA_CARGO_TOML, MANGA_HELPER_SOURCE]);
+    let hash = hash_sources(&[
+        MANGA_HELPER_VERSION,
+        MANGA_CARGO_TOML,
+        MANGA_CARGO_LOCK,
+        MANGA_HELPER_SOURCE,
+    ]);
     std::env::temp_dir().join(format!("wnacg-ocr-manga-{hash:016x}"))
 }
 
 fn models_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("wnacg")
+    dirs::data_local_dir()
+        .map(|path| path.join("wnacg"))
+        .or_else(|| dirs::home_dir().map(|path| path.join(".wnacg")))
+        .unwrap_or_else(|| std::env::temp_dir().join("wnacg"))
         .join("ocr-models")
 }
 
@@ -249,34 +264,96 @@ fn ensure_vision_helper() -> Result<PathBuf, String> {
     Ok(bin)
 }
 
-fn ensure_manga_models() -> Result<(), String> {
+fn file_sha256(path: &std::path::Path) -> Result<String, String> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("无法读取 OCR 模型：{error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 128 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("无法校验 OCR 模型：{error}"))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn model_file_is_valid(path: &std::path::Path, model: &ModelFile) -> bool {
+    std::fs::metadata(path)
+        .ok()
+        .is_some_and(|metadata| metadata.len() == model.bytes)
+        && file_sha256(path)
+            .ok()
+            .is_some_and(|digest| digest == model.sha256)
+}
+
+fn ensure_manga_models_inner() -> Result<(), String> {
     let dir = models_dir();
     std::fs::create_dir_all(&dir).map_err(|err| format!("无法创建模型目录：{err}"))?;
-    for (name, url, min_bytes) in MODEL_FILES {
-        let dest = dir.join(name);
-        if let Ok(meta) = std::fs::metadata(&dest) {
-            if meta.len() >= *min_bytes {
-                continue;
-            }
+    for model in MODEL_FILES {
+        let dest = dir.join(model.name);
+        if model_file_is_valid(&dest, model) {
+            continue;
         }
+        let part = dir.join(format!("{}.part", model.name));
         let status = Command::new("curl")
-            .args(["-fL", "--retry", "3", "-C", "-"])
-            .arg(url)
+            .args([
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "-fL",
+                "--retry",
+                "3",
+                "--max-filesize",
+            ])
+            .arg(model.bytes.to_string())
+            .args(["-C", "-"])
+            .arg(model.url)
             .arg("-o")
-            .arg(&dest)
+            .arg(&part)
             .status()
             .map_err(|err| format!("未找到 curl，无法下载 OCR 模型：{err}"))?;
         if !status.success() {
-            let _ = std::fs::remove_file(&dest);
-            return Err(format!("OCR 模型 {name} 下载失败，请检查网络后重试"));
+            let _ = std::fs::remove_file(&part);
+            return Err(format!(
+                "OCR 模型 {} 下载失败，请检查网络后重试",
+                model.name
+            ));
         }
-        if let Ok(meta) = std::fs::metadata(&dest) {
-            if meta.len() < *min_bytes {
-                let _ = std::fs::remove_file(&dest);
-                return Err(format!("OCR 模型 {name} 下载不完整，请重试"));
-            }
+        if !model_file_is_valid(&part, model) {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!("OCR 模型 {} 校验失败，请重试", model.name));
         }
+        if dest.exists() {
+            std::fs::remove_file(&dest)
+                .map_err(|error| format!("无法替换旧 OCR 模型 {}: {error}", model.name))?;
+        }
+        std::fs::rename(&part, &dest)
+            .map_err(|error| format!("无法安装 OCR 模型 {}: {error}", model.name))?;
     }
+    Ok(())
+}
+
+fn ensure_manga_models() -> Result<(), String> {
+    static MODELS_READY: OnceLock<()> = OnceLock::new();
+    static INSTALLING: Mutex<()> = Mutex::new(());
+    if MODELS_READY.get().is_some() {
+        return Ok(());
+    }
+    let _guard = INSTALLING
+        .lock()
+        .map_err(|_| "OCR 模型初始化冲突".to_string())?;
+    if MODELS_READY.get().is_some() {
+        return Ok(());
+    }
+    ensure_manga_models_inner()?;
+    let _ = MODELS_READY.set(());
     Ok(())
 }
 
@@ -284,9 +361,14 @@ fn cargo_bin() -> Command {
     match Command::new("cargo").arg("--version").output() {
         Ok(_) => Command::new("cargo"),
         Err(_) => {
-            let fallback = std::env::var("HOME")
-                .map(|home| PathBuf::from(home).join(".cargo/bin/cargo"))
-                .unwrap_or_default();
+            let binary_name = if cfg!(target_os = "windows") {
+                "cargo.exe"
+            } else {
+                "cargo"
+            };
+            let fallback = dirs::home_dir()
+                .map(|home| home.join(".cargo").join("bin").join(binary_name))
+                .unwrap_or_else(|| PathBuf::from(binary_name));
             Command::new(fallback)
         }
     }
@@ -299,19 +381,26 @@ fn ensure_manga_helper() -> Result<PathBuf, String> {
     let dir = manga_helper_dir();
     std::fs::create_dir_all(dir.join("src"))
         .map_err(|err| format!("无法创建 OCR 缓存目录：{err}"))?;
-    let bin = dir.join("target").join("release").join("manga_ocr_helper");
+    let binary_name = if cfg!(target_os = "windows") {
+        "manga_ocr_helper.exe"
+    } else {
+        "manga_ocr_helper"
+    };
+    let bin = dir.join("target").join("release").join(binary_name);
     if bin.exists() {
         return Ok(bin);
     }
 
     std::fs::write(dir.join("Cargo.toml"), MANGA_CARGO_TOML)
         .map_err(|err| format!("无法写入 OCR 助手工程：{err}"))?;
+    std::fs::write(dir.join("Cargo.lock"), MANGA_CARGO_LOCK)
+        .map_err(|err| format!("无法写入 OCR 助手锁文件：{err}"))?;
     std::fs::write(dir.join("src/main.rs"), MANGA_HELPER_SOURCE)
         .map_err(|err| format!("无法写入 OCR 助手源码：{err}"))?;
 
     let status = cargo_bin()
         .current_dir(&dir)
-        .args(["build", "--release"])
+        .args(["build", "--release", "--locked"])
         .env("WNACG_OCR_MODELS_DIR", models_dir())
         .status()
         .map_err(|err| format!("未找到 cargo，本地漫画 OCR 需要 Rust 工具链：{err}"))?;
@@ -453,8 +542,9 @@ fn ensure_engine(engine: OcrEngine) -> Result<PathBuf, String> {
     match engine {
         OcrEngine::Vision => ensure_vision_helper(),
         OcrEngine::Manga => {
+            let helper = ensure_manga_helper()?;
             ensure_manga_models()?;
-            ensure_manga_helper()
+            Ok(helper)
         }
     }
 }
@@ -660,11 +750,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_validation_checks_exact_size_and_sha256() {
+        let path =
+            std::env::temp_dir().join(format!("wnacg-model-validation-{}", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+        let model = ModelFile {
+            name: "fixture",
+            url: "https://example.invalid/fixture",
+            bytes: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        };
+        assert!(model_file_is_valid(&path, &model));
+        std::fs::write(&path, b"abcd").unwrap();
+        assert!(!model_file_is_valid(&path, &model));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[ignore = "requires WNACG_OCR_TEST_IMAGE and the downloaded manga OCR models"]
     fn manga_engine_detects_vertical_japanese() {
-        let path = std::env::var("WNACG_OCR_TEST_IMAGE").unwrap_or_else(|_| {
-            "/Users/gavin/Documents/Codex/2026-08-07/wn/work/ocr-test/test_vertical3.png"
-                .to_string()
-        });
+        let path = std::env::var("WNACG_OCR_TEST_IMAGE")
+            .expect("请通过 WNACG_OCR_TEST_IMAGE 指定测试图片");
         let bytes = std::fs::read(&path).expect("测试图片不存在");
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let pages = vec![OcrPageInput {
@@ -693,10 +799,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires WNACG_OCR_TEST_IMAGE and the downloaded manga OCR models"]
     fn manga_engine_boxes_are_deterministic_between_passes() {
-        let path = std::env::var("WNACG_OCR_TEST_IMAGE").unwrap_or_else(|_| {
-            "/Users/gavin/Documents/Codex/2026-08-07/wn/work/ocr-test/test_manga2.png".to_string()
-        });
+        let path = std::env::var("WNACG_OCR_TEST_IMAGE")
+            .expect("请通过 WNACG_OCR_TEST_IMAGE 指定测试图片");
         let bytes = std::fs::read(&path).expect("测试图片不存在");
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
 

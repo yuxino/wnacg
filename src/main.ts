@@ -14,7 +14,6 @@ type Album = {
 type PhotoEntry = {
   id: string;
   url: string;
-  thumbnail: string | null;
   title: string;
 };
 
@@ -50,7 +49,6 @@ type ProgressState = {
 
 type DisplayImageResult = {
   url: string;
-  viaFallback: boolean;
   imageUrl: string;
 };
 
@@ -122,6 +120,33 @@ const persistentListMaxAge = 24 * 60 * 60 * 1000;
 const READER_ZOOM_MIN = 0.5;
 const READER_ZOOM_MAX = 2.5;
 const READER_ZOOM_STEP = 0.1;
+const allowedImageDomains = [
+  "wnacg.com",
+  "wnacg.org",
+  "wn03.cfd",
+  "wn09.shop",
+  "wnacgimg.date",
+  "wnimg1.ru",
+  "qy0.ru",
+];
+
+function hostIsDomain(host: string, domain: string) {
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
+function isAllowedRemoteImageUrl(value: string) {
+  try {
+    const url = new URL(value);
+    const host = url.hostname.trim().replace(/\.$/, "").toLowerCase();
+    return url.protocol === "https:"
+      && !url.port
+      && !url.username
+      && !url.password
+      && allowedImageDomains.some((domain) => hostIsDomain(host, domain));
+  } catch {
+    return false;
+  }
+}
 
 function normalizeReaderZoom(value: number) {
   if (!Number.isFinite(value)) return 1;
@@ -626,28 +651,39 @@ function checkForAppUpdate(manual: boolean) {
   return updateCheckInFlight;
 }
 
-let deepseekKeyConfigured: boolean | null = null;
+type DeepseekKeySource = "keychain" | "keychain-with-legacy" | "environment" | "legacy-config" | "missing";
+let deepseekKeySource: DeepseekKeySource | null = null;
+
+function hasUsableDeepseekKey() {
+  return deepseekKeySource !== null && deepseekKeySource !== "missing";
+}
 
 function syncDeepseekKeyControl() {
   const status = readerSettingsPanel.querySelector<HTMLElement>(".api-key-status");
   const input = readerSettingsPanel.querySelector<HTMLInputElement>(".api-key-input");
   if (status) {
-    status.textContent = deepseekKeyConfigured === null
-      ? "检查中"
-      : deepseekKeyConfigured ? "已安全保存到钥匙串" : "尚未配置";
-    status.classList.toggle("configured", deepseekKeyConfigured === true);
+    status.textContent = deepseekKeySource === null ? "检查中" : {
+      keychain: "已安全保存到钥匙串",
+      "keychain-with-legacy": "钥匙串可用；旧配置仍含密钥",
+      environment: "使用环境变量（未持久保存）",
+      "legacy-config": "使用旧配置（未安全迁移）",
+      missing: "尚未配置",
+    }[deepseekKeySource];
+    status.classList.toggle("configured", hasUsableDeepseekKey());
   }
   if (input) {
-    input.placeholder = deepseekKeyConfigured ? "输入新密钥可替换" : "粘贴 API Key";
+    input.placeholder = hasUsableDeepseekKey() ? "输入新密钥可替换" : "粘贴 API Key";
   }
 }
 
 async function refreshDeepseekKeyStatus() {
   try {
-    await invokeTauri<string>("translate_engine_status");
-    deepseekKeyConfigured = true;
+    const source = await invokeTauri<string>("translate_engine_status");
+    deepseekKeySource = source === "keychain" || source === "keychain-with-legacy" || source === "environment" || source === "legacy-config"
+      ? source
+      : "missing";
   } catch {
-    deepseekKeyConfigured = false;
+    deepseekKeySource = "missing";
   }
   syncDeepseekKeyControl();
 }
@@ -683,7 +719,7 @@ function renderDeepseekKeyControl() {
     save.textContent = "保存中";
     try {
       await invokeTauri<void>("set_deepseek_api_key", { apiKey });
-      deepseekKeyConfigured = true;
+      deepseekKeySource = "keychain";
       input.value = "";
       titleTranslateFailed.clear();
       state.translateFailed = {};
@@ -869,14 +905,18 @@ function buildReaderSettingsPanel() {
     },
     {
       title: "翻译字幕",
-      render: () => renderSegmented<boolean>(
-        [
-          { label: "关闭", value: false },
-          { label: "开启", value: true, hint: "R" },
-        ],
-        state.translateEnabled,
-        (v) => toggleReaderTranslate(v),
-      ),
+      render: () => {
+        const control = renderSegmented<boolean>(
+          [
+            { label: translateInitializing ? "取消" : "关闭", value: false },
+            { label: translateInitializing ? "准备中…" : "开启", value: true, hint: "R" },
+          ],
+          translateInitializing || state.translateEnabled,
+          (v) => toggleReaderTranslate(v),
+        );
+        control.setAttribute("aria-busy", String(translateInitializing));
+        return control;
+      },
     },
     {
       title: "生肉标题翻译",
@@ -984,7 +1024,10 @@ function setReaderSettingsOpen(open: boolean) {
   readerSettingsPanel.hidden = !open;
   readerSettingsButton.classList.toggle("active", open);
   readerSettingsButton.setAttribute("aria-expanded", String(open));
-  if (open) buildReaderSettingsPanel();
+  if (open) {
+    buildReaderSettingsPanel();
+    void refreshDeepseekKeyStatus();
+  }
 }
 
 function toggleReaderSettingsPanel() {
@@ -1665,6 +1708,8 @@ const translateInFlight = new Set<number>();
 const translateDone = new Set<number>();
 let translateWorkers = 0;
 const TRANSLATE_CONCURRENCY = 3;
+let translateInitializing = false;
+let translateEnableToken = 0;
 
 function resetReaderPipelines(clearPreloads = false) {
   readerPipelineEpoch++;
@@ -1685,21 +1730,37 @@ function resetReaderPipelines(clearPreloads = false) {
 }
 
 async function toggleReaderTranslate(force?: boolean) {
-  const next = force ?? !state.translateEnabled;
-  if (next === state.translateEnabled) return;
+  const next = force ?? !(state.translateEnabled || translateInitializing);
   if (!next) {
-    updateReaderPrefs({ translateMode: false });
+    if (!state.translateEnabled && !translateInitializing) return;
+    translateEnableToken++;
+    translateInitializing = false;
+    ocrEnableToken++;
+    if (state.translateEnabled) updateReaderPrefs({ translateMode: false });
+    else syncReaderControls();
     return;
   }
-  if (state.ocrLang !== "ja") {
-    updateReaderPrefs({ ocrLang: "ja" });
+  if (state.translateEnabled || translateInitializing) return;
+
+  const token = ++translateEnableToken;
+  translateInitializing = true;
+  syncReaderControls();
+  try {
+    if (state.ocrLang !== "ja") {
+      updateReaderPrefs({ ocrLang: "ja" });
+    }
+    if (!state.ocrEnabled) {
+      await toggleReaderOcr(true);
+    }
+    if (token !== translateEnableToken || !translateInitializing || !state.ocrEnabled) return;
+    updateReaderPrefs({ translateMode: true });
+    queueOcrWindow(currentStreamIndex());
+  } finally {
+    if (token === translateEnableToken) {
+      translateInitializing = false;
+      syncReaderControls();
+    }
   }
-  if (!state.ocrEnabled) {
-    await toggleReaderOcr(true);
-    if (!state.ocrEnabled) return;
-  }
-  updateReaderPrefs({ translateMode: true });
-  queueOcrWindow(currentStreamIndex());
 }
 
 function queueTranslate(index: number) {
@@ -2629,14 +2690,23 @@ function hydrateImage(img: HTMLImageElement, url: string, _referer?: string | nu
   img.classList.remove("image-error");
   img.classList.add("image-loading");
   img.decoding = "async";
+  if (!isAllowedRemoteImageUrl(url)) {
+    img.classList.remove("image-loading");
+    img.classList.add("image-error");
+    img.alt = "封面地址不受信任";
+    img.closest(".cover")?.classList.remove("has-image");
+    return;
+  }
   const onLoad = () => {
     if (img.dataset.imageToken !== token) return;
     img.classList.remove("image-loading");
+    img.closest(".cover")?.classList.add("has-image");
   };
   const onError = () => {
     if (img.dataset.imageToken !== token) return;
     img.classList.remove("image-loading");
     img.classList.add("image-error");
+    img.closest(".cover")?.classList.remove("has-image");
   };
   img.addEventListener("load", onLoad, { once: true });
   img.addEventListener("error", onError, { once: true });
@@ -2735,22 +2805,18 @@ async function loadDisplayImageDataUrl(
   onProgress: (progress: ProgressState) => void,
 ): Promise<DisplayImageResult> {
   const imageUrl = await resolvePhotoImageUrlWithRetry(index, 2);
+  if (!isAllowedRemoteImageUrl(imageUrl)) {
+    throw new Error("图片地址不受信任，已阻止直接加载");
+  }
   state.imageUrls[index] = imageUrl;
   const referer = state.photos[index]?.url;
-  try {
-    return {
-      url: await fetchImageDataUrlWithProgress(imageUrl, referer, requestId, onProgress).then((dataUrl) => {
-        ocrByteCacheUrls.add(imageUrl);
-        return dataUrl;
-      }),
-      viaFallback: false,
-      imageUrl,
-    };
-  } catch (error) {
-    console.warn("Image proxy failed, falling back to direct URL", error);
-    setSoftStatus("图片线路较慢，正在尝试备用显示");
-    return { url: imageUrl, viaFallback: true, imageUrl };
-  }
+  return {
+    url: await fetchImageDataUrlWithProgress(imageUrl, referer, requestId, onProgress).then((dataUrl) => {
+      ocrByteCacheUrls.add(imageUrl);
+      return dataUrl;
+    }),
+    imageUrl,
+  };
 }
 
 async function resolvePhotoImageUrlWithRetry(index: number, retries = 2) {
@@ -3726,7 +3792,7 @@ async function loadStreamImage(container: HTMLElement) {
     // consumer arrives first owns the single download; the rest await it.
     if (!state.preloadedUrls[index]) await preloadFullImage(index, token);
     // Multiple consumers can wake from the same failed preload. Re-check the
-    // shared slot before creating a foreground fallback so only the first
+    // shared slot before creating a foreground load so only the first
     // continuation becomes the new owner.
     while (!state.preloadedUrls[index]) {
       const competingLoad = preloadInFlight.get(index);
@@ -3738,7 +3804,6 @@ async function loadStreamImage(container: HTMLElement) {
     if (state.preloadedUrls[index]) {
       image = {
         url: state.preloadedUrls[index],
-        viaFallback: !state.preloadedUrls[index].startsWith("data:"),
         imageUrl: state.imageUrls[index] ?? "",
       };
     } else {
@@ -3764,7 +3829,7 @@ async function loadStreamImage(container: HTMLElement) {
           if (preloadInFlight.get(index) === foregroundTask) preloadInFlight.delete(index);
         }
       })();
-      // Register the visible fallback in the same map. Scheduled retries,
+      // Register the visible load in the same map. Scheduled retries,
       // OCR prefetches now await this download instead of starting a second one
       // on slow connections.
       preloadInFlight.set(index, foregroundTask);
@@ -3809,11 +3874,7 @@ async function loadStreamImage(container: HTMLElement) {
       renderStreamError(container, index, "这张图片暂时没有加载出来");
     }, { once: true });
     img.src = image.url;
-    if (image.viaFallback) {
-      container.replaceChildren(createProgressIndicator(null, true, "备用线路加载中"));
-    } else {
-      container.replaceChildren(img);
-    }
+    container.replaceChildren(img);
   } catch (error) {
     if (token !== state.readerToken || container.dataset.state !== "loading") return;
     container.dataset.state = "error";
@@ -4354,7 +4415,6 @@ window.addEventListener("resize", () => {
 });
 
 const initialAid = getInitialAlbumFromHash();
-void refreshDeepseekKeyStatus();
 void loadCurrentAppVersion();
 listen<AppUpdateInfo>("app-update-checked", (event) => {
   if (isAppUpdateInfo(event.payload)) applyAppUpdateInfo(event.payload);
