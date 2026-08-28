@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "source": "docs/brand/kiri/kiri-app-icon-source.png",
+  "sourceSha256": "1522e30be1b1d5ebcf017cb7c002e6050b7a6ac366c4a907bebbae0e5d23c236",
+  "assets": {
+    "src-tauri/icons/kiri/32x32.png": "dfee8a4aa00b2210e0b0f65e36dd9a0bd00a3eddd2ef270bd66610d33cb20248",
+    "src-tauri/icons/kiri/128x128.png": "fbdadb8a21ff751ec518329fe4847cc3a08c581aa9e16fefbee369ceb819e2f1",
+    "src-tauri/icons/kiri/128x128@2x.png": "9f67d52f6a2604fce7004bb0c20cdbbd426a9f17a4e7f6566ebb39a2014bd8fe",
+    "src-tauri/icons/kiri/icon.icns": "e549f3d8a8593eef0d4ae095347a74035ff25bddd15ff18d9a94c54d50c6e596",
+    "src-tauri/icons/kiri/icon.ico": "373dfa1ffeda0845c325e6bddc0d404975b1a93f89040bafe70c83f943393a43",
+    "public/brand/kiri-icon-128.png": "fbdadb8a21ff751ec518329fe4847cc3a08c581aa9e16fefbee369ceb819e2f1"
+  }
+}
