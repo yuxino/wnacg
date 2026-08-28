@@ -73,7 +73,31 @@ jobs:
         run: cargo check --manifest-path src-tauri/ocr/manga_helper/Cargo.toml --locked
 
       - name: Build Tauri (macOS)
+        env:
+          APPLE_SIGNING_IDENTITY: '-'
         run: npm run tauri build -- --ci --config '{"build":{"beforeBuildCommand":null}}'
+
+      - name: Verify macOS release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          app="src-tauri/target/release/bundle/macos/wnacg.app"
+          dmgs=(src-tauri/target/release/bundle/dmg/*.dmg)
+          [[ -d "$app" ]] || { echo "macOS app bundle is missing" >&2; exit 1; }
+          [[ ${#dmgs[@]} -eq 1 ]] || { echo "expected exactly one DMG, found ${#dmgs[@]}" >&2; exit 1; }
+
+          codesign --verify --deep --strict --verbose=2 "$app"
+          hdiutil verify "${dmgs[0]}"
+
+          mount_dir="$(mktemp -d)"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_dir" "${dmgs[0]}" >/dev/null
+          trap 'hdiutil detach "$mount_dir" >/dev/null' EXIT
+
+          packaged_app="$mount_dir/wnacg.app"
+          [[ -d "$packaged_app" ]] || { echo "DMG does not contain wnacg.app" >&2; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$packaged_app"
 
       - name: Upload DMG
         uses: actions/upload-artifact@v7.0.1
