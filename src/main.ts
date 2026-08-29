@@ -656,7 +656,7 @@ function syncDeepseekKeyControl() {
   const input = readerSettingsPanel.querySelector<HTMLInputElement>(".api-key-input");
   if (status) {
     status.textContent = deepseekKeySource === null ? "检查中" : {
-      keychain: "已安全保存到钥匙串",
+      keychain: "已安全保存",
       "keychain-with-legacy": "钥匙串可用；旧配置仍含密钥",
       environment: "使用环境变量（未持久保存）",
       "legacy-config": "使用旧配置（未安全迁移）",
@@ -722,7 +722,7 @@ function renderDeepseekKeyControl() {
       }
       translateVisibleTitles();
       refreshTranslateStatus();
-      showToast("DeepSeek 密钥已保存到 macOS 钥匙串", "success", 3200);
+      showToast("DeepSeek 密钥已安全保存", "success", 3200);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       showToast(`密钥保存失败：${message}`, "error", 4200);

@@ -1648,6 +1648,7 @@ pub fn run() {
                 show_main_window(app);
             }
             let _ = app;
+            let _ = event;
         });
 }
 
