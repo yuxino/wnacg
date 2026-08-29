@@ -1448,7 +1448,11 @@ fn sanitize_window_label(aid: &str) -> String {
 }
 
 #[tauri::command]
-fn open_album_window(app: tauri::AppHandle, aid: String, title: String) -> Result<(), String> {
+async fn open_album_window(
+    app: tauri::AppHandle,
+    aid: String,
+    title: String,
+) -> Result<(), String> {
     if aid.trim().is_empty() {
         return Err("缺少作品 ID".to_string());
     }
