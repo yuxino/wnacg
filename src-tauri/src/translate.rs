@@ -12,6 +12,8 @@ const CHUNK_SIZE: usize = 30;
 const MAX_TRANSLATION_ITEMS: usize = 512;
 const MAX_TRANSLATION_ITEM_BYTES: usize = 16 * 1024;
 const MAX_TRANSLATION_TOTAL_BYTES: usize = 512 * 1024;
+const MAX_TRANSLATION_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+const TRANSLATION_RESPONSE_TOO_LARGE: &str = "翻译响应超过 2 MiB 安全上限";
 const TRANSLATION_REQUEST_CONCURRENCY: usize = 3;
 const CACHE_VERSION: u32 = 1;
 const CACHE_FILE_NAME: &str = "translation-cache-v1.json";
@@ -652,6 +654,46 @@ struct Message {
     content: String,
 }
 
+async fn read_translation_body<S, B, E>(
+    status: reqwest::StatusCode,
+    total: Option<u64>,
+    stream: S,
+) -> Result<String, String>
+where
+    S: futures_util::Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    if total.is_some_and(|total| total > MAX_TRANSLATION_RESPONSE_BYTES) {
+        return Err(TRANSLATION_RESPONSE_TOO_LARGE.to_string());
+    }
+
+    let mut body =
+        Vec::with_capacity(total.unwrap_or(0).min(MAX_TRANSLATION_RESPONSE_BYTES) as usize);
+    use futures_util::StreamExt as _;
+    futures_util::pin_mut!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| format!("翻译响应读取失败：{err}"))?;
+        let chunk = chunk.as_ref();
+        if (body.len() as u64).saturating_add(chunk.len() as u64) > MAX_TRANSLATION_RESPONSE_BYTES {
+            return Err(TRANSLATION_RESPONSE_TOO_LARGE.to_string());
+        }
+        body.extend_from_slice(chunk);
+    }
+    let body = String::from_utf8_lossy(&body).into_owned();
+    if !status.is_success() {
+        let preview: String = body.chars().take(200).collect();
+        return Err(format!("翻译接口返回 {status}: {preview}"));
+    }
+    Ok(body)
+}
+
+async fn read_translation_response(response: reqwest::Response) -> Result<String, String> {
+    let status = response.status();
+    let total = response.content_length();
+    read_translation_body(status, total, response.bytes_stream()).await
+}
+
 async fn translate_chunk(
     client: &reqwest::Client,
     key: &str,
@@ -692,15 +734,7 @@ async fn translate_chunk(
         .send()
         .await
         .map_err(|err| format!("翻译请求失败：{err}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|err| format!("翻译响应读取失败：{err}"))?;
-    if !status.is_success() {
-        let preview: String = body.chars().take(200).collect();
-        return Err(format!("翻译接口返回 {status}: {}", preview));
-    }
+    let body = read_translation_response(response).await?;
     let parsed: ChatResponse =
         serde_json::from_str(&body).map_err(|err| format!("翻译响应解析失败：{err}"))?;
     let content = parsed
@@ -843,11 +877,86 @@ mod tests {
             .join(name)
     }
 
+    fn read_test_translation_response(
+        status: reqwest::StatusCode,
+        content_length: Option<u64>,
+        chunks: Vec<Vec<u8>>,
+    ) -> Result<String, String> {
+        tauri::async_runtime::block_on(read_translation_body(
+            status,
+            content_length,
+            futures_util::stream::iter(chunks.into_iter().map(Ok::<_, &'static str>)),
+        ))
+    }
+
     #[test]
     fn translation_client_is_reused_without_network_access() {
         let first = translation_client().expect("应创建翻译客户端") as *const reqwest::Client;
         let second = translation_client().expect("应复用翻译客户端") as *const reqwest::Client;
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn translation_response_below_limit_is_accepted() {
+        let body = vec![b'a'; MAX_TRANSLATION_RESPONSE_BYTES as usize - 1];
+
+        let received =
+            read_test_translation_response(reqwest::StatusCode::OK, None, vec![body.clone()])
+                .expect("低于上限的响应应成功读取");
+
+        assert_eq!(received.as_bytes(), body);
+    }
+
+    #[test]
+    fn translation_response_at_limit_is_accepted() {
+        let body = vec![b'a'; MAX_TRANSLATION_RESPONSE_BYTES as usize];
+
+        let received = read_test_translation_response(
+            reqwest::StatusCode::OK,
+            Some(MAX_TRANSLATION_RESPONSE_BYTES),
+            vec![body.clone()],
+        )
+        .expect("等于上限的响应应成功读取");
+
+        assert_eq!(received.as_bytes(), body);
+    }
+
+    #[test]
+    fn translation_response_content_length_above_limit_is_rejected() {
+        let error = read_test_translation_response(
+            reqwest::StatusCode::OK,
+            Some(MAX_TRANSLATION_RESPONSE_BYTES + 1),
+            vec![],
+        )
+        .expect_err("超大 Content-Length 应被预先拒绝");
+
+        assert_eq!(error, TRANSLATION_RESPONSE_TOO_LARGE);
+    }
+
+    #[test]
+    fn translation_response_stream_above_limit_is_rejected() {
+        let chunks = vec![
+            vec![b'a'; MAX_TRANSLATION_RESPONSE_BYTES as usize],
+            vec![b'b'],
+        ];
+
+        let error = read_test_translation_response(reqwest::StatusCode::OK, None, chunks)
+            .expect_err("累计超限的分块响应应被拒绝");
+
+        assert_eq!(error, TRANSLATION_RESPONSE_TOO_LARGE);
+    }
+
+    #[test]
+    fn translation_response_error_keeps_status_and_preview() {
+        let body = b"rate limited".to_vec();
+        let error = read_test_translation_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            Some(body.len() as u64),
+            vec![body],
+        )
+        .expect_err("错误响应应保留状态与摘要");
+
+        assert_eq!(error, "翻译接口返回 429 Too Many Requests: rate limited");
     }
 
     #[test]
