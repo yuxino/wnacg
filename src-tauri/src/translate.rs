@@ -259,6 +259,8 @@ fn ensure_private_file(path: &Path) -> Result<(), String> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .map_err(|err| format!("无法保护本地数据文件：{err}"))?;
     }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -532,7 +534,12 @@ fn keychain_api_key() -> Result<Option<String>, String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn keychain_api_key() -> Result<Option<String>, String> {
+    credential_manager::read(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn keychain_api_key() -> Result<Option<String>, String> {
     Ok(None)
 }
@@ -548,9 +555,98 @@ fn save_api_key_to_keychain(key: &str) -> Result<(), String> {
         .map_err(|error| format!("无法保存到 macOS 钥匙串：{error}"))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn save_api_key_to_keychain(key: &str) -> Result<(), String> {
+    credential_manager::save(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn save_api_key_to_keychain(_key: &str) -> Result<(), String> {
     Err("当前系统暂不支持安全保存 DeepSeek 密钥".to_string())
+}
+
+/// Windows 凭据管理器实现，提供与 macOS 钥匙串等价的安全凭据存储。
+#[cfg(target_os = "windows")]
+mod credential_manager {
+    use std::ffi::c_void;
+
+    use windows_sys::core::PWSTR;
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_NOT_FOUND};
+    use windows_sys::Win32::Security::Credentials::{
+        CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_MAX_CREDENTIAL_BLOB_SIZE,
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+    };
+
+    fn target_name(service: &str, account: &str) -> Vec<u16> {
+        let mut wide: Vec<u16> = format!("{service}/{account}").encode_utf16().collect();
+        wide.push(0);
+        wide
+    }
+
+    fn error_message(code: u32) -> String {
+        std::io::Error::from_raw_os_error(code as i32).to_string()
+    }
+
+    pub fn save(service: &str, account: &str, key: &str) -> Result<(), String> {
+        let target = target_name(service, account);
+        let mut blob = key.as_bytes().to_vec();
+        let blob_size = u32::try_from(blob.len())
+            .map_err(|_| "DeepSeek API 密钥长度超出 Windows 凭据管理器限制".to_string())?;
+        if blob_size > CRED_MAX_CREDENTIAL_BLOB_SIZE {
+            return Err("DeepSeek API 密钥长度超出 Windows 凭据管理器限制".to_string());
+        }
+        let mut credential: CREDENTIALW = unsafe { std::mem::zeroed() };
+        credential.Type = CRED_TYPE_GENERIC;
+        credential.TargetName = target.as_ptr() as PWSTR;
+        credential.CredentialBlobSize = blob_size;
+        credential.CredentialBlob = blob.as_mut_ptr();
+        credential.Persist = CRED_PERSIST_LOCAL_MACHINE;
+        if unsafe { CredWriteW(&credential, 0) } == 0 {
+            return Err(format!(
+                "无法保存到 Windows 凭据管理器：{}",
+                error_message(unsafe { GetLastError() })
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn read(service: &str, account: &str) -> Result<Option<String>, String> {
+        let target = target_name(service, account);
+        let mut credential_ptr: *mut CREDENTIALW = std::ptr::null_mut();
+        if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential_ptr) } == 0 {
+            let error = unsafe { GetLastError() };
+            if error == ERROR_NOT_FOUND {
+                return Ok(None);
+            }
+            return Err(format!(
+                "无法读取 Windows 凭据管理器：{}",
+                error_message(error)
+            ));
+        }
+        if credential_ptr.is_null() {
+            return Ok(None);
+        }
+        let credential = unsafe { &*credential_ptr };
+        let result = if credential.CredentialBlob.is_null() || credential.CredentialBlobSize == 0 {
+            Ok(None)
+        } else {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    credential.CredentialBlob,
+                    credential.CredentialBlobSize as usize,
+                )
+            };
+            match std::str::from_utf8(bytes) {
+                Ok(key) => {
+                    let key = key.trim().to_string();
+                    Ok((!key.is_empty()).then_some(key))
+                }
+                Err(_) => Err("凭据管理器中的 DeepSeek 密钥格式无效".to_string()),
+            }
+        };
+        unsafe { CredFree(credential_ptr as *const c_void) };
+        result
+    }
 }
 
 fn keychain_contains(key: &str) -> bool {
@@ -632,10 +728,10 @@ pub fn set_deepseek_api_key(api_key: String) -> Result<(), String> {
     }
     save_api_key_to_keychain(key)?;
     if !keychain_contains(key) {
-        return Err("密钥写入钥匙串后未能回读确认".to_string());
+        return Err("密钥写入安全凭据存储后未能回读确认".to_string());
     }
     remove_legacy_api_key_if_present(&config_dir().join("config.json"))
-        .map_err(|error| format!("密钥已保存到钥匙串，但旧版明文清理失败：{error}"))
+        .map_err(|error| format!("密钥已保存到安全凭据存储，但旧版明文清理失败：{error}"))
 }
 
 #[derive(Debug, Deserialize)]

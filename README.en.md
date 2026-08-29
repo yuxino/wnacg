@@ -34,7 +34,7 @@ Build:
 npm run tauri build
 ```
 
-DeepSeek translation is an optional cloud feature: when enabled, text and titles awaiting translation are sent to DeepSeek, but images are not; source text and translations are cached locally. The key is stored in macOS Keychain. On other platforms, use `DEEPSEEK_API_KEY` because secure saving from the UI is not yet supported.
+DeepSeek translation is an optional cloud feature: when enabled, text and titles awaiting translation are sent to DeepSeek, but images are not; source text and translations are cached locally. The key is stored in macOS Keychain on macOS and in Windows Credential Manager on Windows. On other platforms, use `DEEPSEEK_API_KEY` because secure saving from the UI is not yet supported.
 
 OCR runs locally. Enabling Japanese manga OCR for the first time downloads about 224 MiB of pinned models from Hugging Face and compiles a helper with Rust. Apple Vision is macOS-only and also requires Xcode Command Line Tools on first use.
 

@@ -23,6 +23,17 @@ const MAX_VISION_POOL: usize = 3;
 const MAX_MANGA_POOL: usize = 2;
 const IMAGE_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
 
+/// Windows 上以无控制台窗口方式启动子进程，避免 OCR 工作进程/curl/cargo 弹出黑框。
+#[cfg(target_os = "windows")]
+fn hide_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console(_command: &mut Command) {}
+
 struct ModelFile {
     name: &'static str,
     url: &'static str,
@@ -301,7 +312,9 @@ fn ensure_manga_models_inner() -> Result<(), String> {
             continue;
         }
         let part = dir.join(format!("{}.part", model.name));
-        let status = Command::new("curl")
+        let mut command = Command::new("curl");
+        hide_console(&mut command);
+        let status = command
             .args([
                 "--proto",
                 "=https",
@@ -358,7 +371,9 @@ fn ensure_manga_models() -> Result<(), String> {
 }
 
 fn cargo_bin() -> Command {
-    match Command::new("cargo").arg("--version").output() {
+    let mut version_check = Command::new("cargo");
+    hide_console(&mut version_check);
+    let mut command = match version_check.arg("--version").output() {
         Ok(_) => Command::new("cargo"),
         Err(_) => {
             let binary_name = if cfg!(target_os = "windows") {
@@ -371,7 +386,9 @@ fn cargo_bin() -> Command {
                 .unwrap_or_else(|| PathBuf::from(binary_name));
             Command::new(fallback)
         }
-    }
+    };
+    hide_console(&mut command);
+    command
 }
 
 fn manga_helper_binary_name() -> &'static str {
@@ -549,6 +566,7 @@ fn spawn_worker(helper: &std::path::Path, engine: OcrEngine) -> Result<Worker, S
     if engine == OcrEngine::Manga {
         command.env("WNACG_OCR_MODELS_DIR", models_dir());
     }
+    hide_console(&mut command);
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
