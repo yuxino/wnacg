@@ -33,5 +33,9 @@ security-framework = "3.7"
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 
+[features]
+# release 构建时内嵌前端资源并走自定义协议，而不是 devUrl（tauri dev 模式不需要）
+custom-protocol = ["tauri/custom-protocol"]
+
 [profile.release]
 strip = true
