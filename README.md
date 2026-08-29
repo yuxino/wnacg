@@ -6,7 +6,7 @@
   <p>一个面向 WNACG 的桌面漫画阅读器，提供专注阅读、本地 OCR 与可选翻译；应用界面目前仅提供简体中文。</p>
 </div>
 
-> 18+。仓库和安装包不包含第三方漫画、图片内容或 OCR 模型权重。请从 [Releases](https://github.com/yuxino/wnacg/releases) 下载适用于 macOS 11+ Apple Silicon 或 64 位 Windows 10 1709+ / Windows 11 的安装包；暂未提供 Intel Mac 或 Linux 安装包。macOS 包只有 ad-hoc 签名且未经公证。Windows 版需要 Microsoft Edge WebView2 Runtime；系统缺少时安装器会联网下载。Windows 安装包未做代码签名，SmartScreen 可能拦截，企业策略也可能不允许继续。
+> 18+。仓库和安装包不包含第三方漫画、图片内容或 OCR 模型权重。请从 [Releases](https://github.com/yuxino/wnacg/releases) 下载：macOS 安装包仅支持 Apple Silicon（macOS 11+）；Windows x64 安装包目前为 preview，面向 64 位 Windows 10 1709+ / Windows 11，但尚未在 Windows 真机完成安装、启动和核心功能验收。暂未提供 Intel Mac 或 Linux 安装包。macOS 包只有 ad-hoc 签名且未经公证。Windows preview 版需要 Microsoft Edge WebView2 Runtime；系统缺少时安装器会联网下载。Windows preview 安装包未做代码签名，SmartScreen 可能拦截，企业策略也可能不允许继续。
 
 ## 功能
 

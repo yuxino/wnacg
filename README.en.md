@@ -6,7 +6,7 @@
   <p>A desktop manga reader for WNACG with focused reading, local OCR, and optional translation. The interface is currently available in Simplified Chinese only.</p>
 </div>
 
-> 18+. The repository and installers do not include third-party manga, images, or OCR model weights. Download the installer for macOS 11+ on Apple silicon or 64-bit Windows 10 1709+ / Windows 11 from [Releases](https://github.com/yuxino/wnacg/releases); Intel Mac and Linux installers are not currently provided. The macOS build is only ad-hoc signed and is not notarized. The Windows build requires Microsoft Edge WebView2 Runtime; the installer downloads it if missing, so that step needs internet access. The Windows installers are not code-signed, so SmartScreen may block them and managed-device policy may prevent continuing.
+> 18+. The repository and installers do not include third-party manga, images, or OCR model weights. Download from [Releases](https://github.com/yuxino/wnacg/releases): the macOS installer supports Apple silicon only (macOS 11+); the Windows x64 installers are previews targeting 64-bit Windows 10 1709+ / Windows 11, but they have not yet been validated on an actual Windows device for installation, launch, or core functionality. Intel Mac and Linux installers are not currently provided. The macOS build is only ad-hoc signed and is not notarized. The Windows preview requires Microsoft Edge WebView2 Runtime; the installer downloads it if missing, so that step needs internet access. The Windows preview installers are not code-signed, so SmartScreen may block them and managed-device policy may prevent continuing.
 
 ## Features
 
