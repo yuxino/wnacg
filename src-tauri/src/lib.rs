@@ -22,6 +22,17 @@ const RELEASES_URL: &str = "https://github.com/yuxino/wnacg/releases";
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ALBUM_INDEX_PAGES: usize = 256;
 const ALBUM_PAGE_FETCH_CONCURRENCY: usize = 6;
+
+/// Windows 上以无控制台窗口方式启动子进程（curl 备用抓取通道）。
+#[cfg(target_os = "windows")]
+fn hide_console(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(target_os = "windows"))]
+fn hide_console(_command: &mut Command) {}
 static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
@@ -818,7 +829,9 @@ async fn fetch_page_via_curl(url: String, referer: String) -> Result<String, Str
     }
 
     tauri::async_runtime::spawn_blocking(move || {
-        let output = Command::new("curl")
+        let mut command = Command::new("curl");
+        hide_console(&mut command);
+        let output = command
             .arg("--http1.1")
             .args(["--proto", "=https"])
             .arg("--compressed")
