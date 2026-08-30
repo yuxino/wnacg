@@ -6,7 +6,7 @@
   <p>A desktop manga reader for WNACG with focused reading, local OCR, and optional translation. The interface is currently available in Simplified Chinese only.</p>
 </div>
 
-> 18+. The repository and installers do not include third-party manga, images, or OCR model weights. Download from [Releases](https://github.com/yuxino/wnacg/releases): the macOS installer supports Apple silicon only (macOS 11+); the Windows x64 installers are previews targeting 64-bit Windows 10 1709+ / Windows 11, but they have not yet been validated on an actual Windows device for installation, launch, or core functionality. Intel Mac and Linux installers are not currently provided. The macOS build is only ad-hoc signed and is not notarized. The Windows preview requires Microsoft Edge WebView2 Runtime; the installer downloads it if missing, so that step needs internet access. The Windows preview installers are not code-signed, so SmartScreen may block them and managed-device policy may prevent continuing.
+> 18+. The repository and installers do not include third-party manga, images, or OCR model weights. Download from [Releases](https://github.com/yuxino/wnacg/releases): the macOS installer supports Apple silicon only (macOS 11+); the Windows x64 installers are previews targeting 64-bit Windows 10 1709+ / Windows 11 and have completed installation, launch, browsing, settings, and basic reader-interaction acceptance in a Windows 11 virtual machine. The first Japanese OCR model download and real recognition, as well as DeepSeek translation, have not yet completed end-to-end acceptance in that VM. OCR depends on network access to the Hugging Face model host; translation additionally requires the user's own DeepSeek API key. Intel Mac and Linux installers are not currently provided. The macOS build is only ad-hoc signed and is not notarized. The Windows preview requires Microsoft Edge WebView2 Runtime; the installer downloads it if missing, so that step needs internet access. The Windows preview installers are not code-signed, so SmartScreen may block them and managed-device policy may prevent continuing.
 
 ## Features
 
@@ -14,6 +14,7 @@
 - Continuous, single-page, and two-page reading with keyboard navigation, fullscreen, zoom, and separate reader windows
 - Local OCR: Apple Vision for Chinese-first recognition, or `comic-text-detector` with `manga-ocr` for Japanese-first recognition
 - Optional DeepSeek translation for recognized Japanese dialogue and titles, with in-image typesetting and pre-translation
+- On Windows, the reader shows recognition, translation, and retryable failure states; HTTP 429 responses trigger automatic request throttling and a retry-later message
 
 Built with Tauri 2.
 
@@ -36,7 +37,7 @@ npm run tauri build
 
 DeepSeek translation is an optional cloud feature: when enabled, text and titles awaiting translation are sent to DeepSeek, but images are not; source text and translations are cached locally. The key is stored in macOS Keychain on macOS and in Windows Credential Manager on Windows. On other platforms, use `DEEPSEEK_API_KEY` because secure saving from the UI is not yet supported.
 
-OCR runs locally. Enabling Japanese manga OCR for the first time downloads about 224 MiB of pinned models from Hugging Face. The Windows preview bundles the helper and does not require Rust; macOS currently compiles the helper locally with Rust. Apple Vision is macOS-only and also requires Xcode Command Line Tools on first use.
+OCR runs locally. Enabling Japanese manga OCR for the first time downloads about 224 MiB of pinned models from Hugging Face, with in-app progress, retry, and cache reuse. The Windows preview bundles the helper and does not require Rust; macOS currently compiles the helper locally with Rust. Apple Vision is macOS-only and also requires Xcode Command Line Tools on first use.
 
 This repository does not currently include a project-level open-source license. The OCR models and training data have not completed a formal distribution-license review; automatic download does not grant redistribution rights.
 
