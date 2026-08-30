@@ -699,6 +699,20 @@ async function refreshDeepseekKeyStatus() {
   syncDeepseekKeyControl();
 }
 
+async function ensureDeepseekKeyForTranslation() {
+  if (!hasUsableDeepseekKey()) {
+    await refreshDeepseekKeyStatus();
+  }
+  if (hasUsableDeepseekKey()) return true;
+
+  setReaderSettingsOpen(true);
+  showToast("翻译需要 DeepSeek API Key，请先在下方保存", "info", 4800);
+  window.requestAnimationFrame(() => {
+    readerSettingsPanel.querySelector<HTMLInputElement>(".api-key-input")?.focus();
+  });
+  return false;
+}
+
 function renderDeepseekKeyControl() {
   const form = document.createElement("form");
   form.className = "api-key-control";
@@ -941,14 +955,7 @@ function buildReaderSettingsPanel() {
         titleTranslateEnabled,
         (v) => {
           if (v === titleTranslateEnabled) return;
-          setTitleTranslate(v);
-          showToast(
-            v
-              ? "生肉标题翻译已开启，列表与详情标题将显示中文"
-              : "生肉标题翻译已关闭，恢复原标题",
-            "success",
-            2600,
-          );
+          void setTitleTranslateWithFeedback(v);
         },
       ),
     },
@@ -1872,6 +1879,7 @@ async function toggleReaderTranslate(force?: boolean) {
     return;
   }
   if (state.translateEnabled || translateInitializing) return;
+  if (!(await ensureDeepseekKeyForTranslation())) return;
 
   const token = ++translateEnableToken;
   translateInitializing = true;
@@ -3112,11 +3120,13 @@ async function translateVisibleTitles() {
     }
     saveTitleTranslationCache();
     applyTitleTranslations();
-  } catch {
+  } catch (error) {
     for (const title of titles) {
       titleTranslatePending.delete(title);
       titleTranslateFailed.add(title);
     }
+    const message = error instanceof Error ? error.message : String(error);
+    showToast(`标题翻译失败：${message}`, "error", 4800);
   }
 }
 
@@ -3140,6 +3150,7 @@ function applyTitleTranslations() {
 }
 
 function setTitleTranslate(enabled: boolean) {
+  if (enabled && !titleTranslateEnabled) titleTranslateFailed.clear();
   titleTranslateEnabled = enabled;
   localStorage.setItem(TITLE_TRANSLATE_ENABLED_KEY, enabled ? "1" : "0");
   syncTitleTranslateToggle();
@@ -3152,8 +3163,23 @@ function setTitleTranslate(enabled: boolean) {
   }
 }
 
+async function setTitleTranslateWithFeedback(enabled: boolean) {
+  if (enabled && !(await ensureDeepseekKeyForTranslation())) {
+    syncTitleTranslateToggle();
+    return;
+  }
+  setTitleTranslate(enabled);
+  showToast(
+    enabled
+      ? "生肉标题翻译已开启，列表与详情标题将显示中文"
+      : "生肉标题翻译已关闭，恢复原标题",
+    "success",
+    2600,
+  );
+}
+
 function toggleTitleTranslate() {
-  setTitleTranslate(!titleTranslateEnabled);
+  void setTitleTranslateWithFeedback(!titleTranslateEnabled);
 }
 
 async function translatedAlbumTitle(title: string): Promise<string> {
