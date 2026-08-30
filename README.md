@@ -36,7 +36,7 @@ npm run tauri build
 
 DeepSeek 翻译是可选云端功能：启用后，待翻译的文字与标题会发送给 DeepSeek，图片不会发送；原文与译文缓存在本机。密钥在 macOS 保存到钥匙串、Windows 保存到 Windows 凭据管理器；其他平台请使用 `DEEPSEEK_API_KEY`，因为界面暂不支持安全保存。
 
-OCR 在本机运行。首次启用日文漫画 OCR 会从 Hugging Face 下载约 224 MiB 固定版本模型，并用 Rust 编译辅助程序；Apple Vision 仅适用于 macOS，首次使用还需要 Xcode Command Line Tools。
+OCR 在本机运行。首次启用日文漫画 OCR 会从 Hugging Face 下载约 224 MiB 固定版本模型；Windows preview 已内置辅助程序，无需安装 Rust，macOS 当前会在本机用 Rust 编译辅助程序。Apple Vision 仅适用于 macOS，首次使用还需要 Xcode Command Line Tools。
 
 仓库暂未附项目级开源许可证；OCR 模型及训练数据也尚未完成正式分发许可审查。自动下载不等同于取得再分发授权。
 
