@@ -246,6 +246,7 @@ function Test-AppStartup {
   )
 
   $process = $null
+  $secondProcess = $null
   try {
     $process = Start-Process -FilePath $AppPath -WorkingDirectory (Split-Path -Parent $AppPath) -PassThru
     Start-Sleep -Seconds 8
@@ -253,7 +254,36 @@ function Test-AppStartup {
     if ($process.HasExited) {
       throw "WNACG exited during the startup probe with code $($process.ExitCode): $AppPath"
     }
+
+    $secondProcess = Start-Process -FilePath $AppPath -WorkingDirectory (Split-Path -Parent $AppPath) -PassThru
+    if (-not $secondProcess.WaitForExit(10000)) {
+      throw "A second WNACG instance remained running: $AppPath"
+    }
+    $process.Refresh()
+    if ($process.HasExited) {
+      throw "Launching a second instance terminated the primary WNACG process: $AppPath"
+    }
+
+    $resolvedAppPath = [System.IO.Path]::GetFullPath($AppPath)
+    $matchingProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'wnacg.exe'" | Where-Object {
+      -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) -and
+      [System.IO.Path]::GetFullPath($_.ExecutablePath).Equals(
+        $resolvedAppPath,
+        [System.StringComparison]::OrdinalIgnoreCase
+      )
+    })
+    if ($matchingProcesses.Count -ne 1) {
+      throw "Expected exactly one WNACG process after a second launch, found $($matchingProcesses.Count): $AppPath"
+    }
   } finally {
+    if ($null -ne $secondProcess) {
+      $secondProcess.Refresh()
+      if (-not $secondProcess.HasExited) {
+        Stop-Process -Id $secondProcess.Id -Force -ErrorAction SilentlyContinue
+        [void] $secondProcess.WaitForExit(10000)
+      }
+      $secondProcess.Dispose()
+    }
     if ($null -ne $process) {
       $process.Refresh()
       if (-not $process.HasExited) {

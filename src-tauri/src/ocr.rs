@@ -296,6 +296,16 @@ fn lock_pool(engine: OcrEngine) -> Result<std::sync::MutexGuard<'static, Option<
         .map_err(|_| "OCR 内部锁异常".to_string())
 }
 
+/// Stop helper processes deterministically before the desktop process exits.
+/// Static pools are not guaranteed to run `Drop` during process teardown.
+pub fn shutdown_workers() {
+    for engine in [OcrEngine::Vision, OcrEngine::Manga] {
+        if let Ok(mut pool) = lock_pool(engine) {
+            *pool = None;
+        }
+    }
+}
+
 // ── 引擎安装(编译缓存) ───────────────────────────────────────────────────
 
 fn hash_sources(items: &[&str]) -> u64 {

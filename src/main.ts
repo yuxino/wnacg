@@ -380,9 +380,11 @@ translateStatus.id = "translate-status";
 translateStatus.className = "translate-status";
 translateStatus.hidden = true;
 translateStatus.addEventListener("click", () => {
-  const index = visibleReaderIndices().find((visibleIndex) => state.translateFailed[visibleIndex]);
+  const index = visibleReaderIndices().find((visibleIndex) => translationFailure(visibleIndex));
   if (index !== undefined) {
     delete state.translateFailed[index];
+    delete state.ocrFailed[index];
+    ocrTextDone.delete(index);
     translateDone.delete(index);
     queueOcrText(index);
     queueTranslate(index);
@@ -1741,6 +1743,7 @@ async function pumpOcrQueue() {
     for (const item of items) {
       ocrPendingIndices.delete(item.index);
       state.ocrFailed[item.index] = message;
+      renderTranslateBadge(item.index);
     }
     showToast(`OCR 失败：${message}`, "error", 4200);
   } finally {
@@ -1813,6 +1816,7 @@ function pumpOcrTextQueue() {
           if (sources.dataUrl) ocrTextPending.add(index);
         } else {
           state.ocrFailed[index] = result.error;
+          renderTranslateBadge(index);
         }
         return;
       }
@@ -1827,6 +1831,7 @@ function pumpOcrTextQueue() {
       if (token !== state.readerToken || aid !== state.currentAlbum?.aid || epoch !== readerPipelineEpoch || state.view !== "reader") return;
       const message = error instanceof Error ? error.message : String(error);
       state.ocrFailed[index] = message;
+      renderTranslateBadge(index);
       showToast(`文字识别失败：${message}`, "error", 4200);
     }).finally(() => {
       if (token === state.readerToken && aid === state.currentAlbum?.aid && epoch === readerPipelineEpoch) {
@@ -1894,6 +1899,7 @@ async function toggleReaderTranslate(force?: boolean) {
     if (token !== translateEnableToken || !translateInitializing || !state.ocrEnabled) return;
     updateReaderPrefs({ translateMode: true });
     queueOcrWindow(currentStreamIndex());
+    showToast("翻译已开启，正在识别当前页…", "info", 3200);
   } finally {
     if (token === translateEnableToken) {
       translateInitializing = false;
@@ -1906,7 +1912,14 @@ function queueTranslate(index: number) {
   if (!state.translateEnabled || state.ocrLang !== "ja") return;
   if (index < 0 || index >= state.photos.length) return;
   const regions = state.ocrRegions[index];
-  if (!regions || regions.length === 0) return;
+  if (!regions) return;
+  if (regions.length === 0) {
+    if (ocrTextDone.has(index)) {
+      translateDone.add(index);
+      renderTranslateBadge(index);
+    }
+    return;
+  }
   if (state.translateTexts[index]) {
     // 已缓存过译文的页面,重新开启翻译时直接重画
     translateDone.add(index);
@@ -2409,16 +2422,21 @@ function pruneTranslateOverlays(center: number) {
   });
 }
 
-// ---- 翻译状态徽标:让用户感知"正在翻译" ----
+// ---- 翻译状态徽标:让用户感知识别与翻译阶段 ----
 
-function translateBusy(index: number): boolean {
-  if (index < 0 || index >= state.photos.length) return false;
-  if (translateDone.has(index)) return false;
-  if (state.translateFailed[index]) return false;
-  const regions = state.ocrRegions[index];
-  if (!regions || regions.length === 0) return false; // 还没框选出文字区域
-  // 有文字区域但还没翻译完成:识别/翻译任意阶段都显示"翻译中…"
-  return true;
+type TranslatePhase = "idle" | "recognizing" | "translating" | "done" | "failed";
+
+function translationFailure(index: number): string | undefined {
+  return state.translateFailed[index] || state.ocrFailed[index];
+}
+
+function translatePhase(index: number): TranslatePhase {
+  if (!state.translateEnabled || index < 0 || index >= state.photos.length) return "idle";
+  if (translationFailure(index)) return "failed";
+  if (translateDone.has(index)) return "done";
+  if (!ocrTextDone.has(index)) return "recognizing";
+  if (translatePending.has(index) || translateInFlight.has(index)) return "translating";
+  return "translating";
 }
 
 function renderTranslateBadge(index: number) {
@@ -2427,18 +2445,22 @@ function renderTranslateBadge(index: number) {
   if (!container) return;
   container.querySelector(".stream-translate-badge")?.remove();
   if (!state.translateEnabled) return;
-  const failed = state.translateFailed[index];
-  const busy = translateBusy(index);
-  if (!failed && !busy) return;
+  const failed = translationFailure(index);
+  const phase = translatePhase(index);
+  if (!failed && phase !== "recognizing" && phase !== "translating") return;
 
   const badge = document.createElement("button");
   badge.type = "button";
   badge.className = failed ? "translate-badge stream-translate-badge failed" : "translate-badge stream-translate-badge";
-  badge.textContent = failed ? "翻译失败 · 点击重试" : "翻译中…";
+  badge.textContent = failed
+    ? "翻译失败 · 点击重试"
+    : phase === "recognizing" ? "识别中…" : "翻译中…";
   badge.addEventListener("click", (event) => {
     event.stopPropagation();
     if (failed) {
       delete state.translateFailed[index];
+      delete state.ocrFailed[index];
+      ocrTextDone.delete(index);
       translateDone.delete(index);
       queueOcrText(index);
       queueTranslate(index);
@@ -3429,11 +3451,15 @@ function refreshTranslateStatus() {
   let label = "翻译开";
   let className = "on";
   const visible = visibleReaderIndices();
-  if (visible.some((index) => state.translateFailed[index])) {
+  const phases = visible.map(translatePhase);
+  if (phases.includes("failed")) {
     label = "翻译失败 · 点击重试";
     className = "failed";
-  } else if (visible.some(translateBusy)) {
+  } else if (phases.includes("translating")) {
     label = "翻译中…";
+    className = "working";
+  } else if (phases.includes("recognizing")) {
+    label = "识别中…";
     className = "working";
   }
   status.textContent = label;

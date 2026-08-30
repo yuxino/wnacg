@@ -21,7 +21,12 @@ const RELEASES_API: &str = "https://api.github.com/repos/yuxino/wnacg/releases?p
 const RELEASES_URL: &str = "https://github.com/yuxino/wnacg/releases";
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ALBUM_INDEX_PAGES: usize = 256;
-const ALBUM_PAGE_FETCH_CONCURRENCY: usize = 6;
+const ALBUM_PAGE_FETCH_CONCURRENCY: usize = 2;
+const PAGE_FETCH_MIN_INTERVAL: Duration = Duration::from_millis(1_200);
+const PAGE_FETCH_DEFAULT_COOLDOWN: Duration = Duration::from_secs(15);
+const PAGE_FETCH_MAX_COOLDOWN: Duration = Duration::from_secs(120);
+const RATE_LIMIT_ERROR_PREFIX: &str = "站点请求过于频繁（HTTP 429）";
+const CURL_RATE_LIMIT_MARKER: &str = "__WNACG_HTTP_429__";
 
 /// Windows 上以无控制台窗口方式启动子进程（curl 备用抓取通道）。
 #[cfg(target_os = "windows")]
@@ -88,6 +93,81 @@ static HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(||
         .build()
         .map_err(|err| format!("HTTP 客户端创建失败：{err}"))
 });
+
+#[derive(Debug)]
+struct PageFetchGate {
+    next_allowed_at: Instant,
+}
+
+impl PageFetchGate {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_allowed_at: now,
+        }
+    }
+
+    fn reserve(&mut self, now: Instant) -> Option<Duration> {
+        if now < self.next_allowed_at {
+            return Some(self.next_allowed_at.duration_since(now));
+        }
+        self.next_allowed_at = now + PAGE_FETCH_MIN_INTERVAL;
+        None
+    }
+
+    fn defer(&mut self, now: Instant, delay: Duration) {
+        let deferred_until = now + delay;
+        if deferred_until > self.next_allowed_at {
+            self.next_allowed_at = deferred_until;
+        }
+    }
+}
+
+static PAGE_FETCH_GATE: LazyLock<tokio::sync::Mutex<PageFetchGate>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(PageFetchGate::new(Instant::now())));
+
+async fn wait_for_page_fetch_slot() {
+    loop {
+        let delay = {
+            let mut gate = PAGE_FETCH_GATE.lock().await;
+            gate.reserve(Instant::now())
+        };
+        match delay {
+            Some(delay) => tokio::time::sleep(delay).await,
+            None => return,
+        }
+    }
+}
+
+async fn defer_page_fetches(delay: Duration) {
+    PAGE_FETCH_GATE.lock().await.defer(Instant::now(), delay);
+}
+
+fn rate_limit_delay(retry_after: Option<&str>) -> Duration {
+    let seconds = retry_after
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(PAGE_FETCH_DEFAULT_COOLDOWN.as_secs())
+        .clamp(1, PAGE_FETCH_MAX_COOLDOWN.as_secs());
+    Duration::from_secs(seconds)
+}
+
+fn rate_limit_error(delay: Duration) -> String {
+    format!(
+        "{RATE_LIMIT_ERROR_PREFIX}，已自动暂停 {} 秒。请稍后重试。",
+        delay.as_secs()
+    )
+}
+
+fn is_rate_limit_error(error: &str) -> bool {
+    error.starts_with(RATE_LIMIT_ERROR_PREFIX)
+}
+
+fn combine_fallback_error(primary: String, fallback: String) -> String {
+    if is_rate_limit_error(&fallback) {
+        fallback
+    } else {
+        format!("{primary}\n备用通道也失败：{fallback}")
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct Album {
@@ -778,12 +858,13 @@ fn parse_photo_image(html: &str, base_url: &str) -> Result<PhotoImage, String> {
 
 async fn fetch_page(url: String, referer: Option<&str>) -> Result<String, String> {
     let referer = referer.unwrap_or("https://wnacg.com/");
+    wait_for_page_fetch_slot().await;
     let response =
         match client()?.get(&url).header("referer", referer).send().await {
             Ok(r) => r,
             Err(err) => {
                 return fetch_page_via_curl(url, referer.to_string()).await.map_err(
-                    |fallback_err| format!("请求失败：{err}\n备用通道也失败：{fallback_err}"),
+                    |fallback_err| combine_fallback_error(format!("请求失败：{err}"), fallback_err),
                 );
             }
         };
@@ -793,29 +874,40 @@ async fn fetch_page(url: String, referer: Option<&str>) -> Result<String, String
     }
 
     let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let delay = rate_limit_delay(
+            response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+        );
+        defer_page_fetches(delay).await;
+        return Err(rate_limit_error(delay));
+    }
     if !response.status().is_success() {
         return fetch_page_via_curl(url, referer.to_string())
             .await
             .map_err(|fallback_err| {
-                format!("服务返回 HTTP {status}\n备用通道也失败：{fallback_err}")
+                combine_fallback_error(format!("服务返回 HTTP {status}"), fallback_err)
             });
     }
 
-    let body =
-        match response.text().await {
-            Ok(b) => b,
-            Err(err) => {
-                return fetch_page_via_curl(url, referer.to_string()).await.map_err(
-                    |fallback_err| format!("读取响应失败：{err}\n备用通道也失败：{fallback_err}"),
-                );
-            }
-        };
+    let body = match response.text().await {
+        Ok(b) => b,
+        Err(err) => {
+            return fetch_page_via_curl(url, referer.to_string())
+                .await
+                .map_err(|fallback_err| {
+                    combine_fallback_error(format!("读取响应失败：{err}"), fallback_err)
+                });
+        }
+    };
 
     if body.is_empty() || looks_like_cloudflare_challenge(&body) {
         return fetch_page_via_curl(url, referer.to_string())
             .await
             .map_err(|fallback_err| {
-                format!("站点返回空内容或被 CF 拦截\n备用通道也失败：{fallback_err}")
+                combine_fallback_error("站点返回空内容或被 CF 拦截".to_string(), fallback_err)
             });
     }
 
@@ -828,7 +920,8 @@ async fn fetch_page_via_curl(url: String, referer: String) -> Result<String, Str
         return Err("只允许抓取受信任的 WNACG 页面".to_string());
     }
 
-    tauri::async_runtime::spawn_blocking(move || {
+    wait_for_page_fetch_slot().await;
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let mut command = Command::new("curl");
         hide_console(&mut command);
         let output = command
@@ -869,6 +962,9 @@ async fn fetch_page_via_curl(url: String, referer: String) -> Result<String, Str
         let body = stdout[..marker_at].to_string();
         let code = stdout[marker_at + marker.len()..].trim();
 
+        if code == "429" {
+            return Err(CURL_RATE_LIMIT_MARKER.to_string());
+        }
         if !code.starts_with('2') {
             return Err(format!("curl 返回 HTTP {code}"));
         }
@@ -879,7 +975,16 @@ async fn fetch_page_via_curl(url: String, referer: String) -> Result<String, Str
         Ok(body)
     })
     .await
-    .map_err(|err| format!("curl 备用任务失败：{err}"))?
+    .map_err(|err| format!("curl 备用任务失败：{err}"))?;
+
+    match result {
+        Err(error) if error == CURL_RATE_LIMIT_MARKER => {
+            let delay = PAGE_FETCH_DEFAULT_COOLDOWN;
+            defer_page_fetches(delay).await;
+            Err(rate_limit_error(delay))
+        }
+        result => result,
+    }
 }
 
 async fn fetch_binary(url: String, referer: Option<String>) -> Result<(String, Vec<u8>), String> {
@@ -1095,6 +1200,7 @@ async fn fetch_albums(path: String, _app: tauri::AppHandle) -> Result<Vec<Album>
             .and_then(|html| parse_albums(&html, base_url))
         {
             Ok(albums) => return Ok(albums),
+            Err(error) if is_rate_limit_error(&error) => return Err(error),
             Err(error) => errors.push(format!("{base_url}: {error}")),
         }
     }
@@ -1236,7 +1342,7 @@ async fn fetch_album_photos(aid: String, _app: tauri::AppHandle) -> Result<Album
                 };
 
                 if max_page > 1 {
-                    let mut page_results = futures_util::stream::iter(2..=max_page)
+                    let mut page_stream = futures_util::stream::iter(2..=max_page)
                         .map(|page| {
                             let bu = base_url.to_string();
                             let a = aid.clone();
@@ -1247,27 +1353,29 @@ async fn fetch_album_photos(aid: String, _app: tauri::AppHandle) -> Result<Album
                                 Ok::<_, String>((page, parse_album_photos(&html, &bu)?))
                             }
                         })
-                        .buffer_unordered(ALBUM_PAGE_FETCH_CONCURRENCY)
-                        .collect::<Vec<_>>()
-                        .await;
-                    page_results.sort_by_key(|result| match result {
-                        Ok((page, _)) => *page,
-                        Err(_) => usize::MAX,
-                    });
-
+                        .buffer_unordered(ALBUM_PAGE_FETCH_CONCURRENCY);
+                    let mut page_results = Vec::new();
                     let mut page_error = None;
-                    for result in page_results {
+                    while let Some(result) = page_stream.next().await {
                         match result {
-                            Ok((_, mut page_photos)) => photos.append(&mut page_photos),
+                            Ok(page_result) => page_results.push(page_result),
                             Err(error) => {
                                 page_error = Some(error);
                                 break;
                             }
                         }
                     }
+                    drop(page_stream);
                     if let Some(error) = page_error {
+                        if is_rate_limit_error(&error) {
+                            return Err(error);
+                        }
                         errors.push(format!("{base_url}: {error}"));
                         continue;
+                    }
+                    page_results.sort_by_key(|(page, _)| *page);
+                    for (_, mut page_photos) in page_results {
+                        photos.append(&mut page_photos);
                     }
                 }
 
@@ -1285,6 +1393,7 @@ async fn fetch_album_photos(aid: String, _app: tauri::AppHandle) -> Result<Album
                     title,
                 });
             }
+            Err(error) if is_rate_limit_error(&error) => return Err(error),
             Err(error) => errors.push(format!("{base_url}: {error}")),
         }
     }
@@ -1317,6 +1426,7 @@ async fn fetch_photo_image(
             .and_then(|html| parse_photo_image(&html, base_url))
         {
             Ok(photo) => return Ok(photo),
+            Err(error) if is_rate_limit_error(&error) => return Err(error),
             Err(error) => errors.push(format!("{base_url}: {error}")),
         }
     }
@@ -1571,6 +1681,9 @@ fn browse_link_in_main(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             fetch_albums,
@@ -1646,6 +1759,7 @@ pub fn run() {
                     "quit" => {
                         app.state::<Arc<AtomicBool>>()
                             .store(true, Ordering::Relaxed);
+                        ocr::shutdown_workers();
                         app.exit(0);
                     }
                     _ => {}
@@ -1670,13 +1784,13 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
+        .run(|app, event| match event {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = event {
-                show_main_window(app);
+            tauri::RunEvent::Reopen { .. } => show_main_window(app),
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                ocr::shutdown_workers();
             }
-            let _ = app;
-            let _ = event;
+            _ => {}
         });
 }
 
@@ -1892,5 +2006,39 @@ mod tests {
         let mut throttle = ImageProgressThrottle::new(start, 0, Some(0));
 
         assert!(!throttle.should_emit(start + Duration::from_secs(1), 1_000, Some(100)));
+    }
+
+    #[test]
+    fn page_fetch_gate_spaces_requests_and_extends_rate_limit_cooldowns() {
+        let start = Instant::now();
+        let mut gate = PageFetchGate::new(start);
+
+        assert_eq!(gate.reserve(start), None);
+        assert_eq!(
+            gate.reserve(start + Duration::from_millis(200)),
+            Some(Duration::from_millis(1_000))
+        );
+
+        gate.defer(start + Duration::from_millis(300), Duration::from_secs(15));
+        assert_eq!(
+            gate.reserve(start + Duration::from_secs(1)),
+            Some(Duration::from_millis(14_300))
+        );
+    }
+
+    #[test]
+    fn retry_after_seconds_are_bounded_and_render_a_rate_limit_error() {
+        assert_eq!(rate_limit_delay(None), PAGE_FETCH_DEFAULT_COOLDOWN);
+        assert_eq!(rate_limit_delay(Some("9")), Duration::from_secs(9));
+        assert_eq!(rate_limit_delay(Some("0")), Duration::from_secs(1));
+        assert_eq!(rate_limit_delay(Some("9999")), PAGE_FETCH_MAX_COOLDOWN);
+
+        let error = rate_limit_error(Duration::from_secs(9));
+        assert!(is_rate_limit_error(&error));
+        assert!(error.contains("已自动暂停 9 秒"));
+        assert_eq!(
+            combine_fallback_error("原请求失败".to_string(), error.clone()),
+            error
+        );
     }
 }
