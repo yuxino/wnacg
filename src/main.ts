@@ -4146,6 +4146,15 @@ function preloadImage(url: string) {
 
 // ---- keyboard ----
 
+function isInteractiveShortcutTarget(target: EventTarget | null) {
+  if (!(target instanceof Element)) return false;
+  return Boolean(
+    target.closest(
+      "button, input, textarea, select, a[href], [contenteditable]:not([contenteditable='false']), [role='button'], [role='link']",
+    ),
+  );
+}
+
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && readerSettingsOpen) {
     e.preventDefault();
@@ -4167,7 +4176,8 @@ document.addEventListener("keydown", (e) => {
     return;
   }
 
-  if (state.view === "reader" && !(e.target instanceof HTMLInputElement) && !(e.target instanceof HTMLTextAreaElement)) {
+  const hasCommandModifier = e.ctrlKey || e.metaKey || e.altKey;
+  if (state.view === "reader" && !hasCommandModifier && !isInteractiveShortcutTarget(e.target)) {
     if (e.key === "+" || e.key === "=") {
       e.preventDefault();
       adjustReaderZoom(READER_ZOOM_STEP);
@@ -4266,9 +4276,9 @@ document.addEventListener("keydown", (e) => {
     backToList();
   } else if (
     state.view === "reader"
+    && !hasCommandModifier
     && e.key.toLowerCase() === "x"
-    && !(e.target instanceof HTMLInputElement)
-    && !(e.target instanceof HTMLTextAreaElement)
+    && !isInteractiveShortcutTarget(e.target)
   ) {
     if (state.fullscreen) {
       toggleFullscreen();

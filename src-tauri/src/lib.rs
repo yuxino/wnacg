@@ -1400,6 +1400,12 @@ async fn check_for_update(app: tauri::AppHandle) -> Result<AppUpdateInfo, String
     })
 }
 
+#[cfg(target_os = "windows")]
+fn tray_icon_image() -> Image<'static> {
+    tauri::include_image!("icons/kiri/32x32.png")
+}
+
+#[cfg(not(target_os = "windows"))]
 fn tray_icon_image() -> Image<'static> {
     tauri::include_image!("icons/tray-icon.png")
 }
@@ -1472,6 +1478,7 @@ async fn open_album_window(
     let label = sanitize_window_label(&aid);
 
     if let Some(existing) = app.get_webview_window(&label) {
+        existing.unminimize().ok();
         existing.show().ok();
         existing.set_focus().ok();
         return Ok(());
@@ -1590,6 +1597,8 @@ pub fn run() {
             translate::translate_titles
         ])
         .setup(|app| {
+            translate::migrate_legacy_data();
+
             let show = MenuItemBuilder::with_id("show", "显示").build(app)?;
             let hide = MenuItemBuilder::with_id("hide", "隐藏").build(app)?;
             let quit = MenuItemBuilder::with_id("quit", "退出").build(app)?;
@@ -1622,9 +1631,8 @@ pub fn run() {
                 });
             }
 
-            let _tray = TrayIconBuilder::new()
+            let tray_builder = TrayIconBuilder::new()
                 .icon(tray_icon_image())
-                .icon_as_template(true)
                 .tooltip("wnacg")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -1651,8 +1659,10 @@ pub fn run() {
                     {
                         toggle_main_window(tray.app_handle());
                     }
-                })
-                .build(app)?;
+                });
+            #[cfg(target_os = "macos")]
+            let tray_builder = tray_builder.icon_as_template(true);
+            let _tray = tray_builder.build(app)?;
 
             app.manage(is_quitting);
 

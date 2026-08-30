@@ -273,21 +273,27 @@ function Invoke-NsisInstallSmoke {
 
   $installRoot = Join-Path $env:LOCALAPPDATA 'wnacg'
   $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\wnacg'
-  $modelRoot = Join-Path $env:LOCALAPPDATA 'com.yuxino.wnacg\ocr-models'
+  $dataRoot = Join-Path $env:LOCALAPPDATA 'com.yuxino.wnacg'
+  $modelRoot = Join-Path $dataRoot 'ocr-models'
   $modelSentinel = Join-Path $modelRoot 'ci-preserve-after-uninstall.txt'
+  $translationSentinel = Join-Path $dataRoot 'translation-cache-v1.json'
+  $legacyTranslationCache = Join-Path $installRoot 'translation-cache-v1.json'
+  $startMenuShortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\wnacg.lnk'
+  $desktopShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'wnacg.lnk'
   if ((Test-Path -LiteralPath $installRoot) -or (Test-Path -LiteralPath $uninstallKey)) {
     throw "Refusing to replace a pre-existing WNACG installation at '$installRoot'"
   }
-  if (Test-Path -LiteralPath $modelRoot) {
-    throw "Refusing to replace a pre-existing WNACG model directory at '$modelRoot'"
+  if (Test-Path -LiteralPath $dataRoot) {
+    throw "Refusing to replace a pre-existing WNACG data directory at '$dataRoot'"
   }
 
   New-Item -ItemType Directory -Path $modelRoot | Out-Null
   [System.IO.File]::WriteAllText($modelSentinel, 'preserve', [System.Text.Encoding]::ASCII)
 
   $installed = $false
+  $translationMigrated = $false
   try {
-    $installer = Start-Process -FilePath $InstallerPath -ArgumentList @('/S', '/NS') -Wait -PassThru
+    $installer = Start-Process -FilePath $InstallerPath -ArgumentList @('/S') -Wait -PassThru
     $installer.Refresh()
     if ($installer.ExitCode -ne 0) {
       throw "NSIS installer failed with exit code $($installer.ExitCode)"
@@ -299,14 +305,26 @@ function Invoke-NsisInstallSmoke {
     $uninstaller = Join-Path $installRoot 'uninstall.exe'
     Get-Item -LiteralPath $app -ErrorAction Stop | Out-Null
     Get-Item -LiteralPath $uninstaller -ErrorAction Stop | Out-Null
+    Get-Item -LiteralPath $uninstallKey -ErrorAction Stop | Out-Null
+    Get-Item -LiteralPath $startMenuShortcut -ErrorAction Stop | Out-Null
+    Get-Item -LiteralPath $desktopShortcut -ErrorAction Stop | Out-Null
     Assert-X64Pe -Path $app
     Assert-OcrPayload -Directory $ocr
     Test-OcrHelperStartup -HelperPath (Join-Path $ocr 'manga_ocr_helper.exe') -WorkRoot $env:RUNNER_TEMP
+    [System.IO.File]::WriteAllText(
+      $legacyTranslationCache,
+      '{"version":1,"next_order":1,"dialogue":{},"title":{}}',
+      [System.Text.Encoding]::ASCII
+    )
     Test-AppStartup -AppPath $app
+    if ((Test-Path -LiteralPath $legacyTranslationCache) -or (-not (Test-Path -LiteralPath $translationSentinel))) {
+      throw "WNACG did not migrate the legacy translation cache out of the install directory"
+    }
+    $translationMigrated = $true
 
     $installPrefix = $installRoot.TrimEnd('\') + '\'
-    if ($modelRoot.StartsWith($installPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-      throw "OCR model storage must remain outside the uninstallable app directory: $modelRoot"
+    if ($dataRoot.StartsWith($installPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+      throw "Application data must remain outside the uninstallable app directory: $dataRoot"
     }
   } finally {
     if ($installed) {
@@ -318,18 +336,35 @@ function Invoke-NsisInstallSmoke {
           throw "NSIS uninstaller failed with exit code $($uninstall.ExitCode)"
         }
       }
-      for ($attempt = 0; $attempt -lt 30 -and (Test-Path -LiteralPath (Join-Path $installRoot 'wnacg.exe')); $attempt++) {
+      for ($attempt = 0; $attempt -lt 30 -and (
+        (Test-Path -LiteralPath $installRoot) -or
+        (Test-Path -LiteralPath $uninstallKey) -or
+        ($null -ne (Get-Process -Name 'wnacg', 'manga_ocr_helper' -ErrorAction SilentlyContinue))
+      ); $attempt++) {
         Start-Sleep -Milliseconds 500
       }
-      if (Test-Path -LiteralPath (Join-Path $installRoot 'wnacg.exe')) {
-        throw "NSIS uninstaller left the application executable behind: $installRoot"
+      if ($null -ne (Get-Process -Name 'wnacg', 'manga_ocr_helper' -ErrorAction SilentlyContinue)) {
+        throw 'NSIS uninstall left a WNACG application or OCR helper process running'
+      }
+      if (Test-Path -LiteralPath $installRoot) {
+        throw "NSIS uninstaller left the application directory behind: $installRoot"
+      }
+      if (Test-Path -LiteralPath $uninstallKey) {
+        throw "NSIS uninstaller left its registry entry behind: $uninstallKey"
+      }
+      foreach ($shortcut in @($startMenuShortcut, $desktopShortcut)) {
+        if (Test-Path -LiteralPath $shortcut) {
+          throw "NSIS uninstaller left a shortcut behind: $shortcut"
+        }
       }
     }
     if (-not (Test-Path -LiteralPath $modelSentinel)) {
       throw "NSIS uninstall removed the isolated OCR model directory: $modelRoot"
     }
-    Remove-Item -LiteralPath $modelSentinel -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $modelRoot -Force -ErrorAction SilentlyContinue
+    if ($translationMigrated -and -not (Test-Path -LiteralPath $translationSentinel)) {
+      throw "NSIS uninstall removed the isolated translation cache: $translationSentinel"
+    }
+    Remove-Item -LiteralPath $dataRoot -Recurse -Force -ErrorAction SilentlyContinue
   }
 }
 

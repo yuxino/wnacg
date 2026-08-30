@@ -23,6 +23,10 @@ const CACHE_MAX_FILE_BYTES: u64 = 12 * 1024 * 1024;
 const LEGACY_CONFIG_MAX_FILE_BYTES: u64 = 1024 * 1024;
 const CACHE_MAX_SOURCE_BYTES: usize = 16 * 1024;
 const CACHE_MAX_TRANSLATION_BYTES: usize = 32 * 1024;
+#[cfg(any(target_os = "windows", test))]
+const APP_DATA_DIRECTORY_NAME: &str = "com.yuxino.wnacg";
+const LEGACY_DATA_DIRECTORY_NAME: &str = "wnacg";
+const LEGACY_CONFIG_FILE_NAME: &str = "config.json";
 
 static TRANSLATION_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
 static TRANSLATION_CACHE: OnceLock<Mutex<TranslationCache>> = OnceLock::new();
@@ -222,15 +226,112 @@ struct PendingText {
     offsets: Vec<usize>,
 }
 
-fn config_dir() -> std::path::PathBuf {
+fn legacy_config_dir() -> PathBuf {
     dirs::data_local_dir()
-        .map(|path| path.join("wnacg"))
+        .map(|path| path.join(LEGACY_DATA_DIRECTORY_NAME))
         .or_else(|| dirs::home_dir().map(|path| path.join(".wnacg")))
-        .unwrap_or_else(|| std::env::temp_dir().join("wnacg"))
+        .unwrap_or_else(|| std::env::temp_dir().join(LEGACY_DATA_DIRECTORY_NAME))
+}
+
+fn config_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        return dirs::data_local_dir()
+            .map(|path| path.join(APP_DATA_DIRECTORY_NAME))
+            .or_else(|| {
+                dirs::home_dir().map(|path| path.join(format!(".{APP_DATA_DIRECTORY_NAME}")))
+            })
+            .unwrap_or_else(|| std::env::temp_dir().join(APP_DATA_DIRECTORY_NAME));
+    }
+    #[cfg(not(target_os = "windows"))]
+    legacy_config_dir()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn migrate_legacy_data_file(
+    legacy_path: &Path,
+    current_path: &Path,
+    max_file_bytes: u64,
+) -> Result<bool, String> {
+    if legacy_path == current_path || current_path.exists() {
+        return Ok(false);
+    }
+    let metadata = match std::fs::symlink_metadata(legacy_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("无法检查旧版本地数据：{error}")),
+    };
+    if !metadata.file_type().is_file() {
+        return Err("旧版本地数据不是普通文件".to_string());
+    }
+    if metadata.len() > max_file_bytes {
+        return Err("旧版本地数据超过安全上限".to_string());
+    }
+
+    let bytes =
+        std::fs::read(legacy_path).map_err(|error| format!("无法读取旧版本地数据：{error}"))?;
+    if bytes.len() as u64 > max_file_bytes {
+        return Err("旧版本地数据超过安全上限".to_string());
+    }
+    let parent = current_path.parent().ok_or("本地数据路径无效")?;
+    ensure_private_directory(parent)?;
+    let temp_path = cache_temp_path(current_path);
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|error| format!("无法创建本地数据迁移临时文件：{error}"))?;
+        file.write_all(&bytes)
+            .map_err(|error| format!("无法迁移旧版本地数据：{error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("无法同步迁移后的本地数据：{error}"))?;
+        std::fs::rename(&temp_path, current_path)
+            .map_err(|error| format!("无法安装迁移后的本地数据：{error}"))?;
+        ensure_private_file(current_path)?;
+        std::fs::remove_file(legacy_path)
+            .map_err(|error| format!("无法清理已迁移的旧版本地数据：{error}"))?;
+        if let Some(legacy_parent) = legacy_path.parent() {
+            let _ = std::fs::remove_dir(legacy_parent);
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result.map(|()| true)
+}
+
+fn migrated_data_path(name: &str, max_file_bytes: u64) -> PathBuf {
+    let current_path = config_dir().join(name);
+    #[cfg(target_os = "windows")]
+    {
+        let legacy_path = legacy_config_dir().join(name);
+        if let Err(error) = migrate_legacy_data_file(&legacy_path, &current_path, max_file_bytes) {
+            eprintln!("旧版 WNACG 本地数据迁移失败：{error}");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = max_file_bytes;
+    current_path
 }
 
 fn cache_path() -> PathBuf {
-    config_dir().join(CACHE_FILE_NAME)
+    migrated_data_path(CACHE_FILE_NAME, CACHE_MAX_FILE_BYTES)
+}
+
+fn config_path() -> PathBuf {
+    migrated_data_path(LEGACY_CONFIG_FILE_NAME, LEGACY_CONFIG_MAX_FILE_BYTES)
+}
+
+pub(crate) fn migrate_legacy_data() {
+    let _ = cache_path();
+    let _ = config_path();
 }
 
 fn cache_temp_path(path: &Path) -> PathBuf {
@@ -657,7 +758,7 @@ fn keychain_contains(key: &str) -> bool {
 }
 
 fn keychain_source_after_legacy_cleanup(key: &str) -> ApiKeySource {
-    let legacy_path = config_dir().join("config.json");
+    let legacy_path = config_path();
     match legacy_key_remains_after_cleanup(&legacy_path, key) {
         Ok(false) => ApiKeySource::Keychain,
         Ok(true) => ApiKeySource::KeychainWithLegacy,
@@ -691,7 +792,7 @@ fn api_key_with_source() -> Result<(String, ApiKeySource), String> {
             return Ok((key, ApiKeySource::Environment));
         }
     }
-    let path = config_dir().join("config.json");
+    let path = config_path();
     if std::fs::metadata(&path)
         .ok()
         .is_some_and(|metadata| metadata.len() <= LEGACY_CONFIG_MAX_FILE_BYTES)
@@ -730,7 +831,7 @@ pub fn set_deepseek_api_key(api_key: String) -> Result<(), String> {
     if !keychain_contains(key) {
         return Err("密钥写入安全凭据存储后未能回读确认".to_string());
     }
-    remove_legacy_api_key_if_present(&config_dir().join("config.json"))
+    remove_legacy_api_key_if_present(&config_path())
         .map_err(|error| format!("密钥已保存到安全凭据存储，但旧版明文清理失败：{error}"))
 }
 
@@ -1220,6 +1321,47 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    #[test]
+    fn legacy_data_migration_moves_file_without_overwriting() {
+        let root = test_cache_path("migration-root");
+        let legacy_path = root.join(LEGACY_DATA_DIRECTORY_NAME).join(CACHE_FILE_NAME);
+        let current_path = root.join(APP_DATA_DIRECTORY_NAME).join(CACHE_FILE_NAME);
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, b"legacy-cache").unwrap();
+
+        assert!(migrate_legacy_data_file(&legacy_path, &current_path, 1024).unwrap());
+        assert_eq!(std::fs::read(&current_path).unwrap(), b"legacy-cache");
+        assert!(!legacy_path.exists());
+        assert!(!legacy_path.parent().unwrap().exists());
+
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, b"stale-cache").unwrap();
+        assert!(!migrate_legacy_data_file(&legacy_path, &current_path, 1024).unwrap());
+        assert_eq!(std::fs::read(&current_path).unwrap(), b"legacy-cache");
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), b"stale-cache");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_data_migration_rejects_oversized_files() {
+        let root = test_cache_path("oversized-migration-root");
+        let legacy_path = root
+            .join(LEGACY_DATA_DIRECTORY_NAME)
+            .join(LEGACY_CONFIG_FILE_NAME);
+        let current_path = root
+            .join(APP_DATA_DIRECTORY_NAME)
+            .join(LEGACY_CONFIG_FILE_NAME);
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, b"too-large").unwrap();
+
+        assert!(migrate_legacy_data_file(&legacy_path, &current_path, 4).is_err());
+        assert_eq!(std::fs::read(&legacy_path).unwrap(), b"too-large");
+        assert!(!current_path.exists());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
