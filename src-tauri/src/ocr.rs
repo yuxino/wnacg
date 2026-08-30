@@ -1,29 +1,38 @@
 use base64::Engine as _;
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+use tauri::Emitter as _;
+#[cfg(target_os = "windows")]
+use tauri::Manager as _;
 
+#[cfg(target_os = "macos")]
 const VISION_HELPER_SOURCE: &str = include_str!("../ocr/ocr_helper.swift");
+#[cfg(target_os = "macos")]
 const VISION_HELPER_VERSION: &str = "v2";
 
-// 漫画引擎(日文竖排):Rust 助手 + ONNX 模型,首次使用由 cargo 编译并缓存
+// 漫画引擎(日文竖排):Rust 助手 + ONNX 模型；Windows 随安装包提供助手，模型按需缓存。
 const MANGA_CARGO_TOML: &str = include_str!("../ocr/manga_helper/Cargo.toml");
 const MANGA_CARGO_LOCK: &str = include_str!("../ocr/manga_helper/Cargo.lock");
 const MANGA_HELPER_SOURCE: &str = include_str!("../ocr/manga_helper/src/main.rs");
-const MANGA_HELPER_VERSION: &str = "v1";
+const MANGA_HELPER_VERSION: &str = "v2";
 
 const MAX_VISION_POOL: usize = 3;
 const MAX_MANGA_POOL: usize = 2;
 const IMAGE_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
+const MODEL_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(90);
+#[cfg(target_os = "windows")]
+const BUNDLED_MANGA_HELPER: &str = "ocr/manga_ocr_helper.exe";
 
-/// Windows 上以无控制台窗口方式启动子进程，避免 OCR 工作进程/curl/cargo 弹出黑框。
+/// Windows 上以无控制台窗口方式启动子进程，避免 OCR 工作进程/Cargo 弹出黑框。
 #[cfg(target_os = "windows")]
 fn hide_console(command: &mut Command) {
     use std::os::windows::process::CommandExt as _;
@@ -39,6 +48,71 @@ struct ModelFile {
     url: &'static str,
     bytes: u64,
     sha256: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OcrModelProgress {
+    request_id: String,
+    phase: String,
+    file_name: Option<String>,
+    file_index: usize,
+    file_count: usize,
+    file_loaded: u64,
+    file_total: u64,
+    loaded: u64,
+    total: u64,
+    percent: u8,
+}
+
+#[derive(Clone)]
+struct ModelProgressReporter {
+    app: Option<tauri::AppHandle>,
+    request_id: Option<String>,
+}
+
+impl ModelProgressReporter {
+    fn disabled() -> Self {
+        Self {
+            app: None,
+            request_id: None,
+        }
+    }
+
+    fn emit(&self, phase: &str, model: Option<(&ModelFile, usize, u64)>, loaded: u64, total: u64) {
+        let (Some(app), Some(request_id)) = (&self.app, &self.request_id) else {
+            return;
+        };
+        let (file_name, file_index, file_loaded, file_total) = match model {
+            Some((model, index, file_loaded)) => (
+                Some(model.name.to_string()),
+                index + 1,
+                file_loaded,
+                model.bytes,
+            ),
+            None => (None, 0, 0, 0),
+        };
+        let percent = loaded
+            .saturating_mul(100)
+            .checked_div(total)
+            .unwrap_or(100)
+            .min(100) as u8;
+        let _ = app.emit(
+            "ocr-model-progress",
+            OcrModelProgress {
+                request_id: request_id.clone(),
+                phase: phase.to_string(),
+                file_name,
+                file_index,
+                file_count: MODEL_FILES.len(),
+                file_loaded,
+                file_total,
+                loaded,
+                total,
+                percent,
+            },
+        );
+    }
 }
 
 const MODEL_FILES: &[ModelFile] = &[
@@ -120,10 +194,18 @@ impl OcrEngine {
 }
 
 struct Worker {
+    child: Child,
     stdin: ChildStdin,
     pending: Arc<Mutex<HashMap<u64, mpsc::Sender<serde_json::Value>>>>,
     next_id: u64,
     engine: OcrEngine,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 struct Pool {
@@ -224,6 +306,7 @@ fn hash_sources(items: &[&str]) -> u64 {
     hasher.finish()
 }
 
+#[cfg(target_os = "macos")]
 fn vision_helper_dir() -> PathBuf {
     let hash = hash_sources(&[VISION_HELPER_VERSION, VISION_HELPER_SOURCE]);
     std::env::temp_dir().join(format!("wnacg-ocr-vision-{hash:016x}"))
@@ -239,7 +322,7 @@ fn manga_helper_dir() -> PathBuf {
     std::env::temp_dir().join(format!("wnacg-ocr-manga-{hash:016x}"))
 }
 
-fn models_dir() -> PathBuf {
+fn legacy_models_dir() -> PathBuf {
     dirs::data_local_dir()
         .map(|path| path.join("wnacg"))
         .or_else(|| dirs::home_dir().map(|path| path.join(".wnacg")))
@@ -247,6 +330,20 @@ fn models_dir() -> PathBuf {
         .join("ocr-models")
 }
 
+fn models_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        return dirs::data_local_dir()
+            .map(|path| path.join("com.yuxino.wnacg"))
+            .or_else(|| dirs::home_dir().map(|path| path.join(".wnacg")))
+            .unwrap_or_else(|| std::env::temp_dir().join("wnacg"))
+            .join("ocr-models");
+    }
+    #[cfg(not(target_os = "windows"))]
+    legacy_models_dir()
+}
+
+#[cfg(target_os = "macos")]
 fn ensure_vision_helper() -> Result<PathBuf, String> {
     static COMPILING: Mutex<()> = Mutex::new(());
     let _guard = COMPILING.lock().map_err(|_| "OCR 初始化冲突".to_string())?;
@@ -275,6 +372,11 @@ fn ensure_vision_helper() -> Result<PathBuf, String> {
     Ok(bin)
 }
 
+#[cfg(not(target_os = "macos"))]
+fn ensure_vision_helper() -> Result<PathBuf, String> {
+    Err("中文优先 OCR 目前仅支持 macOS；Windows 请切换到「日文优先」".to_string())
+}
+
 fn file_sha256(path: &std::path::Path) -> Result<String, String> {
     use sha2::{Digest as _, Sha256};
 
@@ -294,78 +396,434 @@ fn file_sha256(path: &std::path::Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn model_file_is_valid(path: &std::path::Path, model: &ModelFile) -> bool {
-    std::fs::metadata(path)
+fn regular_file_metadata(path: &Path) -> Option<std::fs::Metadata> {
+    std::fs::symlink_metadata(path)
         .ok()
-        .is_some_and(|metadata| metadata.len() == model.bytes)
+        .filter(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
+}
+
+fn model_file_is_valid(path: &std::path::Path, model: &ModelFile) -> bool {
+    regular_file_metadata(path).is_some_and(|metadata| metadata.len() == model.bytes)
         && file_sha256(path)
             .ok()
             .is_some_and(|digest| digest == model.sha256)
 }
 
-fn ensure_manga_models_inner() -> Result<(), String> {
-    let dir = models_dir();
-    std::fs::create_dir_all(&dir).map_err(|err| format!("无法创建模型目录：{err}"))?;
+#[cfg(target_os = "windows")]
+fn copy_legacy_model_file(source: &Path, destination: &Path, max_bytes: u64) -> Result<(), String> {
+    if destination.exists() {
+        return Ok(());
+    }
+    let Some(metadata) = regular_file_metadata(source) else {
+        return Ok(());
+    };
+    if metadata.len() == 0 || metadata.len() > max_bytes {
+        return Ok(());
+    }
+    let staging = destination.with_file_name(format!(
+        ".{}.{}.migrate",
+        destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("model"),
+        std::process::id()
+    ));
+    if staging.exists() {
+        let staging_metadata = std::fs::symlink_metadata(&staging)
+            .map_err(|error| format!("无法检查模型迁移临时文件：{error}"))?;
+        if staging_metadata.file_type().is_symlink() || !staging_metadata.is_file() {
+            return Err("模型迁移临时路径不是普通文件".to_string());
+        }
+        std::fs::remove_file(&staging)
+            .map_err(|error| format!("无法清理模型迁移临时文件：{error}"))?;
+    }
+    let result = (|| {
+        let mut input =
+            std::fs::File::open(source).map_err(|error| format!("无法读取旧 OCR 模型：{error}"))?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)
+            .map_err(|error| format!("无法创建 OCR 模型迁移文件：{error}"))?;
+        let copied = std::io::copy(&mut input, &mut output)
+            .map_err(|error| format!("无法迁移旧 OCR 模型：{error}"))?;
+        if copied != metadata.len() {
+            return Err("旧 OCR 模型迁移不完整".to_string());
+        }
+        output
+            .sync_all()
+            .map_err(|error| format!("无法同步已迁移 OCR 模型：{error}"))?;
+        drop(output);
+        std::fs::rename(&staging, destination)
+            .map_err(|error| format!("无法安装已迁移 OCR 模型：{error}"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(staging);
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn migrate_legacy_models(
+    dir: &Path,
+    reporter: &ModelProgressReporter,
+    total: u64,
+) -> Result<(), String> {
+    let legacy = legacy_models_dir();
+    if legacy == dir || !legacy.exists() {
+        return Ok(());
+    }
+    let metadata = std::fs::symlink_metadata(&legacy)
+        .map_err(|error| format!("无法检查旧 OCR 模型目录：{error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("旧 OCR 模型目录不是可信的普通目录".to_string());
+    }
+    reporter.emit("migrating", None, 0, total);
     for model in MODEL_FILES {
-        let dest = dir.join(model.name);
-        if model_file_is_valid(&dest, model) {
-            continue;
-        }
-        let part = dir.join(format!("{}.part", model.name));
-        let mut command = Command::new("curl");
-        hide_console(&mut command);
-        let status = command
-            .args([
-                "--proto",
-                "=https",
-                "--proto-redir",
-                "=https",
-                "-fL",
-                "--retry",
-                "3",
-                "--max-filesize",
-            ])
-            .arg(model.bytes.to_string())
-            .args(["-C", "-"])
-            .arg(model.url)
-            .arg("-o")
-            .arg(&part)
-            .status()
-            .map_err(|err| format!("未找到 curl，无法下载 OCR 模型：{err}"))?;
-        if !status.success() {
-            let _ = std::fs::remove_file(&part);
-            return Err(format!(
-                "OCR 模型 {} 下载失败，请检查网络后重试",
-                model.name
-            ));
-        }
-        if !model_file_is_valid(&part, model) {
-            let _ = std::fs::remove_file(&part);
-            return Err(format!("OCR 模型 {} 校验失败，请重试", model.name));
-        }
-        if dest.exists() {
-            std::fs::remove_file(&dest)
-                .map_err(|error| format!("无法替换旧 OCR 模型 {}: {error}", model.name))?;
-        }
-        std::fs::rename(&part, &dest)
-            .map_err(|error| format!("无法安装 OCR 模型 {}: {error}", model.name))?;
+        copy_legacy_model_file(&legacy.join(model.name), &dir.join(model.name), model.bytes)?;
+        copy_legacy_model_file(
+            &legacy.join(format!("{}.part", model.name)),
+            &dir.join(format!("{}.part", model.name)),
+            model.bytes,
+        )?;
     }
     Ok(())
 }
 
-fn ensure_manga_models() -> Result<(), String> {
+fn is_allowed_model_url(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https"
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "huggingface.co"
+        || host.ends_with(".huggingface.co")
+        || host == "hf.co"
+        || host.ends_with(".hf.co")
+}
+
+static MODEL_HTTP_CLIENT: LazyLock<Result<reqwest::blocking::Client, String>> =
+    LazyLock::new(|| {
+        reqwest::blocking::Client::builder()
+            .user_agent("wnacg/0.1 local-ocr-model-downloader")
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 8 {
+                    return attempt.error(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "OCR 模型重定向次数过多",
+                    ));
+                }
+                if is_allowed_model_url(attempt.url()) {
+                    attempt.follow()
+                } else {
+                    attempt.error(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "OCR 模型重定向到了未授权站点",
+                    ))
+                }
+            }))
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(30 * 60))
+            .build()
+            .map_err(|error| format!("无法创建 OCR 模型下载器：{error}"))
+    });
+
+fn partial_model_length(path: &Path, model: &ModelFile) -> Result<u64, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("无法检查 OCR 模型下载进度：{error}")),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!("OCR 模型 {} 的临时路径不是普通文件", model.name));
+    }
+    if metadata.len() > model.bytes {
+        std::fs::remove_file(path)
+            .map_err(|error| format!("无法清理超出大小的 OCR 模型：{error}"))?;
+        return Ok(0);
+    }
+    Ok(metadata.len())
+}
+
+fn download_model_once(
+    model: &ModelFile,
+    part: &Path,
+    completed_before: u64,
+    total: u64,
+    reporter: &ModelProgressReporter,
+) -> Result<(), String> {
+    let client = MODEL_HTTP_CLIENT.as_ref().map_err(Clone::clone)?;
+    let mut resume_at = partial_model_length(part, model)?;
+    if resume_at == model.bytes {
+        return Ok(());
+    }
+
+    reporter.emit(
+        "downloading",
+        Some((
+            model,
+            MODEL_FILES
+                .iter()
+                .position(|item| item.name == model.name)
+                .unwrap_or(0),
+            resume_at,
+        )),
+        completed_before.saturating_add(resume_at),
+        total,
+    );
+    let mut request = client
+        .get(model.url)
+        .header(reqwest::header::ACCEPT_ENCODING, "identity");
+    if resume_at > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={resume_at}-"));
+    }
+    let mut response = request
+        .send()
+        .map_err(|error| format!("请求 OCR 模型 {} 失败：{error}", model.name))?;
+    if !is_allowed_model_url(response.url()) {
+        return Err("OCR 模型请求重定向到了未授权站点".to_string());
+    }
+
+    let status = response.status();
+    if resume_at > 0 && status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        drop(response);
+        std::fs::remove_file(part)
+            .map_err(|error| format!("无法重新开始 OCR 模型 {} 下载：{error}", model.name))?;
+        return download_model_once(model, part, completed_before, total, reporter);
+    }
+    let append = resume_at > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+    if append {
+        let expected_prefix = format!("bytes {resume_at}-");
+        let content_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !content_range.starts_with(&expected_prefix) {
+            drop(response);
+            std::fs::remove_file(part)
+                .map_err(|error| format!("无法重新开始 OCR 模型 {} 下载：{error}", model.name))?;
+            return download_model_once(model, part, completed_before, total, reporter);
+        }
+    } else if status.is_success() {
+        resume_at = 0;
+    } else {
+        return Err(format!("OCR 模型 {} 返回 HTTP {status}", model.name));
+    }
+
+    if response
+        .content_length()
+        .is_some_and(|length| length > model.bytes.saturating_sub(resume_at))
+    {
+        return Err(format!("OCR 模型 {} 超过预期大小", model.name));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(!append);
+    if append {
+        options.append(true);
+    }
+    let mut output = options
+        .open(part)
+        .map_err(|error| format!("无法写入 OCR 模型 {}：{error}", model.name))?;
+    let mut file_loaded = resume_at;
+    let mut buffer = [0_u8; 128 * 1024];
+    let mut last_emitted_at = Instant::now();
+    let mut last_percent = ((file_loaded.saturating_mul(100) / model.bytes).min(100)) as u8;
+    loop {
+        let count = response
+            .read(&mut buffer)
+            .map_err(|error| format!("读取 OCR 模型 {} 失败：{error}", model.name))?;
+        if count == 0 {
+            break;
+        }
+        file_loaded = file_loaded.saturating_add(count as u64);
+        if file_loaded > model.bytes {
+            return Err(format!("OCR 模型 {} 超过预期大小", model.name));
+        }
+        output
+            .write_all(&buffer[..count])
+            .map_err(|error| format!("写入 OCR 模型 {} 失败：{error}", model.name))?;
+        let percent = ((file_loaded.saturating_mul(100) / model.bytes).min(100)) as u8;
+        if percent != last_percent
+            && Instant::now().saturating_duration_since(last_emitted_at)
+                >= MODEL_PROGRESS_EMIT_INTERVAL
+        {
+            reporter.emit(
+                "downloading",
+                Some((
+                    model,
+                    MODEL_FILES
+                        .iter()
+                        .position(|item| item.name == model.name)
+                        .unwrap_or(0),
+                    file_loaded,
+                )),
+                completed_before.saturating_add(file_loaded),
+                total,
+            );
+            last_emitted_at = Instant::now();
+            last_percent = percent;
+        }
+    }
+    output
+        .sync_all()
+        .map_err(|error| format!("无法同步 OCR 模型 {}：{error}", model.name))?;
+    if file_loaded != model.bytes {
+        return Err(format!(
+            "OCR 模型 {} 下载不完整（{} / {} 字节）",
+            model.name, file_loaded, model.bytes
+        ));
+    }
+    reporter.emit(
+        "downloading",
+        Some((
+            model,
+            MODEL_FILES
+                .iter()
+                .position(|item| item.name == model.name)
+                .unwrap_or(0),
+            file_loaded,
+        )),
+        completed_before.saturating_add(file_loaded),
+        total,
+    );
+    Ok(())
+}
+
+fn download_model(
+    model: &ModelFile,
+    part: &Path,
+    completed_before: u64,
+    total: u64,
+    reporter: &ModelProgressReporter,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 1..=3 {
+        match download_model_once(model, part, completed_before, total, reporter) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = error;
+                if attempt < 3 {
+                    std::thread::sleep(Duration::from_millis(300 * attempt));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "OCR 模型 {} 下载失败，已保留进度供下次续传：{}",
+        model.name, last_error
+    ))
+}
+
+fn install_verified_model(
+    part: &Path,
+    destination: &Path,
+    model: &ModelFile,
+) -> Result<(), String> {
+    if let Ok(metadata) = std::fs::symlink_metadata(destination) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!("OCR 模型 {} 的安装路径不是普通文件", model.name));
+        }
+        std::fs::remove_file(destination)
+            .map_err(|error| format!("无法替换旧 OCR 模型 {}：{error}", model.name))?;
+    }
+    std::fs::rename(part, destination)
+        .map_err(|error| format!("无法安装 OCR 模型 {}：{error}", model.name))
+}
+
+fn ensure_manga_models_inner(reporter: &ModelProgressReporter) -> Result<(), String> {
+    let dir = models_dir();
+    std::fs::create_dir_all(&dir).map_err(|err| format!("无法创建模型目录：{err}"))?;
+    let dir_metadata = std::fs::symlink_metadata(&dir)
+        .map_err(|error| format!("无法检查 OCR 模型目录：{error}"))?;
+    if dir_metadata.file_type().is_symlink() || !dir_metadata.is_dir() {
+        return Err("OCR 模型目录不是可信的普通目录".to_string());
+    }
+    let lock_path = dir.join(".model-install.lock");
+    if let Ok(metadata) = std::fs::symlink_metadata(&lock_path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("OCR 模型锁路径不是普通文件".to_string());
+        }
+    }
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| format!("无法创建 OCR 模型锁：{error}"))?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("无法锁定 OCR 模型目录：{error}"))?;
+
+    let total = MODEL_FILES.iter().map(|model| model.bytes).sum();
+    #[cfg(target_os = "windows")]
+    migrate_legacy_models(&dir, reporter, total)?;
+    let mut completed = 0_u64;
+    for (index, model) in MODEL_FILES.iter().enumerate() {
+        reporter.emit("checking", Some((model, index, 0)), completed, total);
+        let dest = dir.join(model.name);
+        if model_file_is_valid(&dest, model) {
+            completed = completed.saturating_add(model.bytes);
+            continue;
+        }
+        let part = dir.join(format!("{}.part", model.name));
+        let mut verified = false;
+        for integrity_attempt in 0..2 {
+            download_model(model, &part, completed, total, reporter)?;
+            reporter.emit(
+                "verifying",
+                Some((model, index, model.bytes)),
+                completed.saturating_add(model.bytes),
+                total,
+            );
+            if model_file_is_valid(&part, model) {
+                verified = true;
+                break;
+            }
+            if let Ok(metadata) = std::fs::symlink_metadata(&part) {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(format!("OCR 模型 {} 的临时路径不是普通文件", model.name));
+                }
+                std::fs::remove_file(&part)
+                    .map_err(|error| format!("无法清理校验失败的 OCR 模型：{error}"))?;
+            }
+            if integrity_attempt == 1 {
+                break;
+            }
+        }
+        if !verified {
+            return Err(format!("OCR 模型 {} 校验失败，请重试", model.name));
+        }
+        install_verified_model(&part, &dest, model)?;
+        completed = completed.saturating_add(model.bytes);
+    }
+    reporter.emit("ready", None, total, total);
+    Ok(())
+}
+
+fn ensure_manga_models(reporter: &ModelProgressReporter) -> Result<(), String> {
     static MODELS_READY: OnceLock<()> = OnceLock::new();
     static INSTALLING: Mutex<()> = Mutex::new(());
+    let total = MODEL_FILES.iter().map(|model| model.bytes).sum();
     if MODELS_READY.get().is_some() {
+        reporter.emit("ready", None, total, total);
         return Ok(());
     }
     let _guard = INSTALLING
         .lock()
         .map_err(|_| "OCR 模型初始化冲突".to_string())?;
     if MODELS_READY.get().is_some() {
+        reporter.emit("ready", None, total, total);
         return Ok(());
     }
-    ensure_manga_models_inner()?;
+    ensure_manga_models_inner(reporter)?;
     let _ = MODELS_READY.set(());
     Ok(())
 }
@@ -397,6 +855,39 @@ fn manga_helper_binary_name() -> &'static str {
     } else {
         "manga_ocr_helper"
     }
+}
+
+#[cfg(target_os = "windows")]
+fn bundled_manga_helper(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|error| format!("无法定位应用资源目录：{error}"))?;
+    let helper = resource_dir.join(BUNDLED_MANGA_HELPER);
+    let metadata = std::fs::symlink_metadata(&helper)
+        .map_err(|error| format!("Windows OCR helper 未随安装包提供：{error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        return Err("Windows OCR helper 安装不完整，请重新安装应用".to_string());
+    }
+    let dependency_dir = helper
+        .parent()
+        .ok_or_else(|| "Windows OCR helper 路径无效".to_string())?;
+    for name in [
+        "onnxruntime.dll",
+        "onnxruntime_providers_shared.dll",
+        "MSVCP140.dll",
+        "MSVCP140_1.dll",
+        "VCRUNTIME140.dll",
+        "VCRUNTIME140_1.dll",
+    ] {
+        let path = dependency_dir.join(name);
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|error| format!("Windows OCR 运行库 {name} 缺失：{error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+            return Err(format!("Windows OCR 运行库 {name} 安装不完整"));
+        }
+    }
+    Ok(helper)
 }
 
 fn is_scoped_manga_cache_dir(temp_root: &Path, cache_dir: &Path) -> bool {
@@ -514,9 +1005,14 @@ fn install_manga_helper_artifact(
     install_result
 }
 
-fn ensure_manga_helper() -> Result<PathBuf, String> {
+fn ensure_manga_helper(_app: Option<&tauri::AppHandle>) -> Result<PathBuf, String> {
     static COMPILING: Mutex<()> = Mutex::new(());
     let _guard = COMPILING.lock().map_err(|_| "OCR 初始化冲突".to_string())?;
+
+    #[cfg(target_os = "windows")]
+    if let Some(app) = _app {
+        return bundled_manga_helper(app);
+    }
 
     let dir = manga_helper_dir();
     std::fs::create_dir_all(dir.join("src"))
@@ -570,15 +1066,17 @@ fn spawn_worker(helper: &std::path::Path, engine: OcrEngine) -> Result<Worker, S
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("无法启动本地 OCR 进程：{err}"))?;
     let stdout = child.stdout.take().ok_or("OCR 进程输出不可用")?;
     let stdin = child.stdin.take().ok_or("OCR 进程输入不可用")?;
+    let stderr = child.stderr.take().ok_or("OCR 进程错误输出不可用")?;
 
     let pending: Arc<Mutex<HashMap<u64, mpsc::Sender<serde_json::Value>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let reader_pending = Arc::clone(&pending);
+    let (ready_tx, ready_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
         for line in reader.lines() {
@@ -586,6 +1084,10 @@ fn spawn_worker(helper: &std::path::Path, engine: OcrEngine) -> Result<Worker, S
             let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
+            if value.get("ready").and_then(|value| value.as_bool()) == Some(true) {
+                let _ = ready_tx.send(());
+                continue;
+            }
             let id = value.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
             if let Ok(mut map) = reader_pending.lock() {
                 if let Some(tx) = map.remove(&id) {
@@ -594,8 +1096,32 @@ fn spawn_worker(helper: &std::path::Path, engine: OcrEngine) -> Result<Worker, S
             }
         }
     });
+    let startup_error = Arc::new(Mutex::new(String::new()));
+    let reader_startup_error = Arc::clone(&startup_error);
+    let stderr_thread = std::thread::spawn(move || {
+        let mut message = String::new();
+        let _ = stderr.take(8 * 1024).read_to_string(&mut message);
+        if let Ok(mut stored) = reader_startup_error.lock() {
+            *stored = message;
+        }
+    });
+
+    if engine == OcrEngine::Manga && ready_rx.recv_timeout(Duration::from_secs(120)).is_err() {
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr_thread.join();
+        let detail = startup_error
+            .lock()
+            .ok()
+            .map(|message| message.trim().to_string())
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| "helper 未在 120 秒内就绪".to_string());
+        return Err(format!("漫画 OCR 引擎启动失败：{detail}"));
+    }
 
     Ok(Worker {
+        child,
         stdin,
         pending,
         next_id: 1,
@@ -685,12 +1211,16 @@ fn resolve_page_source(page: &OcrPageInput) -> Result<String, String> {
     }
 }
 
-fn ensure_engine(engine: OcrEngine) -> Result<PathBuf, String> {
+fn ensure_engine(
+    engine: OcrEngine,
+    app: Option<&tauri::AppHandle>,
+    reporter: &ModelProgressReporter,
+) -> Result<PathBuf, String> {
     match engine {
         OcrEngine::Vision => ensure_vision_helper(),
         OcrEngine::Manga => {
-            let helper = ensure_manga_helper()?;
-            ensure_manga_models()?;
+            let helper = ensure_manga_helper(app)?;
+            ensure_manga_models(reporter)?;
             Ok(helper)
         }
     }
@@ -730,7 +1260,11 @@ fn page_engine(page: &OcrPageInput) -> OcrEngine {
     OcrEngine::from_str(page.engine.as_deref())
 }
 
-pub fn ocr_pages_sync(pages: Vec<OcrPageInput>) -> Result<Vec<OcrPageOutput>, String> {
+fn ocr_pages_sync_with_app(
+    pages: Vec<OcrPageInput>,
+    app: Option<&tauri::AppHandle>,
+) -> Result<Vec<OcrPageOutput>, String> {
+    let reporter = ModelProgressReporter::disabled();
     let mut need_vision = false;
     let mut need_manga = false;
     for page in &pages {
@@ -740,11 +1274,11 @@ pub fn ocr_pages_sync(pages: Vec<OcrPageInput>) -> Result<Vec<OcrPageOutput>, St
         }
     }
     if need_vision {
-        let helper = ensure_engine(OcrEngine::Vision)?;
+        let helper = ensure_engine(OcrEngine::Vision, app, &reporter)?;
         ensure_pool(OcrEngine::Vision, &helper)?;
     }
     if need_manga {
-        let helper = ensure_engine(OcrEngine::Manga)?;
+        let helper = ensure_engine(OcrEngine::Manga, app, &reporter)?;
         ensure_pool(OcrEngine::Manga, &helper)?;
     }
 
@@ -800,7 +1334,7 @@ pub fn ocr_pages_sync(pages: Vec<OcrPageInput>) -> Result<Vec<OcrPageOutput>, St
                 Err(err) => {
                     let dead = pool.workers.swap_remove(slot);
                     drop(dead);
-                    let helper = match ensure_engine(engine) {
+                    let helper = match ensure_engine(engine, app, &reporter) {
                         Ok(helper) => helper,
                         Err(ensure_err) => {
                             outputs.push(OcrPageOutput {
@@ -873,18 +1407,49 @@ pub fn ocr_pages_sync(pages: Vec<OcrPageInput>) -> Result<Vec<OcrPageOutput>, St
     Ok(outputs)
 }
 
+#[cfg(test)]
+fn ocr_pages_sync(pages: Vec<OcrPageInput>) -> Result<Vec<OcrPageOutput>, String> {
+    ocr_pages_sync_with_app(pages, None)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrCapabilities {
+    vision: bool,
+    manga: bool,
+}
+
 #[tauri::command]
-pub async fn ocr_pages(pages: Vec<OcrPageInput>) -> Result<Vec<OcrPageOutput>, String> {
-    tauri::async_runtime::spawn_blocking(move || ocr_pages_sync(pages))
+pub fn ocr_capabilities() -> OcrCapabilities {
+    OcrCapabilities {
+        vision: cfg!(target_os = "macos"),
+        manga: true,
+    }
+}
+
+#[tauri::command]
+pub async fn ocr_pages(
+    app: tauri::AppHandle,
+    pages: Vec<OcrPageInput>,
+) -> Result<Vec<OcrPageOutput>, String> {
+    tauri::async_runtime::spawn_blocking(move || ocr_pages_sync_with_app(pages, Some(&app)))
         .await
         .map_err(|err| format!("OCR 任务执行失败：{err}"))?
 }
 
 #[tauri::command]
-pub async fn ocr_engine_status(engine: Option<String>) -> Result<String, String> {
+pub async fn ocr_engine_status(
+    app: tauri::AppHandle,
+    engine: Option<String>,
+    request_id: Option<String>,
+) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let reporter = ModelProgressReporter {
+            app: Some(app.clone()),
+            request_id,
+        };
         let engine = OcrEngine::from_str(engine.as_deref());
-        let helper = ensure_engine(engine)?;
+        let helper = ensure_engine(engine, Some(&app), &reporter)?;
         ensure_pool(engine, &helper)?;
         Ok::<_, String>("ready".to_string())
     })
@@ -919,6 +1484,48 @@ mod tests {
         std::fs::write(&path, b"abcd").unwrap();
         assert!(!model_file_is_valid(&path, &model));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn partial_model_progress_is_preserved_but_oversized_files_are_removed() {
+        let dir = test_manga_cache_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("fixture.part");
+        let model = ModelFile {
+            name: "fixture",
+            url: "https://example.invalid/fixture",
+            bytes: 3,
+            sha256: "unused",
+        };
+        std::fs::write(&part, b"ab").unwrap();
+        assert_eq!(partial_model_length(&part, &model).unwrap(), 2);
+        assert!(part.exists());
+
+        std::fs::write(&part, b"abcd").unwrap();
+        assert_eq!(partial_model_length(&part, &model).unwrap(), 0);
+        assert!(!part.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn model_download_urls_stay_on_pinned_https_hosts() {
+        for allowed in [
+            "https://huggingface.co/model/file",
+            "https://cdn-lfs.hf.co/model/file",
+            "https://cas-bridge.xethub.hf.co/model/file",
+        ] {
+            assert!(is_allowed_model_url(&reqwest::Url::parse(allowed).unwrap()));
+        }
+        for rejected in [
+            "http://huggingface.co/model/file",
+            "https://huggingface.co.evil.example/model/file",
+            "https://user@huggingface.co/model/file",
+            "https://huggingface.co:444/model/file",
+        ] {
+            assert!(!is_allowed_model_url(
+                &reqwest::Url::parse(rejected).unwrap()
+            ));
+        }
     }
 
     #[test]

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "resources": {
+      "binaries/windows/manga_ocr_helper.exe": "ocr/manga_ocr_helper.exe",
+      "binaries/windows/onnxruntime.dll": "ocr/onnxruntime.dll",
+      "binaries/windows/onnxruntime_providers_shared.dll": "ocr/onnxruntime_providers_shared.dll",
+      "binaries/windows/MSVCP140.dll": "ocr/MSVCP140.dll",
+      "binaries/windows/MSVCP140_1.dll": "ocr/MSVCP140_1.dll",
+      "binaries/windows/VCRUNTIME140.dll": "ocr/VCRUNTIME140.dll",
+      "binaries/windows/VCRUNTIME140_1.dll": "ocr/VCRUNTIME140_1.dll",
+      "binaries/windows/onnxruntime-LICENSE.txt": "ocr/licenses/onnxruntime-LICENSE.txt",
+      "binaries/windows/onnxruntime-ThirdPartyNotices.txt": "ocr/licenses/onnxruntime-ThirdPartyNotices.txt"
+    }
+  }
+}

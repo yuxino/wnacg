@@ -12,6 +12,7 @@ dist
 dist-ssr
 *.local
 src-tauri/ocr/manga_helper/target
+src-tauri/binaries/windows
 
 # Editor directories and files
 .vscode/*

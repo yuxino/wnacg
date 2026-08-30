@@ -32,6 +32,24 @@ type ImageDownloadProgress = {
   percent: number | null;
 };
 
+type OcrModelProgress = {
+  requestId: string;
+  phase: "checking" | "migrating" | "downloading" | "verifying" | "ready";
+  fileName: string | null;
+  fileIndex: number;
+  fileCount: number;
+  fileLoaded: number;
+  fileTotal: number;
+  loaded: number;
+  total: number;
+  percent: number;
+};
+
+type OcrCapabilities = {
+  vision: boolean;
+  manga: boolean;
+};
+
 type AppUpdateInfo = {
   currentVersion: string;
   latestVersion: string | null;
@@ -888,10 +906,12 @@ function buildReaderSettingsPanel() {
     {
       title: "OCR 语言",
       render: () => renderSegmented<ReaderOcrLang>(
-        [
-          { label: "中文优先", value: "zh" },
-          { label: "日文优先", value: "ja" },
-        ],
+        ocrCapabilities.vision
+          ? [
+              { label: "中文优先", value: "zh" },
+              { label: "日文优先", value: "ja" },
+            ]
+          : [{ label: "日文优先", value: "ja" }],
         state.ocrLang,
         (v) => updateReaderPrefs({ ocrLang: v }),
       ),
@@ -1049,12 +1069,20 @@ document.body.append(toastContainer);
 
 type ToastTone = "info" | "success" | "error";
 
-function showToast(message: string, tone: ToastTone = "info", durationMs = 2400) {
+type ToastController = (() => void) & {
+  update: (message: string) => void;
+  setProgress: (percent: number | null) => void;
+};
+
+function showToast(message: string, tone: ToastTone = "info", durationMs = 2400): ToastController {
   const toast = document.createElement("div");
   toast.className = `toast toast-${tone}`;
+  const content = document.createElement("div");
+  content.className = "toast-content";
   const text = document.createElement("span");
   text.textContent = message;
-  toast.append(text);
+  content.append(text);
+  toast.append(content);
   const close = document.createElement("button");
   close.type = "button";
   close.className = "toast-close";
@@ -1064,13 +1092,32 @@ function showToast(message: string, tone: ToastTone = "info", durationMs = 2400)
   toast.append(close);
   toastContainer.append(toast);
   let dismissed = false;
-  const dismiss = () => {
+  let progress: HTMLDivElement | null = null;
+  let progressFill: HTMLSpanElement | null = null;
+  const dismiss = (() => {
     if (dismissed) return;
     dismissed = true;
     toast.classList.add("toast-leaving");
     window.setTimeout(() => toast.remove(), 220);
+  }) as ToastController;
+  dismiss.update = (nextMessage: string) => {
+    if (!dismissed) text.textContent = nextMessage;
   };
-  window.setTimeout(dismiss, durationMs);
+  dismiss.setProgress = (percent: number | null) => {
+    if (dismissed) return;
+    if (!progress || !progressFill) {
+      progress = document.createElement("div");
+      progress.className = "toast-progress";
+      progressFill = document.createElement("span");
+      progress.append(progressFill);
+      content.append(progress);
+    }
+    progressFill.classList.toggle("indeterminate", percent === null);
+    progressFill.style.width = percent === null
+      ? "42%"
+      : `${Math.max(0, Math.min(100, percent))}%`;
+  };
+  if (durationMs > 0) window.setTimeout(dismiss, durationMs);
   return dismiss;
 }
 
@@ -1404,7 +1451,35 @@ const ocrTextInFlight = new Set<number>();
 const ocrTextDone = new Set<number>();
 let ocrTextWorkers = 0;
 const OCR_TEXT_CONCURRENCY = 2;
-let ocrMangaInitTried = false;
+let ocrCapabilities: OcrCapabilities = {
+  vision: !/Windows/i.test(navigator.userAgent),
+  manga: true,
+};
+
+function enforceOcrCapabilities(capabilities: OcrCapabilities) {
+  ocrCapabilities = capabilities;
+  if (!capabilities.vision && state.ocrLang === "zh") {
+    state.ocrLang = "ja";
+    state.translateEnabled = false;
+    saveReaderPrefs();
+    applyReaderPrefs();
+    syncReaderControls();
+    broadcastReaderPrefs();
+  }
+  if (readerSettingsOpen) buildReaderSettingsPanel();
+}
+
+async function refreshOcrCapabilities() {
+  try {
+    const capabilities = await invokeTauri<OcrCapabilities>("ocr_capabilities");
+    if (typeof capabilities?.vision !== "boolean" || typeof capabilities?.manga !== "boolean") {
+      return;
+    }
+    enforceOcrCapabilities(capabilities);
+  } catch (error) {
+    console.error("ocr_capabilities failed:", error);
+  }
+}
 
 function ocrLanguages(): string[] {
   return state.ocrLang === "zh"
@@ -1412,9 +1487,79 @@ function ocrLanguages(): string[] {
     : ["ja-JP", "zh-Hans", "zh-Hant", "en-US"];
 }
 
+function normalizeOcrLanguage(value: unknown): "zh" | "ja" | null {
+  if (value === "ja") return "ja";
+  if (value === "zh") return ocrCapabilities.vision ? "zh" : "ja";
+  return null;
+}
+
 function ocrEngine(): string {
   // 日文优先:漫画专用本地引擎(竖排日文);中文优先:Apple Vision(横排中文)
-  return state.ocrLang === "ja" ? "manga" : "vision";
+  return state.ocrLang === "ja" || !ocrCapabilities.vision ? "manga" : "vision";
+}
+
+function ocrModelProgressMessage(progress: OcrModelProgress) {
+  const file = progress.fileIndex > 0 && progress.fileCount > 0
+    ? `（${progress.fileIndex}/${progress.fileCount}）`
+    : "";
+  switch (progress.phase) {
+    case "migrating":
+      return "正在迁移已有 OCR 模型…";
+    case "downloading":
+      return `正在下载 OCR 模型 ${progress.percent}%${file} · ${formatBytes(progress.loaded)} / ${formatBytes(progress.total)}`;
+    case "verifying":
+      return `正在校验 OCR 模型${file}…`;
+    case "ready":
+      return "OCR 模型已就绪，正在启动引擎…";
+    default:
+      return `正在检查本地 OCR 模型${file}…`;
+  }
+}
+
+const ocrEngineInitializations = new Map<string, Promise<void>>();
+
+async function runOcrEngineInitialization(engine: string) {
+  const toast = showToast(
+    engine === "manga" ? "正在检查本地 OCR 模型…" : "正在初始化本地 OCR 引擎…",
+    "info",
+    0,
+  );
+  toast.setProgress(null);
+  const requestId = typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `ocr-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  let unlistenProgress: (() => void) | null = null;
+  try {
+    unlistenProgress = await listen<OcrModelProgress>("ocr-model-progress", (event) => {
+      const progress = event.payload;
+      // Model installation is shared across app windows. Accept the active
+      // installer's events so a second reader window waiting on the lock also
+      // gains real progress instead of remaining indeterminate.
+      if (engine !== "manga") return;
+      toast.update(ocrModelProgressMessage(progress));
+      toast.setProgress(progress.phase === "downloading" || progress.phase === "ready"
+        ? progress.percent
+        : null);
+    });
+    await invokeTauri<string>("ocr_engine_status", { engine, requestId });
+  } finally {
+    unlistenProgress?.();
+    toast();
+  }
+}
+
+function ensureOcrEngineInitialized(engine = ocrEngine()) {
+  const existing = ocrEngineInitializations.get(engine);
+  if (existing) return existing;
+  let initialization: Promise<void>;
+  initialization = runOcrEngineInitialization(engine).catch((error) => {
+    if (ocrEngineInitializations.get(engine) === initialization) {
+      ocrEngineInitializations.delete(engine);
+    }
+    throw error;
+  });
+  ocrEngineInitializations.set(engine, initialization);
+  return initialization;
 }
 
 function isVisiblePage(index: number): boolean {
@@ -1469,27 +1614,16 @@ async function toggleReaderOcr(force?: boolean) {
     return;
   }
 
-  const firstTime = ocrEngine() === "manga" && !ocrMangaInitTried;
-  if (ocrEngine() === "manga") ocrMangaInitTried = true;
-  const toast = showToast(
-    firstTime
-      ? "正在准备本地漫画 OCR（首次需下载约 230MB 模型，请稍候）…"
-      : "正在初始化本地 OCR 引擎…",
-    "info",
-    240_000,
-  );
+  const engine = ocrEngine();
   try {
-    await invokeTauri<string>("ocr_engine_status", { engine: ocrEngine() });
+    await ensureOcrEngineInitialized(engine);
     if (token !== ocrEnableToken) {
       // 等待引擎期间开关又被切换(比如 R 关了联动把 O 关掉),放弃本次开启
-      toast();
       return;
     }
-    toast();
     updateReaderPrefs({ ocrBoxes: true });
     showToast("本地 OCR 已开启", "success", 2600);
   } catch (error) {
-    toast();
     const message = error instanceof Error ? error.message : String(error);
     showToast(`本地 OCR 不可用：${message}`, "error", 4800);
   }
@@ -1547,14 +1681,17 @@ async function pumpOcrQueue() {
   const token = state.readerToken;
   const aid = state.currentAlbum?.aid;
   const epoch = readerPipelineEpoch;
+  const engine = ocrEngine();
   try {
+    await ensureOcrEngineInitialized(engine);
+    if (token !== state.readerToken || aid !== state.currentAlbum?.aid || epoch !== readerPipelineEpoch || state.view !== "reader") return;
     const results = await invokeTauri<OcrPageResult[]>("ocr_pages", {
       pages: items.map((item) => ({
         index: item.index,
         imageUrl: item.imageUrl,
         dataUrl: item.imageUrl && ocrByteCacheUrls.has(item.imageUrl) ? null : item.dataUrl,
         languages: ocrLanguages(),
-        engine: ocrEngine(),
+        engine,
         withText: false,
       })),
     });
@@ -1648,7 +1785,7 @@ function pumpOcrTextQueue() {
     const token = state.readerToken;
     const aid = state.currentAlbum?.aid;
     const epoch = readerPipelineEpoch;
-    void invokeTauri<OcrPageResult[]>("ocr_pages", {
+    void ensureOcrEngineInitialized("manga").then(() => invokeTauri<OcrPageResult[]>("ocr_pages", {
       pages: [{
         index,
         imageUrl: sources.imageUrl,
@@ -1659,7 +1796,7 @@ function pumpOcrTextQueue() {
         engine: "manga",
         withText: true,
       }],
-    }).then((results) => {
+    })).then((results) => {
       if (token !== state.readerToken || aid !== state.currentAlbum?.aid || epoch !== readerPipelineEpoch || state.view !== "reader") return;
       const result = results[0];
       if (!result) throw new Error("OCR 返回为空");
@@ -4276,6 +4413,8 @@ function getInitialAlbumFromHash(): string | null {
 
 renderCategories();
 syncFullscreenState();
+enforceOcrCapabilities(ocrCapabilities);
+void refreshOcrCapabilities();
 
 loadTitleTranslateState();
 syncTitleTranslateToggle();
@@ -4334,8 +4473,9 @@ listen<Partial<ReaderPrefs>>("reader-prefs-changed", (event) => {
     readerFitChanged = true;
     dirty = true;
   }
-  if ((payload.ocrLang === "zh" || payload.ocrLang === "ja") && payload.ocrLang !== state.ocrLang) {
-    state.ocrLang = payload.ocrLang;
+  const incomingOcrLang = normalizeOcrLanguage(payload.ocrLang);
+  if (incomingOcrLang !== null && incomingOcrLang !== state.ocrLang) {
+    state.ocrLang = incomingOcrLang;
     ocrLangChanged = true;
     dirty = true;
   }

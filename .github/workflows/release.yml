@@ -238,6 +238,131 @@ jobs:
             throw ('Expected an x64 app executable (PE machine 0x8664), found 0x{0:X4}' -f $machine)
           }
 
+          $ocrResourceDir = 'src-tauri/target/release/ocr'
+          $ocrFiles = @(
+            'manga_ocr_helper.exe',
+            'onnxruntime.dll',
+            'onnxruntime_providers_shared.dll',
+            'MSVCP140.dll',
+            'MSVCP140_1.dll',
+            'VCRUNTIME140.dll',
+            'VCRUNTIME140_1.dll'
+          )
+          foreach ($name in $ocrFiles) {
+            $file = Get-Item (Join-Path $ocrResourceDir $name) -ErrorAction Stop
+            if ($file.Length -le 0) {
+              throw "Packaged OCR resource is empty: $name"
+            }
+          }
+          foreach ($name in @('onnxruntime-LICENSE.txt', 'onnxruntime-ThirdPartyNotices.txt')) {
+            $file = Get-Item (Join-Path "$ocrResourceDir/licenses" $name) -ErrorAction Stop
+            if ($file.Length -le 0) {
+              throw "Packaged OCR notice is empty: $name"
+            }
+          }
+
+          $helper = Get-Item (Join-Path $ocrResourceDir 'manga_ocr_helper.exe')
+          $helperBytes = [System.IO.File]::ReadAllBytes($helper.FullName)
+          if ($helperBytes.Length -lt 0x46 -or [BitConverter]::ToUInt16($helperBytes, 0) -ne 0x5A4D) {
+            throw "$($helper.Name) is not a PE executable"
+          }
+          $helperPeOffset = [BitConverter]::ToInt32($helperBytes, 0x3C)
+          if ($helperPeOffset -lt 0x40 -or $helperPeOffset -gt ($helperBytes.Length - 6)) {
+            throw "$($helper.Name) has an invalid PE header offset"
+          }
+          if ([BitConverter]::ToUInt32($helperBytes, $helperPeOffset) -ne 0x00004550) {
+            throw "$($helper.Name) has an invalid PE signature"
+          }
+          $helperMachine = [BitConverter]::ToUInt16($helperBytes, $helperPeOffset + 4)
+          if ($helperMachine -ne 0x8664) {
+            throw ('Expected an x64 OCR helper (PE machine 0x8664), found 0x{0:X4}' -f $helperMachine)
+          }
+
+          $stderrPath = Join-Path $env:RUNNER_TEMP 'wnacg-ocr-helper-startup.stderr'
+          $previousModelsDir = $env:WNACG_OCR_MODELS_DIR
+          try {
+            $env:WNACG_OCR_MODELS_DIR = Join-Path $env:RUNNER_TEMP 'wnacg-missing-ocr-models'
+            $helperProcess = Start-Process -FilePath $helper.FullName -NoNewWindow -Wait -PassThru -RedirectStandardError $stderrPath
+            if ($helperProcess.ExitCode -ne 1) {
+              throw "OCR helper dependency probe expected exit 1, found $($helperProcess.ExitCode)"
+            }
+            $helperError = Get-Content $stderrPath -Raw -Encoding UTF8
+            if ($helperError -notmatch '无法加载模型') {
+              throw "OCR helper did not reach model loading: $helperError"
+            }
+          } finally {
+            if ($null -eq $previousModelsDir) {
+              Remove-Item Env:WNACG_OCR_MODELS_DIR -ErrorAction SilentlyContinue
+            } else {
+              $env:WNACG_OCR_MODELS_DIR = $previousModelsDir
+            }
+            Remove-Item $stderrPath -Force -ErrorAction SilentlyContinue
+          }
+
+          $msiInstaller = $null
+          $database = $null
+          $view = $null
+          try {
+            $msiInstaller = New-Object -ComObject WindowsInstaller.Installer
+            $database = $msiInstaller.GetType().InvokeMember(
+              'OpenDatabase',
+              [System.Reflection.BindingFlags]::InvokeMethod,
+              $null,
+              $msiInstaller,
+              @([string] $msis[0].FullName, [int] 0)
+            )
+            $view = $database.GetType().InvokeMember(
+              'OpenView',
+              [System.Reflection.BindingFlags]::InvokeMethod,
+              $null,
+              $database,
+              @('SELECT `FileName` FROM `File`')
+            )
+            [void] $view.GetType().InvokeMember(
+              'Execute',
+              [System.Reflection.BindingFlags]::InvokeMethod,
+              $null,
+              $view,
+              $null
+            )
+            $msiFileNames = @()
+            while ($true) {
+              $record = $view.GetType().InvokeMember(
+                'Fetch',
+                [System.Reflection.BindingFlags]::InvokeMethod,
+                $null,
+                $view,
+                $null
+              )
+              if ($null -eq $record) { break }
+              try {
+                $fileName = $record.GetType().InvokeMember(
+                  'StringData',
+                  [System.Reflection.BindingFlags]::GetProperty,
+                  $null,
+                  $record,
+                  @([int] 1)
+                )
+                $msiFileNames += ($fileName -split '\|')[-1]
+              } finally {
+                if ([Runtime.InteropServices.Marshal]::IsComObject($record)) {
+                  [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record)
+                }
+              }
+            }
+            foreach ($name in @($ocrFiles + @('onnxruntime-LICENSE.txt', 'onnxruntime-ThirdPartyNotices.txt'))) {
+              if ($msiFileNames -notcontains $name) {
+                throw "MSI does not contain required OCR resource: $name"
+              }
+            }
+          } finally {
+            foreach ($comObject in @($view, $database, $msiInstaller)) {
+              if ($null -ne $comObject -and [Runtime.InteropServices.Marshal]::IsComObject($comObject)) {
+                [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($comObject)
+              }
+            }
+          }
+
       - name: Upload MSI
         uses: actions/upload-artifact@v7.0.1
         with:

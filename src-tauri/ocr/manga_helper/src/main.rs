@@ -79,6 +79,29 @@ fn models_dir() -> String {
     })
 }
 
+#[cfg(target_os = "windows")]
+fn initialize_ort() -> Result<(), String> {
+    let executable = env::current_exe().map_err(|error| format!("无法定位 OCR helper：{error}"))?;
+    let runtime = executable
+        .parent()
+        .ok_or_else(|| "OCR helper 路径无效".to_string())?
+        .join("onnxruntime.dll");
+    let metadata = std::fs::symlink_metadata(&runtime)
+        .map_err(|error| format!("ONNX Runtime 未随 OCR helper 提供：{error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() == 0 {
+        return Err("ONNX Runtime 安装不完整".to_string());
+    }
+    ort::init_from(&runtime)
+        .map_err(|error| format!("无法加载 ONNX Runtime：{error}"))?
+        .commit();
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn initialize_ort() -> Result<(), String> {
+    Ok(())
+}
+
 fn load_session(path: &Path, optimize: bool) -> Result<Session, String> {
     if optimize {
         Session::builder()
@@ -418,9 +441,17 @@ fn process(detector: &mut Detector, ocr: &Option<MangaOcr>, req: &Request) -> Re
         if i < text_count {
             if let Some(ocr) = ocr {
                 let crop = img.crop(x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32);
-                if let Ok(recognized) = ocr.recognize(&crop) {
-                    text = recognized.trim().to_string();
-                }
+                let recognized = match ocr.recognize(&crop) {
+                    Ok(recognized) => recognized,
+                    Err(error) => {
+                        return Response {
+                            id: req.id,
+                            regions: None,
+                            error: Some(format!("文字识别失败：{error}")),
+                        };
+                    }
+                };
+                text = recognized.trim().to_string();
             }
         }
         regions.push(Region {
@@ -440,6 +471,10 @@ fn process(detector: &mut Detector, ocr: &Option<MangaOcr>, req: &Request) -> Re
 }
 
 fn main() {
+    if let Err(error) = initialize_ort() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
     let models_dir = models_dir();
     let models = Path::new(&models_dir);
     let mut detector = match Detector::new(models) {
@@ -454,15 +489,30 @@ fn main() {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout);
+    if let Ok(ready) = serde_json::to_string(&serde_json::json!({ "ready": true })) {
+        let _ = writeln!(out, "{ready}");
+        let _ = out.flush();
+    }
     for line in BufReader::new(stdin.lock()).lines() {
         let Ok(line) = line else { break };
         let Ok(req) = serde_json::from_str::<Request>(&line) else {
             continue;
         };
-        if req.with_text && ocr.is_none() {
-            ocr = MangaOcr::new(models).ok();
-        }
-        let response = process(&mut detector, &ocr, &req);
+        let response = if req.with_text && ocr.is_none() {
+            match MangaOcr::new(models) {
+                Ok(recognizer) => {
+                    ocr = Some(recognizer);
+                    process(&mut detector, &ocr, &req)
+                }
+                Err(error) => Response {
+                    id: req.id,
+                    regions: None,
+                    error: Some(format!("文字识别模型加载失败：{error}")),
+                },
+            }
+        } else {
+            process(&mut detector, &ocr, &req)
+        };
         if let Ok(json) = serde_json::to_string(&response) {
             let _ = writeln!(out, "{json}");
             let _ = out.flush();

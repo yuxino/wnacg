@@ -1581,6 +1581,7 @@ pub fn run() {
             close_current_window,
             search_tag_in_main,
             browse_link_in_main,
+            ocr::ocr_capabilities,
             ocr::ocr_pages,
             ocr::ocr_engine_status,
             translate::translate_dialogue,
