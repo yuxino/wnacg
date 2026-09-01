@@ -211,6 +211,21 @@ jobs:
           pattern: '*'
           merge-multiple: true
 
+      - name: Generate and verify SHA-256 manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(
+            find . -maxdepth 1 -type f \( -name '*.msi' -o -name '*.exe' -o -name '*.dmg' \) \
+              -print | sed 's#^./##' | LC_ALL=C sort
+          )
+          [[ ${#assets[@]} -eq 3 ]] || {
+            echo "expected exactly three release assets, found ${#assets[@]}" >&2
+            exit 1
+          }
+          sha256sum "${assets[@]}" > SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+
       - name: Create Release
         uses: softprops/action-gh-release@v3.0.2
         with:
@@ -218,4 +233,5 @@ jobs:
             *.msi
             *.exe
             *.dmg
+            SHA256SUMS.txt
           fail_on_unmatched_files: true

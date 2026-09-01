@@ -1,6 +1,6 @@
 [package]
 name = "wnacg"
-version = "0.1.9"
+version = "0.1.10"
 description = "wnacg desktop app"
 edition = "2021"
 
@@ -36,4 +36,6 @@ security-framework = "3.7"
 windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 
 [profile.release]
+codegen-units = 1
+lto = true
 strip = true

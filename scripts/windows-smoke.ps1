@@ -148,7 +148,7 @@ function Assert-MsiPayload {
       [System.Reflection.BindingFlags]::InvokeMethod,
       $null,
       $database,
-      @('SELECT `FileName` FROM `File`')
+      @('SELECT `FileName`, `FileSize` FROM `File`')
     )
     [void] $view.GetType().InvokeMember(
       'Execute',
@@ -158,6 +158,7 @@ function Assert-MsiPayload {
       $null
     )
     $msiFileNames = @()
+    [int64] $msiLogicalBytes = 0
     while ($true) {
       $record = $view.GetType().InvokeMember(
         'Fetch',
@@ -178,6 +179,14 @@ function Assert-MsiPayload {
           @([int] 1)
         )
         $msiFileNames += ($fileName -split '\|')[-1]
+        $fileSize = $record.GetType().InvokeMember(
+          'IntegerData',
+          [System.Reflection.BindingFlags]::GetProperty,
+          $null,
+          $record,
+          @([int] 2)
+        )
+        $msiLogicalBytes += [int64] $fileSize
       } finally {
         if ([Runtime.InteropServices.Marshal]::IsComObject($record)) {
           [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record)
@@ -201,6 +210,7 @@ function Assert-MsiPayload {
         throw "MSI does not contain required OCR resource: $name"
       }
     }
+    Write-Host "Windows MSI logical payload: $msiLogicalBytes bytes across $($msiFileNames.Count) files"
   } finally {
     foreach ($comObject in @($view, $database, $summary, $installer)) {
       if ($null -ne $comObject -and [Runtime.InteropServices.Marshal]::IsComObject($comObject)) {
@@ -345,6 +355,9 @@ function Invoke-NsisInstallSmoke {
     Get-Item -LiteralPath $desktopShortcut -ErrorAction Stop | Out-Null
     Assert-X64Pe -Path $app
     Assert-OcrPayload -Directory $ocr
+    $installedFiles = @(Get-ChildItem -LiteralPath $installRoot -File -Recurse)
+    $installedBytes = [int64] (($installedFiles | Measure-Object -Property Length -Sum).Sum)
+    Write-Host "Windows NSIS installed footprint: $installedBytes bytes across $($installedFiles.Count) files"
     Test-OcrHelperStartup -HelperPath (Join-Path $ocr 'manga_ocr_helper.exe') -WorkRoot $env:RUNNER_TEMP
     [System.IO.File]::WriteAllText(
       $legacyTranslationCache,
