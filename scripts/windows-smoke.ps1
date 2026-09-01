@@ -248,14 +248,16 @@ function Test-AppStartup {
   $process = $null
   $secondProcess = $null
   try {
-    $process = Start-Process -FilePath $AppPath -WorkingDirectory (Split-Path -Parent $AppPath) -PassThru
+    # Keep the working directory outside the app folder so WebView2 children
+    # cannot hold that folder open after the primary process exits.
+    $process = Start-Process -FilePath $AppPath -PassThru
     Start-Sleep -Seconds 8
     $process.Refresh()
     if ($process.HasExited) {
       throw "WNACG exited during the startup probe with code $($process.ExitCode): $AppPath"
     }
 
-    $secondProcess = Start-Process -FilePath $AppPath -WorkingDirectory (Split-Path -Parent $AppPath) -PassThru
+    $secondProcess = Start-Process -FilePath $AppPath -PassThru
     if (-not $secondProcess.WaitForExit(10000)) {
       throw "A second WNACG instance remained running: $AppPath"
     }
