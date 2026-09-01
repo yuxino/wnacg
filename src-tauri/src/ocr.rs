@@ -14,6 +14,8 @@ use tauri::Emitter as _;
 #[cfg(target_os = "windows")]
 use tauri::Manager as _;
 
+use super::hide_console;
+
 #[cfg(target_os = "macos")]
 const VISION_HELPER_SOURCE: &str = include_str!("../ocr/ocr_helper.swift");
 #[cfg(target_os = "macos")]
@@ -31,17 +33,6 @@ const IMAGE_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
 const MODEL_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(90);
 #[cfg(target_os = "windows")]
 const BUNDLED_MANGA_HELPER: &str = "ocr/manga_ocr_helper.exe";
-
-/// Windows 上以无控制台窗口方式启动子进程，避免 OCR 工作进程/Cargo 弹出黑框。
-#[cfg(target_os = "windows")]
-fn hide_console(command: &mut Command) {
-    use std::os::windows::process::CommandExt as _;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(target_os = "windows"))]
-fn hide_console(_command: &mut Command) {}
 
 struct ModelFile {
     name: &'static str,

@@ -2834,11 +2834,6 @@ async function fetchAlbums(page: number, contextKey = listContextKey()) {
   const [mode, query, categoryPath, linkPath] = contextKey.split("\n") as [typeof state.mode, string, string, string];
   if (isLinkedMode(mode)) {
     if (linkPath) return invokeTauri<Album[]>("fetch_albums", { path: linkedPagePath(linkPath, page) });
-    if (mode === "tag") {
-      if (page === 1) return invokeTauri<Album[]>("search_tag", { tag: query });
-      const tagPath = `/albums-index-tag-${encodeURIComponent(query)}.html`;
-      return invokeTauri<Album[]>("fetch_albums", { path: linkedPagePath(tagPath, page) });
-    }
     throw new Error("缺少对应的列表链接");
   }
   if (mode === "search") return invokeTauri<Album[]>("search_albums", { query, page });
@@ -3400,16 +3395,6 @@ function applyLinkedBrowse(request: BrowseLinkRequest) {
   } else {
     loadAlbums();
   }
-}
-
-function applyTagSearch(tag: string) {
-  const name = tag.trim();
-  if (!name) return;
-  applyLinkedBrowse({
-    kind: "tag",
-    name,
-    path: `/albums-index-tag-${encodeURIComponent(name)}.html`,
-  });
 }
 
 const APP_TITLE = "wnacg · 桌面阅读器";
@@ -4643,11 +4628,4 @@ if (initialAid) {
       path: request.path.trim(),
     });
   }).catch((err) => console.error("listen(browse-link) failed:", err));
-
-  // 兼容旧版子窗口发出的标签事件。
-  listen<string>("search-tag", (event) => {
-    const tag = typeof event.payload === "string" ? event.payload : String(event.payload ?? "");
-    if (!tag.trim()) return;
-    applyTagSearch(tag.trim());
-  }).catch((err) => console.error("listen(search-tag) failed:", err));
 }

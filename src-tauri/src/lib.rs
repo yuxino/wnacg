@@ -28,7 +28,7 @@ const PAGE_FETCH_MAX_COOLDOWN: Duration = Duration::from_secs(120);
 const RATE_LIMIT_ERROR_PREFIX: &str = "站点请求过于频繁（HTTP 429）";
 const CURL_RATE_LIMIT_MARKER: &str = "__WNACG_HTTP_429__";
 
-/// Windows 上以无控制台窗口方式启动子进程（curl 备用抓取通道）。
+/// Windows 上以无控制台窗口方式启动应用管理的子进程。
 #[cfg(target_os = "windows")]
 fn hide_console(command: &mut Command) {
     use std::os::windows::process::CommandExt as _;
@@ -1401,14 +1401,6 @@ async fn fetch_album_photos(aid: String, _app: tauri::AppHandle) -> Result<Album
     Err(errors.join("\n"))
 }
 
-/// Search albums by tag (clicking a tag in reader view)
-#[tauri::command]
-async fn search_tag(tag: String, app: tauri::AppHandle) -> Result<Vec<Album>, String> {
-    let encoded = urlencoding::encode(&tag);
-    let path = format!("/albums-index-tag-{encoded}.html");
-    fetch_albums(path, app).await
-}
-
 #[tauri::command]
 async fn fetch_photo_image(
     page_url: String,
@@ -1626,22 +1618,6 @@ fn close_current_window(window: tauri::Window) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn search_tag_in_main(app: tauri::AppHandle, tag: String) -> Result<(), String> {
-    let trimmed = tag.trim();
-    if trimmed.is_empty() {
-        return Err("缺少标签".to_string());
-    }
-    let main = app
-        .get_webview_window("main")
-        .ok_or_else(|| "找不到主窗口".to_string())?;
-    main.show().ok();
-    main.unminimize().ok();
-    main.set_focus().ok();
-    main.emit("search-tag", trimmed.to_string())
-        .map_err(|err| format!("通知主窗口失败：{err}"))
-}
-
-#[tauri::command]
 fn browse_link_in_main(
     app: tauri::AppHandle,
     kind: String,
@@ -1688,7 +1664,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             fetch_albums,
             search_albums,
-            search_tag,
             fetch_album_photos,
             fetch_photo_image,
             fetch_image_data_url,
@@ -1699,7 +1674,6 @@ pub fn run() {
             open_album_window,
             set_window_title,
             close_current_window,
-            search_tag_in_main,
             browse_link_in_main,
             ocr::ocr_capabilities,
             ocr::ocr_pages,
