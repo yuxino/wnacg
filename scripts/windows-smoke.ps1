@@ -370,11 +370,14 @@ function Invoke-NsisInstallSmoke {
             throw "NSIS uninstaller failed with exit code $($uninstall.ExitCode)"
           }
         }
-        for ($attempt = 0; $attempt -lt 30 -and (
+        # The x64 NSIS uninstaller can finish its final self-cleanup noticeably
+        # later under Windows 11 ARM64 emulation than on a native x64 runner.
+        $uninstallDeadline = [DateTime]::UtcNow.AddSeconds(60)
+        while ([DateTime]::UtcNow -lt $uninstallDeadline -and (
           (Test-Path -LiteralPath $installRoot) -or
           (Test-Path -LiteralPath $uninstallKey) -or
           ($null -ne (Get-Process -Name 'wnacg', 'manga_ocr_helper' -ErrorAction SilentlyContinue))
-        ); $attempt++) {
+        )) {
           Start-Sleep -Milliseconds 500
         }
         if ($null -ne (Get-Process -Name 'wnacg', 'manga_ocr_helper' -ErrorAction SilentlyContinue)) {
