@@ -254,19 +254,37 @@ jobs:
         with:
           pattern: '*'
           merge-multiple: true
+          path: artifacts
 
-      - name: Generate and verify signed updater manifest
+      - name: Stage and verify signed updater artifacts
         shell: bash
         run: |
           set -euo pipefail
+          mkdir release-assets
+
+          mapfile -t release_files < <(
+            find artifacts -type f \( \
+              -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.sig' \
+            \) -print | LC_ALL=C sort
+          )
+          [[ ${#release_files[@]} -eq 7 ]] || {
+            echo "expected exactly seven built release assets, found ${#release_files[@]}" >&2
+            exit 1
+          }
+          for source in "${release_files[@]}"; do
+            destination="release-assets/$(basename "$source")"
+            [[ ! -e "$destination" ]] || { echo "duplicate release filename: $destination" >&2; exit 1; }
+            cp "$source" "$destination"
+          done
+
           shopt -s nullglob
 
           version="$(node -p 'require("./package.json").version')"
           notes_file="docs/release-notes/v${version}.md"
-          mac_bundles=(*.app.tar.gz)
-          mac_signatures=(*.app.tar.gz.sig)
-          windows_bundles=(*_x64-setup.exe)
-          windows_signatures=(*_x64-setup.exe.sig)
+          mac_bundles=(release-assets/*.app.tar.gz)
+          mac_signatures=(release-assets/*.app.tar.gz.sig)
+          windows_bundles=(release-assets/*_x64-setup.exe)
+          windows_signatures=(release-assets/*_x64-setup.exe.sig)
           [[ -f "$notes_file" ]] || { echo "missing release notes: $notes_file" >&2; exit 1; }
           [[ ${#mac_bundles[@]} -eq 1 ]] || { echo "expected one macOS updater bundle" >&2; exit 1; }
           [[ ${#mac_signatures[@]} -eq 1 ]] || { echo "expected one macOS updater signature" >&2; exit 1; }
@@ -281,8 +299,8 @@ jobs:
           export UPDATER_MAC_SIGNATURE="${mac_signatures[0]}"
           export UPDATER_WINDOWS_BUNDLE="${windows_bundles[0]}"
           export UPDATER_WINDOWS_SIGNATURE="${windows_signatures[0]}"
-          export UPDATER_OUTPUT="latest.json"
-          export UPDATER_ASSET_REPORT="updater-assets.json"
+          export UPDATER_OUTPUT="release-assets/latest.json"
+          export UPDATER_ASSET_REPORT="release-assets/updater-assets.json"
           node scripts/updater-manifest.mjs
           UPDATER_MODE=verify node scripts/updater-manifest.mjs
 
@@ -291,18 +309,18 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t assets < <(
-            find . -maxdepth 1 -type f \( \
+            find release-assets -maxdepth 1 -type f \( \
               -name '*.msi' -o -name '*.exe' -o -name '*.dmg' -o -name '*.app.tar.gz' \
               -o -name '*.sig' -o -name 'latest.json' -o -name 'updater-assets.json' \
             \) \
-              -print | sed 's#^./##' | LC_ALL=C sort
+              -print | sed 's#^release-assets/##' | LC_ALL=C sort
           )
           [[ ${#assets[@]} -eq 9 ]] || {
             echo "expected exactly nine release assets, found ${#assets[@]}" >&2
             exit 1
           }
-          sha256sum "${assets[@]}" > SHA256SUMS.txt
-          sha256sum --check SHA256SUMS.txt
+          (cd release-assets && sha256sum "${assets[@]}" > SHA256SUMS.txt)
+          (cd release-assets && sha256sum --check SHA256SUMS.txt)
 
       - name: Create private source Release
         env:
@@ -316,7 +334,9 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --notes-file "docs/release-notes/v${version}.md" \
             --verify-tag \
-            ./*.msi ./*.exe ./*.dmg ./*.app.tar.gz ./*.sig latest.json updater-assets.json SHA256SUMS.txt
+            release-assets/*.msi release-assets/*.exe release-assets/*.dmg \
+            release-assets/*.app.tar.gz release-assets/*.sig \
+            release-assets/latest.json release-assets/updater-assets.json release-assets/SHA256SUMS.txt
 
       - name: Verify private Release metadata and exact assets
         env:
@@ -327,6 +347,6 @@ jobs:
           audit_dir="$(mktemp -d)"
           trap 'rm -rf "$audit_dir"' EXIT
           gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --dir "$audit_dir"
-          cp SHA256SUMS.txt "$audit_dir/SHA256SUMS.txt"
+          cp release-assets/SHA256SUMS.txt "$audit_dir/SHA256SUMS.txt"
           (cd "$audit_dir" && sha256sum --check SHA256SUMS.txt)
-          cmp latest.json "$audit_dir/latest.json"
+          cmp release-assets/latest.json "$audit_dir/latest.json"
