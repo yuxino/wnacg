@@ -17,6 +17,12 @@ Download from [Releases](https://github.com/yuxino/wnacg/releases):
 
 Intel Mac and Linux installers are not provided. Windows includes the x64 Japanese-OCR helper, but its first model download and real recognition, plus DeepSeek translation, have not completed end-to-end Windows acceptance.
 
+### In-app updates
+
+`v0.1.11` is the signed updater bootstrap. Older versions do not contain the updater, so this version still needs one manual installation from Releases. Installers and updater bundles carry an independent update signature. The app does not embed a GitHub token and does not download or install updates silently.
+
+Releases remain private as requested. Because a desktop app cannot safely embed repository credentials, its update check cannot read a private Release anonymously; sign in to GitHub and download later versions manually from Releases. The settings page offers the Releases link after a failed check.
+
 ## Features
 
 - Browse by category, search by keyword, and follow author, tag, and category links from album details
@@ -24,6 +30,7 @@ Intel Mac and Linux installers are not provided. Windows includes the x64 Japane
 - Local OCR through Apple Vision on macOS or `comic-text-detector` with `manga-ocr` for Japanese text
 - Optional DeepSeek translation for Japanese dialogue and titles, with in-image typesetting
 - Visible recognition, translation, and retryable error states, plus automatic throttling when the site rate-limits requests
+- Signed updater foundations, real download-progress states, and an explicit recovery path when private checks fail
 
 ## Run locally
 

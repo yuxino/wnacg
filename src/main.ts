@@ -1,7 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { createAppUpdaterController } from "./app-updater";
+import {
+  isAppUpdateBusy,
+  isAppUpdateSnapshot,
+  type AppUpdateSnapshot,
+} from "./app-updater-controller";
 
 type Album = {
   aid: string;
@@ -49,15 +54,6 @@ type OcrCapabilities = {
   vision: boolean;
   manga: boolean;
 };
-
-type AppUpdateInfo = {
-  currentVersion: string;
-  latestVersion: string | null;
-  available: boolean;
-  releaseUrl: string;
-};
-
-type AppUpdateState = "idle" | "checking" | "current" | "available" | "error";
 
 type ProgressState = {
   loaded: number;
@@ -511,35 +507,38 @@ readerSettings.append(readerSettingsButton, readerSettingsPanel);
 
 pagerControls.append(readerSettings);
 
-let currentAppVersion = "";
-let appUpdateInfo: AppUpdateInfo | null = null;
-let appUpdateState: AppUpdateState = "idle";
-let updateCheckInFlight: Promise<void> | null = null;
+const APP_RELEASES_URL = "https://github.com/yuxino/wnacg/releases";
+const appUpdater = createAppUpdaterController();
+let appUpdateSnapshot = appUpdater.getSnapshot();
+let applyingRemoteAppUpdate = false;
+let appUpdateEventsReady = false;
+
+const appUpdateErrorPhases = new Set([
+  "check-error",
+  "download-error",
+  "install-error",
+  "relaunch-error",
+]);
 
 function versionLabel(value: string) {
   const normalized = value.trim().replace(/^[vV]/, "");
   return normalized ? `v${normalized}` : "v—";
 }
 
-function applyAppUpdateInfo(info: AppUpdateInfo) {
-  appUpdateInfo = info;
-  currentAppVersion = info.currentVersion;
-  appUpdateState = info.available && info.latestVersion ? "available" : "current";
-  syncAppUpdateUi();
+function formatUpdateBytes(value: number) {
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+  return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
-function isAppUpdateInfo(value: unknown): value is AppUpdateInfo {
-  if (!value || typeof value !== "object") return false;
-  const info = value as Partial<AppUpdateInfo>;
-  return typeof info.currentVersion === "string"
-    && (typeof info.latestVersion === "string" || info.latestVersion === null)
-    && typeof info.available === "boolean"
-    && typeof info.releaseUrl === "string";
+function isAppUpdateError(snapshot: AppUpdateSnapshot) {
+  return appUpdateErrorPhases.has(snapshot.phase);
 }
 
 function syncAppUpdateUi() {
-  const latestVersion = appUpdateInfo?.latestVersion;
-  const hasUpdate = appUpdateState === "available" && Boolean(latestVersion);
+  const snapshot = appUpdateSnapshot;
+  const latestVersion = snapshot.latestVersion;
+  const hasUpdate = snapshot.phase === "available" && Boolean(latestVersion);
   readerSettingsButton.classList.toggle("update-available", hasUpdate);
   const settingsLabel = hasUpdate
     ? `阅读设置，有新版本 ${versionLabel(latestVersion!)}`
@@ -551,30 +550,75 @@ function syncAppUpdateUi() {
   if (!control) return;
   const version = control.querySelector<HTMLElement>(".app-version");
   const status = control.querySelector<HTMLElement>(".app-update-status");
-  const button = control.querySelector<HTMLButtonElement>(".app-update-button");
-  if (!version || !status || !button) return;
+  const button = control.querySelector<HTMLButtonElement>(".app-update-primary");
+  const postpone = control.querySelector<HTMLButtonElement>(".app-update-postpone");
+  const recovery = control.querySelector<HTMLButtonElement>(".app-update-recovery");
+  const progress = control.querySelector<HTMLProgressElement>(".app-update-progress");
+  const notes = control.querySelector<HTMLElement>(".app-update-notes");
+  if (!version || !status || !button || !postpone || !recovery || !progress || !notes) return;
 
-  const displayedVersion = appUpdateInfo?.currentVersion || currentAppVersion;
-  version.textContent = versionLabel(displayedVersion);
-  button.disabled = appUpdateState === "checking";
+  version.textContent = versionLabel(snapshot.currentVersion);
+  const busy = isAppUpdateBusy(snapshot.phase);
+  button.disabled = busy;
   button.classList.toggle("available", hasUpdate);
-  button.setAttribute("aria-busy", String(appUpdateState === "checking"));
+  button.setAttribute("aria-busy", String(busy));
+  postpone.hidden = snapshot.phase !== "available";
+  recovery.hidden = !isAppUpdateError(snapshot);
 
-  switch (appUpdateState) {
+  progress.hidden = snapshot.phase !== "downloading" && snapshot.phase !== "installing";
+  if (snapshot.percent === null) {
+    progress.removeAttribute("value");
+    progress.setAttribute("aria-valuetext", snapshot.downloadedBytes > 0
+      ? `已下载 ${formatUpdateBytes(snapshot.downloadedBytes)}，总大小未知`
+      : "正在等待下载大小");
+  } else {
+    progress.max = 100;
+    progress.value = snapshot.percent;
+    progress.setAttribute("aria-valuetext", `已下载 ${snapshot.percent}%`);
+  }
+
+  notes.hidden = !snapshot.latestVersion || !snapshot.notes;
+  notes.textContent = snapshot.notes ? `更新说明：${snapshot.notes}` : "";
+
+  switch (snapshot.phase) {
     case "checking":
-      status.textContent = "正在连接 GitHub";
+      status.textContent = "正在安全检查更新";
       button.textContent = "检查中…";
       break;
     case "current":
-      status.textContent = latestVersion ? "已是最新版" : "暂无可用更新";
+      status.textContent = "当前已是最新版";
       button.textContent = "重新检查";
       break;
     case "available":
-      status.textContent = "发现新版本";
-      button.textContent = `查看 ${versionLabel(latestVersion || "")}`;
+      status.textContent = `发现 ${versionLabel(latestVersion || "")}`;
+      button.textContent = "下载更新";
       break;
-    case "error":
-      status.textContent = "检查失败";
+    case "downloading":
+      status.textContent = snapshot.percent === null
+        ? `已下载 ${formatUpdateBytes(snapshot.downloadedBytes)} · 总大小未知`
+        : `正在下载 ${snapshot.percent}%`;
+      button.textContent = "下载中…";
+      break;
+    case "installing":
+      status.textContent = /Windows/i.test(navigator.userAgent)
+        ? "签名已校验，正在启动安装程序；应用将自动退出"
+        : "签名已校验，正在安装更新";
+      button.textContent = "正在安装…";
+      break;
+    case "restart-ready":
+      status.textContent = "更新已安装，等待重新启动";
+      button.textContent = "重启并完成更新";
+      break;
+    case "windows-installing":
+      status.textContent = "安装程序已启动；完成后请重新打开应用";
+      button.textContent = "安装程序处理中";
+      button.disabled = true;
+      break;
+    case "check-error":
+    case "download-error":
+    case "install-error":
+    case "relaunch-error":
+      status.textContent = snapshot.errorMessage || "更新失败，当前版本未被替换";
       button.textContent = "重新检查";
       break;
     default:
@@ -582,10 +626,28 @@ function syncAppUpdateUi() {
       button.textContent = "检查更新";
       break;
   }
-  button.title = hasUpdate
-    ? `在浏览器查看 ${versionLabel(latestVersion || "")}`
-    : button.textContent || "检查更新";
+  button.title = button.textContent || "检查更新";
   button.setAttribute("aria-label", button.title);
+}
+
+async function runPrimaryAppUpdateAction() {
+  const phase = appUpdateSnapshot.phase;
+  if (phase === "available") {
+    await appUpdater.downloadAndInstall();
+  } else if (phase === "restart-ready") {
+    await appUpdater.relaunchAfterUpdate();
+  } else if (!isAppUpdateBusy(phase) && phase !== "windows-installing") {
+    await appUpdater.checkForUpdate();
+  }
+
+  const snapshot = appUpdateSnapshot;
+  if (snapshot.phase === "current") {
+    showToast(`当前 ${versionLabel(snapshot.currentVersion)} 已是最新版`, "success", 2800);
+  } else if (snapshot.phase === "available") {
+    showToast(`发现新版本 ${versionLabel(snapshot.latestVersion || "")}`, "info", 3600);
+  } else if (isAppUpdateError(snapshot)) {
+    showToast(snapshot.errorMessage || "更新失败，当前版本未被替换", "error", 4800);
+  }
 }
 
 function renderAppUpdateControl() {
@@ -601,68 +663,52 @@ function renderAppUpdateControl() {
   status.setAttribute("aria-live", "polite");
   meta.append(version, status);
 
+  const progress = document.createElement("progress");
+  progress.className = "app-update-progress";
+  progress.setAttribute("aria-label", "更新下载进度");
+  progress.hidden = true;
+
+  const notes = document.createElement("p");
+  notes.className = "app-update-notes";
+  notes.hidden = true;
+
+  const actions = document.createElement("div");
+  actions.className = "app-update-actions";
+
   const button = document.createElement("button");
   button.type = "button";
-  button.className = "app-update-button";
-  button.addEventListener("click", () => {
-    if (appUpdateState === "available" && appUpdateInfo?.releaseUrl) {
-      openUrl(appUpdateInfo.releaseUrl).catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        showToast(`无法打开下载页面：${message}`, "error", 4200);
-      });
-      return;
-    }
-    void checkForAppUpdate(true);
+  button.className = "app-update-button app-update-primary";
+  button.addEventListener("click", () => void runPrimaryAppUpdateAction());
+
+  const postpone = document.createElement("button");
+  postpone.type = "button";
+  postpone.className = "app-update-button app-update-postpone";
+  postpone.textContent = "稍后";
+  postpone.addEventListener("click", () => void appUpdater.dismissAvailableUpdate());
+
+  const recovery = document.createElement("button");
+  recovery.type = "button";
+  recovery.className = "app-update-button app-update-recovery";
+  recovery.textContent = "打开发布页";
+  recovery.addEventListener("click", () => {
+    openUrl(APP_RELEASES_URL).catch(() => {
+      showToast("无法打开发布页", "error", 3200);
+    });
   });
 
-  control.append(meta, button);
+  actions.append(postpone, recovery, button);
+  control.append(meta, progress, notes, actions);
   window.requestAnimationFrame(syncAppUpdateUi);
   return control;
 }
 
-async function loadCurrentAppVersion() {
-  try {
-    currentAppVersion = await getVersion();
-    syncAppUpdateUi();
-  } catch {
-    // The version is also returned by the native update check. A failure here
-    // must not affect browsing when the page is opened outside Tauri.
-  }
-}
-
-function checkForAppUpdate(manual: boolean) {
-  if (updateCheckInFlight) return updateCheckInFlight;
-
-  appUpdateState = "checking";
+appUpdater.subscribe((snapshot) => {
+  appUpdateSnapshot = snapshot;
   syncAppUpdateUi();
-  updateCheckInFlight = (async () => {
-    try {
-      const info = await invokeTauri<AppUpdateInfo>("check_for_update");
-      applyAppUpdateInfo(info);
-      emit("app-update-checked", info).catch(() => {});
-
-      if (info.available && info.latestVersion) {
-        showToast(`发现新版本 ${versionLabel(info.latestVersion || "")}，可在设置中查看`, "info", 4200);
-      } else if (manual) {
-        const message = info.latestVersion
-          ? `当前 ${versionLabel(info.currentVersion)} 已是最新版`
-          : `当前 ${versionLabel(info.currentVersion)} 暂无可用更新`;
-        showToast(message, "success", 2800);
-      }
-    } catch (error) {
-      appUpdateState = "error";
-      syncAppUpdateUi();
-      if (manual) {
-        const message = error instanceof Error ? error.message : String(error);
-        showToast(`检查更新失败：${message}`, "error", 4800);
-      }
-    }
-  })().finally(() => {
-    updateCheckInFlight = null;
-  });
-
-  return updateCheckInFlight;
-}
+  if (appUpdateEventsReady && !applyingRemoteAppUpdate) {
+    emit("app-update-state", snapshot).catch(() => {});
+  }
+});
 
 type DeepseekKeySource = "keychain" | "keychain-with-legacy" | "environment" | "legacy-config" | "missing";
 let deepseekKeySource: DeepseekKeySource | null = null;
@@ -4601,22 +4647,25 @@ window.addEventListener("resize", () => {
 });
 
 const initialAid = getInitialAlbumFromHash();
-void loadCurrentAppVersion();
-listen<AppUpdateInfo>("app-update-checked", (event) => {
-  if (isAppUpdateInfo(event.payload)) applyAppUpdateInfo(event.payload);
+void appUpdater.loadCurrentVersion();
+listen<AppUpdateSnapshot>("app-update-state", (event) => {
+  if (!isAppUpdateSnapshot(event.payload)) return;
+  applyingRemoteAppUpdate = true;
+  appUpdater.applyRemoteSnapshot(event.payload);
+  applyingRemoteAppUpdate = false;
 }).then(() => {
-  if (initialAid) emit("request-app-update-info").catch(() => {});
-}).catch((err) => console.error("listen(app-update-checked) failed:", err));
+  appUpdateEventsReady = true;
+  if (initialAid) emit("request-app-update-state").catch(() => {});
+}).catch((err) => console.error("listen(app-update-state) failed:", err));
 if (initialAid) {
   // 新窗口模式:隐藏 sidebar、跳过列表加载,直接进 reader
   shell.classList.add("standalone-album");
   loadAlbumReader(initialAid, "");
 } else {
   loadAlbums();
-  window.setTimeout(() => void checkForAppUpdate(false), 1400);
-  listen("request-app-update-info", () => {
-    if (appUpdateInfo) emit("app-update-checked", appUpdateInfo).catch(() => {});
-  }).catch((err) => console.error("listen(request-app-update-info) failed:", err));
+  listen("request-app-update-state", () => {
+    emit("app-update-state", appUpdateSnapshot).catch(() => {});
+  }).catch((err) => console.error("listen(request-app-update-state) failed:", err));
   // 主窗口:监听子窗口发来的详情链接浏览请求
   listen<BrowseLinkRequest>("browse-link", (event) => {
     const request = event.payload;

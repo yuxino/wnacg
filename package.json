@@ -1,27 +1,31 @@
 {
   "name": "wnacg",
   "private": true,
-  "version": "0.1.10",
+  "version": "0.1.11",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "npm run icons:verify && tsc && vite build",
     "tauri:before-dev": "npm run ocr-helper:prepare && npm run dev",
     "tauri:before-build": "npm run build && npm run ocr-helper:prepare",
-    "check": "npm run build && cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo clippy --manifest-path src-tauri/Cargo.toml --locked -- -D warnings && cargo test --manifest-path src-tauri/Cargo.toml --locked && cargo check --manifest-path src-tauri/ocr/manga_helper/Cargo.toml --locked",
+    "check": "npm run build && npm run test:updater && cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo clippy --manifest-path src-tauri/Cargo.toml --locked -- -D warnings && cargo test --manifest-path src-tauri/Cargo.toml --locked && cargo check --manifest-path src-tauri/ocr/manga_helper/Cargo.toml --locked",
     "icons:generate": "node scripts/app-icons.mjs generate",
     "icons:verify": "node scripts/app-icons.mjs verify",
     "ocr-helper:prepare": "node scripts/prepare-ocr-helper.mjs",
     "preview": "vite preview",
+    "test:updater": "vitest run src/app-updater-controller.test.ts scripts/updater-manifest.test.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2",
-    "@tauri-apps/plugin-opener": "^2"
+    "@tauri-apps/api": "2.10.1",
+    "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.11.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
+    "typescript": "~5.6.2",
     "vite": "^6.4.3",
-    "typescript": "~5.6.2"
+    "vitest": "^4.1.11"
   }
 }

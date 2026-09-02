@@ -1,8 +1,7 @@
 use base64::Engine;
 use futures_util::StreamExt;
 use scraper::{Html, Selector};
-use semver::Version;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashSet;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,8 +16,6 @@ mod ocr;
 mod translate;
 
 const BASE_URLS: [&str; 2] = ["https://www.wn09.shop", "https://www.wn03.cfd"];
-const RELEASES_API: &str = "https://api.github.com/repos/yuxino/wnacg/releases?per_page=100";
-const RELEASES_URL: &str = "https://github.com/yuxino/wnacg/releases";
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ALBUM_INDEX_PAGES: usize = 256;
 const ALBUM_PAGE_FETCH_CONCURRENCY: usize = 2;
@@ -249,23 +246,6 @@ struct ImageDownloadProgress {
     percent: Option<u8>,
 }
 
-#[derive(Debug, Deserialize)]
-struct GithubRelease {
-    tag_name: String,
-    html_url: String,
-    draft: bool,
-    prerelease: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AppUpdateInfo {
-    current_version: String,
-    latest_version: Option<String>,
-    available: bool,
-    release_url: String,
-}
-
 const IMAGE_PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(90);
 
 struct ImageProgressThrottle {
@@ -402,48 +382,6 @@ fn build_url(base_url: &str, path: &str) -> Result<String, String> {
 
 fn client() -> Result<&'static reqwest::Client, String> {
     HTTP_CLIENT.as_ref().map_err(Clone::clone)
-}
-
-fn normalized_version(value: &str) -> Result<Version, String> {
-    let trimmed = value.trim();
-    let normalized = trimmed
-        .strip_prefix('v')
-        .or_else(|| trimmed.strip_prefix('V'))
-        .unwrap_or(trimmed);
-    Version::parse(normalized).map_err(|_| format!("无法识别版本号：{value}"))
-}
-
-#[cfg(test)]
-fn is_newer_version(latest: &str, current: &str) -> Result<bool, String> {
-    Ok(normalized_version(latest)? > normalized_version(current)?)
-}
-
-fn newest_stable_release(releases: Vec<GithubRelease>) -> Option<(GithubRelease, Version)> {
-    releases
-        .into_iter()
-        .filter(|release| !release.draft && !release.prerelease)
-        .filter_map(|release| {
-            normalized_version(&release.tag_name)
-                .ok()
-                .filter(|version| version.pre.is_empty())
-                .map(|version| (release, version))
-        })
-        .max_by(|(_, left), (_, right)| left.cmp(right))
-}
-
-fn safe_release_url(value: &str) -> String {
-    reqwest::Url::parse(value)
-        .ok()
-        .filter(|url| {
-            url.scheme() == "https"
-                && url.host_str() == Some("github.com")
-                && url.port().is_none()
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.path().starts_with("/yuxino/wnacg/releases/")
-        })
-        .map(|url| url.to_string())
-        .unwrap_or_else(|| RELEASES_URL.to_string())
 }
 
 fn looks_like_cloudflare_challenge(body: &str) -> bool {
@@ -1460,48 +1398,6 @@ async fn fetch_image_data_url_progress(
     Ok(ImageData { data_url })
 }
 
-#[tauri::command]
-async fn check_for_update(app: tauri::AppHandle) -> Result<AppUpdateInfo, String> {
-    let current_version = app.package_info().version.to_string();
-    let client = reqwest::Client::builder()
-        .user_agent(format!("wnacg/{current_version}"))
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(12))
-        .build()
-        .map_err(|err| format!("更新检查初始化失败：{err}"))?;
-
-    let response = client
-        .get(RELEASES_API)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|err| format!("无法连接更新服务器：{err}"))?;
-
-    let releases = response
-        .error_for_status()
-        .map_err(|err| format!("更新服务器返回错误：{err}"))?
-        .json::<Vec<GithubRelease>>()
-        .await
-        .map_err(|err| format!("更新信息解析失败：{err}"))?;
-    let Some((release, latest_version)) = newest_stable_release(releases) else {
-        return Ok(AppUpdateInfo {
-            current_version,
-            latest_version: None,
-            available: false,
-            release_url: RELEASES_URL.to_string(),
-        });
-    };
-    let available = latest_version > normalized_version(&current_version)?;
-
-    Ok(AppUpdateInfo {
-        current_version,
-        latest_version: Some(latest_version.to_string()),
-        available,
-        release_url: safe_release_url(&release.html_url),
-    })
-}
-
 #[cfg(target_os = "windows")]
 fn tray_icon_image() -> Image<'static> {
     tauri::include_image!("icons/kiri/32x32.png")
@@ -1660,6 +1556,8 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
         }))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             fetch_albums,
@@ -1668,7 +1566,6 @@ pub fn run() {
             fetch_photo_image,
             fetch_image_data_url,
             fetch_image_data_url_progress,
-            check_for_update,
             is_window_fullscreen,
             toggle_window_fullscreen,
             open_album_window,
@@ -1771,62 +1668,6 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn compares_release_versions_semantically() {
-        assert!(is_newer_version("v0.1.6", "0.1.5").unwrap());
-        assert!(is_newer_version("1.0.0", "0.9.9").unwrap());
-        assert!(is_newer_version("v0.1.6+build.4", "0.1.5").unwrap());
-        assert!(!is_newer_version("v0.1.5", "0.1.5").unwrap());
-        assert!(!is_newer_version("v0.1.4", "0.1.5").unwrap());
-        assert!(is_newer_version("vv0.1.6", "0.1.5").is_err());
-        assert!(is_newer_version("latest", "0.1.5").is_err());
-    }
-
-    #[test]
-    fn selects_the_highest_stable_semver_release() {
-        let release = |tag: &str, draft: bool, prerelease: bool| GithubRelease {
-            tag_name: tag.to_string(),
-            html_url: format!("{RELEASES_URL}/tag/{tag}"),
-            draft,
-            prerelease,
-        };
-        let (_, version) = newest_stable_release(vec![
-            release("v0.1.7", false, false),
-            release("v0.2.0-beta.1", false, false),
-            release("v9.0.0", true, false),
-            release("v8.0.0", false, true),
-            release("not-a-version", false, false),
-            release("v0.2.0", false, false),
-        ])
-        .expect("a stable release should be selected");
-
-        assert_eq!(version, Version::parse("0.2.0").unwrap());
-    }
-
-    #[test]
-    fn only_accepts_release_links_from_the_project_repository() {
-        assert_eq!(
-            safe_release_url("https://github.com/yuxino/wnacg/releases/tag/v0.1.6"),
-            "https://github.com/yuxino/wnacg/releases/tag/v0.1.6"
-        );
-        assert_eq!(
-            safe_release_url("https://example.com/yuxino/wnacg/releases/tag/v0.1.6"),
-            RELEASES_URL
-        );
-        assert_eq!(
-            safe_release_url("https://github.com:444/yuxino/wnacg/releases/tag/v0.1.6"),
-            RELEASES_URL
-        );
-        assert_eq!(
-            safe_release_url("https://reader@github.com/yuxino/wnacg/releases/tag/v0.1.6"),
-            RELEASES_URL
-        );
-        assert_eq!(
-            safe_release_url("https://github.com/yuxino/wnacg/releases.evil/tag/v0.1.6"),
-            RELEASES_URL
-        );
-    }
 
     #[test]
     fn only_allows_known_https_wnacg_pages() {
