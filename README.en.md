@@ -8,6 +8,16 @@
 
 > 18+. The repository and installers do not include third-party manga, images, or OCR model weights.
 
+<!-- project-demo-v1 -->
+## Demo
+
+[![wnacg — Demo](docs/demos/preview.gif)](docs/demos/demo.mp4)
+
+[Full video (MP4)](docs/demos/demo.mp4) · [About this demo](docs/demos/README.md)
+
+Continuous, single-page and spread layouts with original sample pages. Recorded from the actual frontend with sample data. No upstream site, third-party comics, OCR or translation results are used.
+<!-- /project-demo-v1 -->
+
 ## Downloads and platforms
 
 Download from [Releases](https://github.com/yuxino/wnacg/releases):
