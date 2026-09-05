@@ -8,6 +8,16 @@
 
 > 18+。仓库和安装包不包含第三方漫画、图片内容或 OCR 模型权重。
 
+<!-- project-demo-v1 -->
+## 演示
+
+[![wnacg — 演示](docs/demos/preview.gif)](docs/demos/demo.mp4)
+
+[完整视频（MP4）](docs/demos/demo.mp4) · [演示说明](docs/demos/README.md)
+
+原创示例页的连续、单页和双页阅读。 真实前端录制，使用示例数据。不访问上游站点，不包含第三方漫画、OCR 或翻译结果。
+<!-- /project-demo-v1 -->
+
 ## 下载与平台
 
 请从 [Releases](https://github.com/yuxino/wnacg/releases) 下载：
