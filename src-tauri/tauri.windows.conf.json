@@ -1,5 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
+  "build": {
+    "beforeBuildCommand": "node src-tauri/installer-theme/build.mjs && npm run tauri:before-build"
+  },
   "bundle": {
     "resources": {
       "binaries/windows/manga_ocr_helper.exe": "ocr/manga_ocr_helper.exe",
@@ -11,6 +14,17 @@
       "binaries/windows/VCRUNTIME140_1.dll": "ocr/VCRUNTIME140_1.dll",
       "binaries/windows/onnxruntime-LICENSE.txt": "ocr/licenses/onnxruntime-LICENSE.txt",
       "binaries/windows/onnxruntime-ThirdPartyNotices.txt": "ocr/licenses/onnxruntime-ThirdPartyNotices.txt"
+    },
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/kiri/icon.ico",
+        "uninstallerIcon": "icons/kiri/icon.ico",
+        "sidebarImage": "installer-theme/generated/sidebar.bmp",
+        "headerImage": "installer-theme/generated/header.bmp",
+        "installerHooks": "installer-theme/theme.nsh",
+        "languages": ["English", "SimpChinese", "Japanese"],
+        "displayLanguageSelector": false
+      }
     }
   }
 }
