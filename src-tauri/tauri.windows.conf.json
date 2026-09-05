@@ -18,7 +18,6 @@
     "windows": {
       "nsis": {
         "installerIcon": "icons/kiri/icon.ico",
-        "uninstallerIcon": "icons/kiri/icon.ico",
         "sidebarImage": "installer-theme/generated/sidebar.bmp",
         "headerImage": "installer-theme/generated/header.bmp",
         "installerHooks": "installer-theme/theme.nsh",
