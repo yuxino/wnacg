@@ -15,7 +15,7 @@
 
 [Full video (MP4)](docs/demos/demo.mp4) · [About this demo](docs/demos/README.md)
 
-Continuous, single-page and spread layouts with original sample pages. Recorded from the actual frontend with sample data. No upstream site, third-party comics, OCR or translation results are used.
+Reading width, spacing, continuous/single/spread layouts, page navigation, zoom and reset. **10x actions with 0.8-second result holds.** Actual frontend with sample data. No upstream site, third-party comics, OCR or translation results.
 <!-- /project-demo-v1 -->
 
 ## Downloads and platforms
