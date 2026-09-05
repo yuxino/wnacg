@@ -84,3 +84,20 @@ test('missing, failed and oversized downloads never produce trusted assets', asy
     await assert.rejects(ensureArtwork({ directory, fetcher: async () => new Response('incorrect') }), /checksum mismatch/);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+// WNACG currently locks @tauri-apps/cli to 2.10.1. These optional NSIS
+// fields were added in CLI 2.11.0 and cause older CLIs to reject the entire
+// Windows configuration before beforeBuildCommand or Rust compilation runs.
+test('Windows theme stays compatible with the pre-2.11 Tauri CLI', () => {
+  const config = JSON.parse(readFileSync(join(themeDirectory, '..', 'tauri.windows.conf.json'), 'utf8'));
+  const nsis = config.bundle.windows.nsis;
+  for (const key of ['uninstallerIcon', 'uninstallerHeaderImage']) {
+    assert.equal(Object.hasOwn(nsis, key), false, `${key} requires Tauri CLI 2.11+`);
+  }
+  assert.equal(nsis.installerIcon, 'icons/kiri/icon.ico');
+  assert.equal(nsis.sidebarImage, 'installer-theme/generated/sidebar.bmp');
+  assert.equal(nsis.headerImage, 'installer-theme/generated/header.bmp');
+  assert.equal(nsis.installerHooks, 'installer-theme/theme.nsh');
+  assert.deepEqual(nsis.languages, ['English', 'SimpChinese', 'Japanese']);
+  assert.equal(nsis.displayLanguageSelector, false);
+});
